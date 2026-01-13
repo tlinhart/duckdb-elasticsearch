@@ -1,0 +1,4 @@
+build/
+duckdb_unittest_tempdir/
+vcpkg/
+.vscode/
