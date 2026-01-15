@@ -1,0 +1,1191 @@
+#include "es_search.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "yyjson.hpp"
+
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <set>
+
+namespace duckdb {
+
+using namespace duckdb_yyjson;
+
+// Bind data for the es_search function.
+struct ElasticsearchSearchBindData : public TableFunctionData {
+	ElasticsearchConfig config;
+	std::string index;
+	std::string query;
+
+	// Schema information.
+	vector<string> column_names;
+	vector<LogicalType> column_types;
+
+	// For storing the Elasticsearch field paths (may differ from column names for nested fields).
+	vector<string> field_paths;
+
+	// For storing ALL mapped field paths including nested (for unmapped detection).
+	std::set<string> all_mapped_paths;
+
+	// Store Elasticsearch types for special handling (geo types).
+	vector<string> es_types;
+
+	// Limit from query (if specified).
+	int64_t limit = -1;
+};
+
+// Global state for scanning.
+struct ElasticsearchSearchGlobalState : public GlobalTableFunctionState {
+	std::unique_ptr<ElasticsearchClient> client;
+	std::string scroll_id;
+	bool finished;
+	idx_t current_row;
+
+	// Parsed documents from current scroll batch.
+	vector<yyjson_doc *> docs;
+	vector<yyjson_val *> hits;
+	idx_t current_hit_idx;
+
+	// Total rows to return (from size/limit).
+	int64_t max_rows;
+
+	ElasticsearchSearchGlobalState() : finished(false), current_row(0), current_hit_idx(0), max_rows(-1) {
+	}
+
+	~ElasticsearchSearchGlobalState() {
+		for (auto doc : docs) {
+			if (doc)
+				yyjson_doc_free(doc);
+		}
+		// Clear scroll if active.
+		if (client && !scroll_id.empty()) {
+			client->ClearScroll(scroll_id);
+		}
+	}
+};
+
+// Helper function to extract a value from a JSON object by path (supports nested fields with dots).
+static yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path) {
+	if (!obj || !yyjson_is_obj(obj))
+		return nullptr;
+
+	size_t pos = 0;
+	size_t dot_pos;
+	yyjson_val *current = obj;
+	std::string remaining = path;
+
+	while ((dot_pos = remaining.find('.', pos)) != std::string::npos) {
+		std::string key = remaining.substr(0, dot_pos);
+		current = yyjson_obj_get(current, key.c_str());
+		if (!current || !yyjson_is_obj(current))
+			return nullptr;
+		remaining = remaining.substr(dot_pos + 1);
+	}
+
+	return yyjson_obj_get(current, remaining.c_str());
+}
+
+// Forward declaration for recursive type building.
+static LogicalType BuildDuckDBTypeFromMapping(yyjson_val *field_def);
+
+// Build STRUCT type from Elasticsearch object/nested properties.
+static LogicalType BuildStructTypeFromProperties(yyjson_val *properties) {
+	if (!properties || !yyjson_is_obj(properties)) {
+		return LogicalType::VARCHAR; // fallback to JSON string
+	}
+
+	child_list_t<LogicalType> struct_children;
+
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(properties, &iter);
+	yyjson_val *key;
+
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		const char *field_name = yyjson_get_str(key);
+		yyjson_val *field_def = yyjson_obj_iter_get_val(key);
+
+		LogicalType child_type = BuildDuckDBTypeFromMapping(field_def);
+		struct_children.push_back(make_pair(std::string(field_name), child_type));
+	}
+
+	if (struct_children.empty()) {
+		return LogicalType::VARCHAR; // empty object -> JSON string
+	}
+
+	return LogicalType::STRUCT(struct_children);
+}
+
+// Build DuckDB type from Elasticsearch field definition.
+static LogicalType BuildDuckDBTypeFromMapping(yyjson_val *field_def) {
+	if (!field_def) {
+		return LogicalType::VARCHAR;
+	}
+
+	yyjson_val *type_val = yyjson_obj_get(field_def, "type");
+	yyjson_val *properties = yyjson_obj_get(field_def, "properties");
+
+	// If it has properties (object or nested type).
+	if (properties && yyjson_is_obj(properties)) {
+		// Build STRUCT type from properties.
+		return BuildStructTypeFromProperties(properties);
+	}
+
+	// Handle explicit type.
+	if (type_val) {
+		const char *type_str = yyjson_get_str(type_val);
+		if (type_str) {
+			std::string es_type(type_str);
+
+			if (es_type == "nested") {
+				// Nested type (array of objects) always has properties.
+				yyjson_val *nested_props = yyjson_obj_get(field_def, "properties");
+				if (nested_props) {
+					LogicalType element_type = BuildStructTypeFromProperties(nested_props);
+					return LogicalType::LIST(element_type);
+				}
+				return LogicalType::LIST(LogicalType::VARCHAR);
+			} else if (es_type == "object") {
+				yyjson_val *obj_props = yyjson_obj_get(field_def, "properties");
+				if (obj_props) {
+					return BuildStructTypeFromProperties(obj_props);
+				}
+				return LogicalType::VARCHAR; // object without properties -> JSON
+			} else if (es_type == "text" || es_type == "keyword" || es_type == "string") {
+				return LogicalType::VARCHAR;
+			} else if (es_type == "long") {
+				return LogicalType::BIGINT;
+			} else if (es_type == "integer") {
+				return LogicalType::INTEGER;
+			} else if (es_type == "short") {
+				return LogicalType::SMALLINT;
+			} else if (es_type == "byte") {
+				return LogicalType::TINYINT;
+			} else if (es_type == "double") {
+				return LogicalType::DOUBLE;
+			} else if (es_type == "float" || es_type == "half_float") {
+				return LogicalType::FLOAT;
+			} else if (es_type == "boolean") {
+				return LogicalType::BOOLEAN;
+			} else if (es_type == "date") {
+				return LogicalType::TIMESTAMP;
+			} else if (es_type == "ip") {
+				return LogicalType::VARCHAR;
+			} else if (es_type == "geo_point" || es_type == "geo_shape") {
+				// Return as VARCHAR containing GeoJSON - user can use ST_GeomFromGeoJSON if spatial extension is
+				// loaded.
+				return LogicalType::VARCHAR;
+			} else if (es_type == "nested" || es_type == "object") {
+				return LogicalType::VARCHAR; // return nested objects as JSON string (fallback)
+			}
+			return LogicalType::VARCHAR; // default to VARCHAR
+		}
+	}
+
+	return LogicalType::VARCHAR;
+}
+
+// Parse Elasticsearch mapping to extract field names and types.
+static void ParseMapping(yyjson_val *properties, const std::string &prefix, vector<string> &column_names,
+                         vector<LogicalType> &column_types, vector<string> &field_paths, vector<string> &es_types) {
+	if (!properties || !yyjson_is_obj(properties))
+		return;
+
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(properties, &iter);
+	yyjson_val *key;
+
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		const char *field_name = yyjson_get_str(key);
+		yyjson_val *field_def = yyjson_obj_iter_get_val(key);
+
+		std::string full_path = prefix.empty() ? field_name : prefix + "." + field_name;
+
+		yyjson_val *type_val = yyjson_obj_get(field_def, "type");
+		yyjson_val *nested_props = yyjson_obj_get(field_def, "properties");
+
+		// Use complex DuckDB types for nested objects.
+		// Each top-level field becomes a column with nested objects as STRUCTs.
+		LogicalType col_type = BuildDuckDBTypeFromMapping(field_def);
+
+		// Determine the Elasticsearch type for special handling.
+		std::string es_type_str;
+		if (type_val) {
+			const char *ts = yyjson_get_str(type_val);
+			if (ts)
+				es_type_str = ts;
+		} else if (nested_props) {
+			es_type_str = "object";
+		}
+
+		column_names.push_back(std::string(field_name));
+		column_types.push_back(col_type);
+		field_paths.push_back(full_path);
+		es_types.push_back(es_type_str);
+	}
+}
+
+// Recursively collect ALL field paths from ES mapping properties (including nested children).
+// This is used for accurate unmapped field detection.
+static void CollectAllMappedPaths(yyjson_val *properties, const std::string &prefix, std::set<std::string> &paths) {
+	if (!properties || !yyjson_is_obj(properties))
+		return;
+
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(properties, &iter);
+	yyjson_val *key;
+
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		const char *field_name = yyjson_get_str(key);
+		yyjson_val *field_def = yyjson_obj_iter_get_val(key);
+
+		std::string full_path = prefix.empty() ? field_name : prefix + "." + field_name;
+		paths.insert(full_path);
+
+		// Recursively collect nested paths for object/nested types.
+		yyjson_val *nested_props = yyjson_obj_get(field_def, "properties");
+		if (nested_props && yyjson_is_obj(nested_props)) {
+			CollectAllMappedPaths(nested_props, full_path, paths);
+		}
+	}
+}
+
+// Structure to hold merged mapping information for a field.
+struct MergedFieldInfo {
+	LogicalType type;
+	std::string es_type;
+	std::string first_index; // first index where this field was seen (for error messages)
+};
+
+// Check if two DuckDB types are compatible for merging.
+// Returns true if types are identical or compatible (can be unified).
+static bool AreTypesCompatible(const LogicalType &type1, const LogicalType &type2) {
+	// Identical types are always compatible.
+	if (type1 == type2) {
+		return true;
+	}
+
+	// Both must be same type id for compatibility.
+	if (type1.id() != type2.id()) {
+		return false;
+	}
+
+	// For STRUCT types, check that all children are compatible.
+	if (type1.id() == LogicalTypeId::STRUCT) {
+		auto &children1 = StructType::GetChildTypes(type1);
+		auto &children2 = StructType::GetChildTypes(type2);
+
+		// Build maps for easier lookup.
+		std::map<std::string, LogicalType> map1, map2;
+		for (const auto &child : children1) {
+			map1[child.first] = child.second;
+		}
+		for (const auto &child : children2) {
+			map2[child.first] = child.second;
+		}
+
+		// Check overlapping fields have compatible types.
+		for (const auto &kv : map1) {
+			auto it = map2.find(kv.first);
+			if (it != map2.end()) {
+				if (!AreTypesCompatible(kv.second, it->second)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	// For LIST types, check child types.
+	if (type1.id() == LogicalTypeId::LIST) {
+		return AreTypesCompatible(ListType::GetChildType(type1), ListType::GetChildType(type2));
+	}
+
+	return false;
+}
+
+// Merge two STRUCT types, combining all fields from both.
+static LogicalType MergeStructTypes(const LogicalType &type1, const LogicalType &type2) {
+	if (type1.id() != LogicalTypeId::STRUCT || type2.id() != LogicalTypeId::STRUCT) {
+		// If not both structs, prefer first.
+		return type1;
+	}
+
+	auto &children1 = StructType::GetChildTypes(type1);
+	auto &children2 = StructType::GetChildTypes(type2);
+
+	// Build ordered map to preserve field order while merging.
+	std::map<std::string, LogicalType> merged;
+	std::vector<std::string> field_order;
+
+	for (const auto &child : children1) {
+		merged[child.first] = child.second;
+		field_order.push_back(child.first);
+	}
+
+	for (const auto &child : children2) {
+		auto it = merged.find(child.first);
+		if (it != merged.end()) {
+			// Field exists in both - merge recursively if both are structs.
+			if (it->second.id() == LogicalTypeId::STRUCT && child.second.id() == LogicalTypeId::STRUCT) {
+				merged[child.first] = MergeStructTypes(it->second, child.second);
+			}
+			// Otherwise keep the first type (already validated as compatible).
+		} else {
+			merged[child.first] = child.second;
+			field_order.push_back(child.first);
+		}
+	}
+
+	child_list_t<LogicalType> result;
+	for (const auto &name : field_order) {
+		result.push_back(make_pair(name, merged[name]));
+	}
+
+	return LogicalType::STRUCT(result);
+}
+
+// Merge mappings from multiple indices, checking for type compatibility.
+// Returns merged column info, or throws on incompatible types.
+static void MergeMappingsFromIndices(yyjson_val *root, vector<string> &column_names, vector<LogicalType> &column_types,
+                                     vector<string> &field_paths, vector<string> &es_types,
+                                     std::set<std::string> &all_mapped_paths) {
+	// Map from field path to merged info.
+	std::map<std::string, MergedFieldInfo> merged_fields;
+	std::vector<std::string> field_order; // preserve insertion order
+
+	// Iterate over all indices in the response.
+	yyjson_obj_iter root_iter;
+	yyjson_obj_iter_init(root, &root_iter);
+	yyjson_val *index_key;
+
+	while ((index_key = yyjson_obj_iter_next(&root_iter))) {
+		const char *index_name = yyjson_get_str(index_key);
+		yyjson_val *index_obj = yyjson_obj_iter_get_val(index_key);
+		if (!index_obj)
+			continue;
+
+		yyjson_val *mappings = yyjson_obj_get(index_obj, "mappings");
+		if (!mappings)
+			continue;
+
+		yyjson_val *properties = yyjson_obj_get(mappings, "properties");
+		if (!properties || !yyjson_is_obj(properties))
+			continue;
+
+		// Collect all mapped paths including nested for unmapped field detection.
+		CollectAllMappedPaths(properties, "", all_mapped_paths);
+
+		// Parse this index's mapping into temporary vectors.
+		vector<string> idx_names, idx_paths, idx_es_types;
+		vector<LogicalType> idx_types;
+		ParseMapping(properties, "", idx_names, idx_types, idx_paths, idx_es_types);
+
+		// Merge each field.
+		for (size_t i = 0; i < idx_names.size(); i++) {
+			const std::string &field_path = idx_paths[i];
+			auto it = merged_fields.find(field_path);
+
+			if (it == merged_fields.end()) {
+				// New field - add it.
+				MergedFieldInfo info;
+				info.type = idx_types[i];
+				info.es_type = idx_es_types[i];
+				info.first_index = index_name;
+				merged_fields[field_path] = info;
+				field_order.push_back(field_path);
+			} else {
+				// Existing field - check compatibility.
+				if (!AreTypesCompatible(it->second.type, idx_types[i])) {
+					throw InvalidInputException(
+					    "Incompatible field types for '%s': index '%s' has type %s, but index '%s' has type %s",
+					    field_path, it->second.first_index, it->second.type.ToString(), index_name,
+					    idx_types[i].ToString());
+				}
+
+				// Merge struct types to include all fields from both.
+				if (it->second.type.id() == LogicalTypeId::STRUCT && idx_types[i].id() == LogicalTypeId::STRUCT) {
+					it->second.type = MergeStructTypes(it->second.type, idx_types[i]);
+				}
+			}
+		}
+	}
+
+	// Build output vectors in order.
+	for (const auto &field_path : field_order) {
+		const auto &info = merged_fields[field_path];
+
+		// Extract column name from field path (last component).
+		std::string col_name = field_path;
+		size_t dot_pos = field_path.rfind('.');
+		if (dot_pos != std::string::npos) {
+			col_name = field_path.substr(dot_pos + 1);
+		}
+
+		column_names.push_back(col_name);
+		column_types.push_back(info.type);
+		field_paths.push_back(field_path);
+		es_types.push_back(info.es_type);
+	}
+}
+
+// Parse the user query to extract "size" parameter.
+static int64_t ExtractSizeFromQuery(const std::string &query) {
+	yyjson_doc *doc = yyjson_read(query.c_str(), query.size(), 0);
+	if (!doc)
+		return -1;
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	yyjson_val *size_val = yyjson_obj_get(root, "size");
+
+	int64_t size = -1;
+	if (size_val && (yyjson_is_int(size_val) || yyjson_is_uint(size_val))) {
+		size = yyjson_get_sint(size_val);
+	}
+
+	yyjson_doc_free(doc);
+	return size;
+}
+
+// Convert Elasticsearch geo_point to GeoJSON format for ST_GeomFromGeoJSON.
+static std::string GeoPointToGeoJSON(yyjson_val *val) {
+	if (!val)
+		return "";
+
+	// geo_point can be in multiple formats:
+	// 1. object: {"lat": 41.12, "lon": -71.34}
+	// 2. array: [-71.34, 41.12] (note: lon, lat order)
+	// 3. string: "41.12,-71.34" or geohash
+	// 4. WKT: "POINT (-71.34 41.12)"
+
+	if (yyjson_is_obj(val)) {
+		yyjson_val *lat = yyjson_obj_get(val, "lat");
+		yyjson_val *lon = yyjson_obj_get(val, "lon");
+		if (lat && lon) {
+			double lat_d = yyjson_is_real(lat) ? yyjson_get_real(lat) : static_cast<double>(yyjson_get_sint(lat));
+			double lon_d = yyjson_is_real(lon) ? yyjson_get_real(lon) : static_cast<double>(yyjson_get_sint(lon));
+			return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon_d) + "," + std::to_string(lat_d) + "]}";
+		}
+	} else if (yyjson_is_arr(val)) {
+		// Array format: [lon, lat].
+		yyjson_val *lon = yyjson_arr_get(val, 0);
+		yyjson_val *lat = yyjson_arr_get(val, 1);
+		if (lat && lon) {
+			double lat_d = yyjson_is_real(lat) ? yyjson_get_real(lat) : static_cast<double>(yyjson_get_sint(lat));
+			double lon_d = yyjson_is_real(lon) ? yyjson_get_real(lon) : static_cast<double>(yyjson_get_sint(lon));
+			return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon_d) + "," + std::to_string(lat_d) + "]}";
+		}
+	} else if (yyjson_is_str(val)) {
+		const char *str = yyjson_get_str(val);
+		std::string s(str);
+		// Check if it's "lat,lon" format.
+		auto comma_pos = s.find(',');
+		if (comma_pos != std::string::npos) {
+			try {
+				double lat = std::stod(s.substr(0, comma_pos));
+				double lon = std::stod(s.substr(comma_pos + 1));
+				return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon) + "," + std::to_string(lat) + "]}";
+			} catch (...) {
+				// Not a valid lat,lon string, return as-is (might be geohash).
+			}
+		}
+	}
+
+	// Return as JSON string if we can't parse it.
+	char *json_str = yyjson_val_write(val, 0, nullptr);
+	if (json_str) {
+		std::string result(json_str);
+		free(json_str);
+		return result;
+	}
+	return "";
+}
+
+// Convert Elasticsearch geo_shape to GeoJSON (it's already GeoJSON-like).
+static std::string GeoShapeToGeoJSON(yyjson_val *val) {
+	if (!val)
+		return "";
+
+	// geo_shape is typically stored in GeoJSON format already.
+	char *json_str = yyjson_val_write(val, 0, nullptr);
+	if (json_str) {
+		std::string result(json_str);
+		free(json_str);
+		return result;
+	}
+	return "";
+}
+
+// Collect unmapped fields from _source that are not in the schema's field_paths.
+// Returns a JSON string of unmapped fields, or empty string if none.
+static std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string> &mapped_paths,
+                                         const std::string &prefix = "") {
+	if (!source || !yyjson_is_obj(source)) {
+		return "";
+	}
+
+	// Use yyjson mutable doc to build the unmapped object.
+	yyjson_mut_doc *unmapped_doc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val *unmapped_root = yyjson_mut_obj(unmapped_doc);
+	yyjson_mut_doc_set_root(unmapped_doc, unmapped_root);
+
+	bool has_unmapped = false;
+
+	// Recursive helper to collect unmapped fields.
+	std::function<void(yyjson_val *, yyjson_mut_val *, const std::string &)> collect_unmapped =
+	    [&](yyjson_val *obj, yyjson_mut_val *target, const std::string &current_prefix) {
+		    if (!obj || !yyjson_is_obj(obj))
+			    return;
+
+		    yyjson_obj_iter iter;
+		    yyjson_obj_iter_init(obj, &iter);
+		    yyjson_val *key;
+
+		    while ((key = yyjson_obj_iter_next(&iter))) {
+			    const char *field_name = yyjson_get_str(key);
+			    yyjson_val *field_val = yyjson_obj_iter_get_val(key);
+
+			    std::string field_path = current_prefix.empty() ? field_name : current_prefix + "." + field_name;
+
+			    // Check if this exact path is mapped.
+			    bool is_mapped = mapped_paths.count(field_path) > 0;
+
+			    // Also check if any mapped path starts with this path (it's a parent of a mapped field).
+			    bool is_parent_of_mapped = false;
+			    for (const auto &mapped_path : mapped_paths) {
+				    if (mapped_path.find(field_path + ".") == 0) {
+					    is_parent_of_mapped = true;
+					    break;
+				    }
+			    }
+
+			    if (is_mapped) {
+				    // This field is mapped - but check if it's an object/nested type with child fields.
+				    // If the field has no children in mapped_paths, it's a terminal type (geo_point, etc.)
+				    // and we should NOT recurse into it even if the value is an object.
+				    bool has_mapped_children = false;
+				    for (const auto &mp : mapped_paths) {
+					    if (mp.find(field_path + ".") == 0) {
+						    has_mapped_children = true;
+						    break;
+					    }
+				    }
+
+				    if (has_mapped_children && yyjson_is_obj(field_val)) {
+					    // This is an object/nested type with defined child fields - check for unmapped children.
+					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
+					    bool sub_has_unmapped = false;
+
+					    yyjson_obj_iter sub_iter;
+					    yyjson_obj_iter_init(field_val, &sub_iter);
+					    yyjson_val *sub_key;
+
+					    while ((sub_key = yyjson_obj_iter_next(&sub_iter))) {
+						    const char *sub_field_name = yyjson_get_str(sub_key);
+						    yyjson_val *sub_field_val = yyjson_obj_iter_get_val(sub_key);
+						    std::string sub_field_path = field_path + "." + sub_field_name;
+
+						    if (mapped_paths.count(sub_field_path) == 0) {
+							    // Check if it's a parent of any mapped field.
+							    bool is_sub_parent = false;
+							    for (const auto &mp : mapped_paths) {
+								    if (mp.find(sub_field_path + ".") == 0) {
+									    is_sub_parent = true;
+									    break;
+								    }
+							    }
+
+							    if (!is_sub_parent) {
+								    // This sub-field is unmapped - add it.
+								    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, sub_field_val);
+								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, sub_field_name, copied);
+								    sub_has_unmapped = true;
+							    } else {
+								    // Recurse into this object.
+								    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
+								    collect_unmapped(sub_field_val, nested_obj, sub_field_path);
+								    if (yyjson_mut_obj_size(nested_obj) > 0) {
+									    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, sub_field_name, nested_obj);
+									    sub_has_unmapped = true;
+								    }
+							    }
+						    } else if (yyjson_is_obj(sub_field_val)) {
+							    // Recurse for nested mapped objects.
+							    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
+							    collect_unmapped(sub_field_val, nested_obj, sub_field_path);
+							    if (yyjson_mut_obj_size(nested_obj) > 0) {
+								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, sub_field_name, nested_obj);
+								    sub_has_unmapped = true;
+							    }
+						    }
+					    }
+
+					    if (sub_has_unmapped) {
+						    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, sub_obj);
+						    has_unmapped = true;
+					    }
+				    }
+				    // Terminal type (geo_point, keyword, etc.) - do not recurse.
+			    } else if (is_parent_of_mapped) {
+				    // This is a parent object of mapped fields - recurse to find unmapped children.
+				    if (yyjson_is_obj(field_val)) {
+					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
+					    collect_unmapped(field_val, sub_obj, field_path);
+					    if (yyjson_mut_obj_size(sub_obj) > 0) {
+						    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, sub_obj);
+						    has_unmapped = true;
+					    }
+				    }
+			    } else {
+				    // This field is completely unmapped - add the entire value.
+				    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, field_val);
+				    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, copied);
+				    has_unmapped = true;
+			    }
+		    }
+	    };
+
+	collect_unmapped(source, unmapped_root, prefix);
+
+	std::string result;
+	if (has_unmapped) {
+		char *json_str = yyjson_mut_write(unmapped_doc, 0, nullptr);
+		if (json_str) {
+			result = json_str;
+			free(json_str);
+		}
+	}
+
+	yyjson_mut_doc_free(unmapped_doc);
+	return result;
+}
+
+// Forward declaration.
+static void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+                             const std::string &es_type);
+
+// Set STRUCT value from JSON object.
+static void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type) {
+	if (!val || yyjson_is_null(val)) {
+		FlatVector::SetNull(result, row_idx, true);
+		return;
+	}
+
+	if (!yyjson_is_obj(val)) {
+		// If not an object, set null.
+		FlatVector::SetNull(result, row_idx, true);
+		return;
+	}
+
+	auto &child_entries = StructVector::GetEntries(result);
+	auto &child_types = StructType::GetChildTypes(type);
+
+	for (idx_t i = 0; i < child_entries.size(); i++) {
+		const auto &child_name = child_types[i].first;
+		const auto &child_type = child_types[i].second;
+
+		yyjson_val *child_val = yyjson_obj_get(val, child_name.c_str());
+		SetValueFromJson(child_val, *child_entries[i], row_idx, child_type, "");
+	}
+}
+
+// Set LIST value from JSON array.
+static void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type) {
+	auto list_data = FlatVector::GetData<list_entry_t>(result);
+
+	if (!val || yyjson_is_null(val)) {
+		FlatVector::SetNull(result, row_idx, true);
+		return;
+	}
+
+	// Handle single value as single-element list (Elasticsearch can return single values for array fields).
+	if (!yyjson_is_arr(val)) {
+		// Single value - treat as list with one element.
+		auto &child_vector = ListVector::GetEntry(result);
+		idx_t current_size = ListVector::GetListSize(result);
+
+		list_data[row_idx].offset = current_size;
+		list_data[row_idx].length = 1;
+
+		ListVector::SetListSize(result, current_size + 1);
+		ListVector::Reserve(result, current_size + 1);
+
+		auto &child_type = ListType::GetChildType(type);
+		SetValueFromJson(val, child_vector, current_size, child_type, "");
+		return;
+	}
+
+	// Handle array.
+	size_t arr_len = yyjson_arr_size(val);
+	auto &child_vector = ListVector::GetEntry(result);
+	idx_t current_size = ListVector::GetListSize(result);
+
+	list_data[row_idx].offset = current_size;
+	list_data[row_idx].length = arr_len;
+
+	if (arr_len == 0) {
+		return;
+	}
+
+	ListVector::SetListSize(result, current_size + arr_len);
+	ListVector::Reserve(result, current_size + arr_len);
+
+	auto &child_type = ListType::GetChildType(type);
+
+	size_t idx, max;
+	yyjson_val *elem;
+	idx_t elem_idx = 0;
+	yyjson_arr_foreach(val, idx, max, elem) {
+		SetValueFromJson(elem, child_vector, current_size + elem_idx, child_type, "");
+		elem_idx++;
+	}
+}
+
+// Extract value from yyjson_val and set it in the result vector.
+static void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+                             const std::string &es_type) {
+	if (!val || yyjson_is_null(val)) {
+		FlatVector::SetNull(result, row_idx, true);
+		return;
+	}
+
+	// Handle geo_point and geo_shape specially - convert to GeoJSON string.
+	if (es_type == "geo_point" || es_type == "geo_shape") {
+		std::string geojson;
+		if (es_type == "geo_point") {
+			geojson = GeoPointToGeoJSON(val);
+		} else {
+			geojson = GeoShapeToGeoJSON(val);
+		}
+
+		if (geojson.empty()) {
+			FlatVector::SetNull(result, row_idx, true);
+		} else {
+			auto str_val = StringVector::AddString(result, geojson);
+			FlatVector::GetData<string_t>(result)[row_idx] = str_val;
+		}
+		return;
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::VARCHAR: {
+		if (yyjson_is_str(val)) {
+			auto str_val = StringVector::AddString(result, yyjson_get_str(val));
+			FlatVector::GetData<string_t>(result)[row_idx] = str_val;
+		} else {
+			// Convert non-string values to JSON string.
+			char *json_str = yyjson_val_write(val, 0, nullptr);
+			if (json_str) {
+				auto str_val = StringVector::AddString(result, json_str);
+				FlatVector::GetData<string_t>(result)[row_idx] = str_val;
+				free(json_str);
+			} else {
+				FlatVector::SetNull(result, row_idx, true);
+			}
+		}
+		break;
+	}
+	case LogicalTypeId::BIGINT:
+		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
+			FlatVector::GetData<int64_t>(result)[row_idx] = yyjson_get_sint(val);
+		} else if (yyjson_is_uint(val)) {
+			FlatVector::GetData<int64_t>(result)[row_idx] = static_cast<int64_t>(yyjson_get_uint(val));
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	case LogicalTypeId::INTEGER:
+		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
+			FlatVector::GetData<int32_t>(result)[row_idx] = static_cast<int32_t>(yyjson_get_sint(val));
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	case LogicalTypeId::SMALLINT:
+		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
+			FlatVector::GetData<int16_t>(result)[row_idx] = static_cast<int16_t>(yyjson_get_sint(val));
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	case LogicalTypeId::TINYINT:
+		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
+			FlatVector::GetData<int8_t>(result)[row_idx] = static_cast<int8_t>(yyjson_get_sint(val));
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	case LogicalTypeId::DOUBLE:
+		if (yyjson_is_real(val)) {
+			FlatVector::GetData<double>(result)[row_idx] = yyjson_get_real(val);
+		} else if (yyjson_is_int(val)) {
+			FlatVector::GetData<double>(result)[row_idx] = static_cast<double>(yyjson_get_sint(val));
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	case LogicalTypeId::FLOAT:
+		if (yyjson_is_real(val)) {
+			FlatVector::GetData<float>(result)[row_idx] = static_cast<float>(yyjson_get_real(val));
+		} else if (yyjson_is_int(val)) {
+			FlatVector::GetData<float>(result)[row_idx] = static_cast<float>(yyjson_get_sint(val));
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	case LogicalTypeId::BOOLEAN:
+		if (yyjson_is_bool(val)) {
+			FlatVector::GetData<bool>(result)[row_idx] = yyjson_get_bool(val);
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	case LogicalTypeId::TIMESTAMP: {
+		if (yyjson_is_str(val)) {
+			// Try to parse ISO timestamp string.
+			auto str = yyjson_get_str(val);
+			timestamp_t ts;
+			string error_message;
+			if (Timestamp::TryConvertTimestamp(str, strlen(str), ts, false, nullptr, false) ==
+			    TimestampCastResult::SUCCESS) {
+				FlatVector::GetData<timestamp_t>(result)[row_idx] = ts;
+			} else {
+				FlatVector::SetNull(result, row_idx, true);
+			}
+		} else if (yyjson_is_int(val)) {
+			// Assume milliseconds since epoch.
+			auto ms = yyjson_get_sint(val);
+			FlatVector::GetData<timestamp_t>(result)[row_idx] = Timestamp::FromEpochMs(ms);
+		} else {
+			FlatVector::SetNull(result, row_idx, true);
+		}
+		break;
+	}
+	case LogicalTypeId::STRUCT:
+		SetStructValueFromJson(val, result, row_idx, type);
+		break;
+	case LogicalTypeId::LIST:
+		SetListValueFromJson(val, result, row_idx, type);
+		break;
+	default:
+		FlatVector::SetNull(result, row_idx, true);
+	}
+}
+
+// Bind function - called to determine output schema.
+static unique_ptr<FunctionData> ElasticsearchSearchBind(ClientContext &context, TableFunctionBindInput &input,
+                                                        vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<ElasticsearchSearchBindData>();
+
+	// Parse arguments (config has defaults from ElasticsearchConfig struct definition).
+	for (auto &kv : input.named_parameters) {
+		if (kv.first == "host") {
+			bind_data->config.host = StringValue::Get(kv.second);
+		} else if (kv.first == "port") {
+			bind_data->config.port = IntegerValue::Get(kv.second);
+		} else if (kv.first == "index") {
+			bind_data->index = StringValue::Get(kv.second);
+		} else if (kv.first == "query") {
+			bind_data->query = StringValue::Get(kv.second);
+		} else if (kv.first == "username") {
+			bind_data->config.username = StringValue::Get(kv.second);
+		} else if (kv.first == "password") {
+			bind_data->config.password = StringValue::Get(kv.second);
+		} else if (kv.first == "use_ssl") {
+			bind_data->config.use_ssl = BooleanValue::Get(kv.second);
+		} else if (kv.first == "verify_ssl") {
+			bind_data->config.verify_ssl = BooleanValue::Get(kv.second);
+		} else if (kv.first == "timeout") {
+			bind_data->config.timeout = IntegerValue::Get(kv.second);
+		} else if (kv.first == "max_retries") {
+			bind_data->config.max_retries = IntegerValue::Get(kv.second);
+		} else if (kv.first == "retry_interval") {
+			bind_data->config.retry_interval = IntegerValue::Get(kv.second);
+		} else if (kv.first == "retry_backoff_factor") {
+			bind_data->config.retry_backoff_factor = DoubleValue::Get(kv.second);
+		}
+	}
+
+	// Validate required parameters.
+	if (bind_data->config.host.empty()) {
+		throw InvalidInputException("es_search requires 'host' parameter");
+	}
+	if (bind_data->index.empty()) {
+		throw InvalidInputException("es_search requires 'index' parameter");
+	}
+
+	if (bind_data->query.empty()) {
+		bind_data->query = R"({"query": {"match_all": {}}})";
+	}
+
+	// Extract size from query if present.
+	bind_data->limit = ExtractSizeFromQuery(bind_data->query);
+
+	// Create client to fetch mapping.
+	ElasticsearchClient client(bind_data->config);
+	auto mapping_response = client.GetMapping(bind_data->index);
+
+	if (!mapping_response.success) {
+		throw IOException("Failed to get Elasticsearch mapping: " + mapping_response.error_message);
+	}
+
+	// Parse the mapping response.
+	yyjson_doc *doc = yyjson_read(mapping_response.body.c_str(), mapping_response.body.size(), 0);
+	if (!doc) {
+		throw IOException("Failed to parse Elasticsearch mapping response");
+	}
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+
+	// Merge mappings from all matching indices (handles patterns like logs-*).
+	// This will throw if incompatible types are found across indices.
+	MergeMappingsFromIndices(root, bind_data->column_names, bind_data->column_types, bind_data->field_paths,
+	                         bind_data->es_types, bind_data->all_mapped_paths);
+
+	yyjson_doc_free(doc);
+
+	// If no columns found, add a default _source column.
+	if (bind_data->column_names.empty()) {
+		bind_data->column_names.push_back("_source");
+		bind_data->column_types.push_back(LogicalType::VARCHAR);
+		bind_data->field_paths.push_back("_source");
+		bind_data->es_types.push_back("object");
+	}
+
+	// Always add _id column at the beginning.
+	names.push_back("_id");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	for (size_t i = 0; i < bind_data->column_names.size(); i++) {
+		names.push_back(bind_data->column_names[i]);
+		return_types.push_back(bind_data->column_types[i]);
+	}
+
+	// Always add _unmapped_ column at the end (JSON type for unmapped/dynamic fields).
+	names.push_back("_unmapped_");
+	return_types.push_back(LogicalType::JSON());
+
+	// Store the types for later use.
+	bind_data->column_names = names;
+	bind_data->column_types = return_types;
+
+	return std::move(bind_data);
+}
+
+// Initialize global state.
+static unique_ptr<GlobalTableFunctionState> ElasticsearchSearchInitGlobal(ClientContext &context,
+                                                                          TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<ElasticsearchSearchBindData>();
+	auto state = make_uniq<ElasticsearchSearchGlobalState>();
+
+	// Set max_rows from limit.
+	state->max_rows = bind_data.limit;
+
+	// Create client using config directly from bind_data.
+	state->client = make_uniq<ElasticsearchClient>(bind_data.config);
+
+	// Determine batch size - use smaller of limit or default batch size.
+	int64_t batch_size = 1000;
+	if (state->max_rows > 0 && state->max_rows < batch_size) {
+		batch_size = state->max_rows;
+	}
+
+	// Start scroll search.
+	auto response = state->client->ScrollSearch(bind_data.index, bind_data.query, "5m", batch_size);
+
+	if (!response.success) {
+		throw IOException("Elasticsearch search failed: " + response.error_message);
+	}
+
+	// Parse response.
+	yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
+	if (!doc) {
+		throw IOException("Failed to parse Elasticsearch response");
+	}
+
+	state->docs.push_back(doc);
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	yyjson_val *scroll_id_val = yyjson_obj_get(root, "_scroll_id");
+	if (scroll_id_val) {
+		state->scroll_id = yyjson_get_str(scroll_id_val);
+	}
+
+	// Get hits.
+	yyjson_val *hits_obj = yyjson_obj_get(root, "hits");
+	if (hits_obj) {
+		yyjson_val *hits_array = yyjson_obj_get(hits_obj, "hits");
+		if (hits_array && yyjson_is_arr(hits_array)) {
+			size_t idx, max;
+			yyjson_val *hit;
+			yyjson_arr_foreach(hits_array, idx, max, hit) {
+				state->hits.push_back(hit);
+			}
+		}
+	}
+
+	if (state->hits.empty()) {
+		state->finished = true;
+	}
+
+	return std::move(state);
+}
+
+// Main scan function.
+static void ElasticsearchSearchScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<ElasticsearchSearchBindData>();
+	auto &state = data.global_state->Cast<ElasticsearchSearchGlobalState>();
+
+	if (state.finished) {
+		output.SetCardinality(0);
+		return;
+	}
+
+	// Check if we've hit the limit.
+	if (state.max_rows > 0 && static_cast<int64_t>(state.current_row) >= state.max_rows) {
+		state.finished = true;
+		output.SetCardinality(0);
+		return;
+	}
+
+	idx_t output_idx = 0;
+	idx_t max_output = STANDARD_VECTOR_SIZE;
+
+	// Adjust max_output if we have a limit.
+	if (state.max_rows > 0) {
+		int64_t remaining = state.max_rows - static_cast<int64_t>(state.current_row);
+		if (remaining < static_cast<int64_t>(max_output)) {
+			max_output = static_cast<idx_t>(remaining);
+		}
+	}
+
+	while (output_idx < max_output && !state.finished) {
+		// Check if we need more data.
+		if (state.current_hit_idx >= state.hits.size()) {
+			// Check if we've hit the limit..
+			if (state.max_rows > 0 && static_cast<int64_t>(state.current_row) >= state.max_rows) {
+				state.finished = true;
+				break;
+			}
+
+			// Fetch next scroll batch.
+			if (state.scroll_id.empty()) {
+				state.finished = true;
+				break;
+			}
+
+			auto response = state.client->ScrollNext(state.scroll_id, "5m");
+			if (!response.success) {
+				throw IOException("Elasticsearch scroll failed: " + response.error_message);
+			}
+
+			// Clear old docs and hits.
+			for (auto doc : state.docs) {
+				if (doc)
+					yyjson_doc_free(doc);
+			}
+			state.docs.clear();
+			state.hits.clear();
+
+			// Parse new response.
+			yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
+			if (!doc) {
+				throw IOException("Failed to parse Elasticsearch scroll response");
+			}
+			state.docs.push_back(doc);
+
+			yyjson_val *root = yyjson_doc_get_root(doc);
+			yyjson_val *hits_obj = yyjson_obj_get(root, "hits");
+			if (hits_obj) {
+				yyjson_val *hits_array = yyjson_obj_get(hits_obj, "hits");
+				if (hits_array && yyjson_is_arr(hits_array)) {
+					size_t idx, max;
+					yyjson_val *hit;
+					yyjson_arr_foreach(hits_array, idx, max, hit) {
+						state.hits.push_back(hit);
+					}
+				}
+			}
+
+			state.current_hit_idx = 0;
+
+			if (state.hits.empty()) {
+				state.finished = true;
+				break;
+			}
+		}
+
+		// Process current hit.
+		yyjson_val *hit = state.hits[state.current_hit_idx];
+		yyjson_val *source = yyjson_obj_get(hit, "_source");
+		yyjson_val *id_val = yyjson_obj_get(hit, "_id");
+
+		// Set _id column (first column).
+		if (id_val && yyjson_is_str(id_val)) {
+			auto str_val = StringVector::AddString(output.data[0], yyjson_get_str(id_val));
+			FlatVector::GetData<string_t>(output.data[0])[output_idx] = str_val;
+		} else {
+			FlatVector::SetNull(output.data[0], output_idx, true);
+		}
+
+		// Set mapped columns (skip first column _id and last column _unmapped_).
+		// Column layout: [_id, ...mapped_fields..., _unmapped_].
+		idx_t unmapped_col_idx = output.ColumnCount() - 1;
+		for (idx_t col_idx = 1; col_idx < unmapped_col_idx; col_idx++) {
+			const std::string &field_path = bind_data.field_paths[col_idx - 1];
+			const std::string &es_type = bind_data.es_types[col_idx - 1];
+
+			yyjson_val *val = nullptr;
+			if (field_path == "_source") {
+				val = source;
+			} else {
+				val = GetValueByPath(source, field_path);
+			}
+
+			SetValueFromJson(val, output.data[col_idx], output_idx, bind_data.column_types[col_idx], es_type);
+		}
+
+		// Set _unmapped_ column (last column) - collect fields not in the mapping.
+		// Use all_mapped_paths which includes nested paths for accurate detection.
+		std::string unmapped_json = CollectUnmappedFields(source, bind_data.all_mapped_paths);
+
+		if (unmapped_json.empty()) {
+			FlatVector::SetNull(output.data[unmapped_col_idx], output_idx, true);
+		} else {
+			auto str_val = StringVector::AddString(output.data[unmapped_col_idx], unmapped_json);
+			FlatVector::GetData<string_t>(output.data[unmapped_col_idx])[output_idx] = str_val;
+		}
+
+		output_idx++;
+		state.current_hit_idx++;
+		state.current_row++;
+	}
+
+	output.SetCardinality(output_idx);
+}
+
+void RegisterElasticsearchSearchFunction(ExtensionLoader &loader) {
+	TableFunction es_search("es_search", {}, ElasticsearchSearchScan, ElasticsearchSearchBind,
+	                        ElasticsearchSearchInitGlobal);
+
+	// Named parameters.
+	es_search.named_parameters["host"] = LogicalType::VARCHAR;
+	es_search.named_parameters["port"] = LogicalType::INTEGER;
+	es_search.named_parameters["index"] = LogicalType::VARCHAR;
+	es_search.named_parameters["query"] = LogicalType::VARCHAR;
+	es_search.named_parameters["username"] = LogicalType::VARCHAR;
+	es_search.named_parameters["password"] = LogicalType::VARCHAR;
+	es_search.named_parameters["use_ssl"] = LogicalType::BOOLEAN;
+	es_search.named_parameters["verify_ssl"] = LogicalType::BOOLEAN;
+	es_search.named_parameters["timeout"] = LogicalType::INTEGER;
+	es_search.named_parameters["max_retries"] = LogicalType::INTEGER;
+	es_search.named_parameters["retry_interval"] = LogicalType::INTEGER;
+	es_search.named_parameters["retry_backoff_factor"] = LogicalType::DOUBLE;
+
+	loader.RegisterFunction(es_search);
+}
+
+} // namespace duckdb
