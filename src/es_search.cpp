@@ -803,7 +803,7 @@ static std::string WktGeometryCollectionToGeoJSON(const std::string &wkt) {
 		// Find the geometry type keyword.
 		size_t geom_start = pos;
 
-		// Find the opening paren of this geometry.
+		// Find the opening parenthesis of this geometry.
 		size_t geom_paren = content.find('(', pos);
 		if (geom_paren == std::string::npos)
 			break;
