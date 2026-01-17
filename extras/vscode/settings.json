@@ -1,0 +1,14 @@
+{
+  "search.exclude": {
+    "duckdb": true,
+    "extension-ci-tools": true
+  },
+  "files.associations": {
+    "**/test/sql/**/*.test": "sqllogictest"
+  },
+  "cmake.sourceDirectory": "${workspaceFolder}/duckdb",
+  "cmake.buildDirectory": "${workspaceFolder}/build/${buildType}",
+  "cmake.configureArgs": [
+    "-DDUCKDB_EXTENSION_CONFIGS=${workspaceFolder}/extension_config.cmake"
+  ]
+}
