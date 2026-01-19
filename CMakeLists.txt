@@ -16,7 +16,10 @@ include_directories(duckdb/third_party/httplib)
 
 set(EXTENSION_SOURCES src/elasticsearch_extension.cpp
                       src/es_client.cpp
+                      src/es_common.cpp
                       src/es_search.cpp
+                      src/es_query.cpp
+                      src/es_filter_translator.cpp
                       src/es_aggregate.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
