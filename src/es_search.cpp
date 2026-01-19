@@ -36,6 +36,9 @@ struct ElasticsearchSearchBindData : public TableFunctionData {
 
 	// Limit from query (if specified).
 	int64_t limit = -1;
+
+	// Sample size for array detection (0 = disabled, default = 100).
+	int64_t sample_size = 100;
 };
 
 // Global state for scanning.
@@ -448,6 +451,124 @@ static int64_t ExtractSizeFromQuery(const std::string &query) {
 
 	yyjson_doc_free(doc);
 	return size;
+}
+
+// Detect which fields contain arrays by sampling documents.
+// Returns a set of field paths that should be LIST types.
+// Note: geo_point and geo_shape fields are skipped because their array format [lon, lat]
+// represents a single point, not multiple values.
+static std::set<std::string> DetectArrayFields(ElasticsearchClient &client, const std::string &index,
+                                               const std::string &query, const vector<string> &field_paths,
+                                               const vector<string> &es_types, int64_t sample_size) {
+	std::set<std::string> array_fields;
+
+	if (sample_size <= 0 || field_paths.empty()) {
+		return array_fields;
+	}
+
+	// Build a set of field paths to skip (geo types use arrays for coordinates, not for multiple values).
+	std::set<std::string> skip_fields;
+	for (size_t i = 0; i < field_paths.size() && i < es_types.size(); i++) {
+		if (es_types[i] == "geo_point" || es_types[i] == "geo_shape") {
+			skip_fields.insert(field_paths[i]);
+		}
+	}
+
+	// Build sample query by modifying the user query to limit size.
+	// Parse the original query and override/add "size" parameter.
+	std::string sample_query;
+	yyjson_doc *query_doc = yyjson_read(query.c_str(), query.size(), 0);
+
+	if (query_doc) {
+		yyjson_mut_doc *mut_doc = yyjson_doc_mut_copy(query_doc, nullptr);
+		yyjson_doc_free(query_doc);
+
+		if (mut_doc) {
+			yyjson_mut_val *mut_root = yyjson_mut_doc_get_root(mut_doc);
+			if (mut_root && yyjson_mut_is_obj(mut_root)) {
+				// Set or override "size" parameter.
+				yyjson_mut_obj_put(mut_root, yyjson_mut_str(mut_doc, "size"), yyjson_mut_int(mut_doc, sample_size));
+
+				char *json_str = yyjson_mut_write(mut_doc, 0, nullptr);
+				if (json_str) {
+					sample_query = json_str;
+					free(json_str);
+				}
+			}
+			yyjson_mut_doc_free(mut_doc);
+		}
+	}
+
+	// Fallback if query modification failed.
+	if (sample_query.empty()) {
+		sample_query = "{\"query\": {\"match_all\": {}}, \"size\": " + std::to_string(sample_size) + "}";
+	}
+
+	// Execute search (using scroll but we only need first batch).
+	auto response = client.ScrollSearch(index, sample_query, "1m", sample_size);
+	if (!response.success) {
+		// If sampling fails, return empty set (conservative: no arrays detected).
+		return array_fields;
+	}
+
+	// Parse response.
+	yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
+	if (!doc) {
+		return array_fields;
+	}
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	yyjson_val *hits_obj = yyjson_obj_get(root, "hits");
+	yyjson_val *hits_array = hits_obj ? yyjson_obj_get(hits_obj, "hits") : nullptr;
+
+	if (!hits_array || !yyjson_is_arr(hits_array)) {
+		// Clear scroll if we got one.
+		yyjson_val *scroll_id_val = yyjson_obj_get(root, "_scroll_id");
+		if (scroll_id_val && yyjson_is_str(scroll_id_val)) {
+			client.ClearScroll(yyjson_get_str(scroll_id_val));
+		}
+		yyjson_doc_free(doc);
+		return array_fields;
+	}
+
+	// Scan each document.
+	size_t idx, max;
+	yyjson_val *hit;
+	yyjson_arr_foreach(hits_array, idx, max, hit) {
+		yyjson_val *source = yyjson_obj_get(hit, "_source");
+		if (!source)
+			continue;
+
+		// Check each field path.
+		for (const auto &field_path : field_paths) {
+			// Skip geo fields (their array format represents coordinates, not multiple values).
+			if (skip_fields.count(field_path))
+				continue;
+
+			// Skip if already detected as array.
+			if (array_fields.count(field_path))
+				continue;
+
+			yyjson_val *val = GetValueByPath(source, field_path);
+			if (val && yyjson_is_arr(val)) {
+				array_fields.insert(field_path);
+			}
+		}
+
+		// Early exit if all non-skipped fields are detected as arrays.
+		if (array_fields.size() + skip_fields.size() >= field_paths.size()) {
+			break;
+		}
+	}
+
+	// Clear scroll if we got one.
+	yyjson_val *scroll_id_val = yyjson_obj_get(root, "_scroll_id");
+	if (scroll_id_val && yyjson_is_str(scroll_id_val)) {
+		client.ClearScroll(yyjson_get_str(scroll_id_val));
+	}
+
+	yyjson_doc_free(doc);
+	return array_fields;
 }
 
 // Helper to trim whitespace from string.
@@ -1081,9 +1202,11 @@ static std::string CollectUnmappedFields(yyjson_val *source, const std::set<std:
 	return result;
 }
 
-// Forward declaration.
+// Forward declarations for mutual recursion.
 static void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
                              const std::string &es_type);
+static void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+                                 const std::string &es_type);
 
 // Set STRUCT value from JSON object.
 static void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type) {
@@ -1111,7 +1234,8 @@ static void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_id
 }
 
 // Set LIST value from JSON array.
-static void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type) {
+static void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+                                 const std::string &es_type) {
 	auto list_data = FlatVector::GetData<list_entry_t>(result);
 
 	if (!val || yyjson_is_null(val)) {
@@ -1132,7 +1256,7 @@ static void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx,
 		ListVector::Reserve(result, current_size + 1);
 
 		auto &child_type = ListType::GetChildType(type);
-		SetValueFromJson(val, child_vector, current_size, child_type, "");
+		SetValueFromJson(val, child_vector, current_size, child_type, es_type);
 		return;
 	}
 
@@ -1157,7 +1281,7 @@ static void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx,
 	yyjson_val *elem;
 	idx_t elem_idx = 0;
 	yyjson_arr_foreach(val, idx, max, elem) {
-		SetValueFromJson(elem, child_vector, current_size + elem_idx, child_type, "");
+		SetValueFromJson(elem, child_vector, current_size + elem_idx, child_type, es_type);
 		elem_idx++;
 	}
 }
@@ -1167,6 +1291,14 @@ static void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, con
                              const std::string &es_type) {
 	if (!val || yyjson_is_null(val)) {
 		FlatVector::SetNull(result, row_idx, true);
+		return;
+	}
+
+	// If the type is LIST, we need to handle it specially - either the value is an array,
+	// or it's a single value that should be wrapped in a single-element list.
+	// This must be checked BEFORE any es_type-specific handling.
+	if (type.id() == LogicalTypeId::LIST) {
+		SetListValueFromJson(val, result, row_idx, type, es_type);
 		return;
 	}
 
@@ -1285,9 +1417,6 @@ static void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, con
 	case LogicalTypeId::STRUCT:
 		SetStructValueFromJson(val, result, row_idx, type);
 		break;
-	case LogicalTypeId::LIST:
-		SetListValueFromJson(val, result, row_idx, type);
-		break;
 	default:
 		FlatVector::SetNull(result, row_idx, true);
 	}
@@ -1324,6 +1453,8 @@ static unique_ptr<FunctionData> ElasticsearchSearchBind(ClientContext &context, 
 			bind_data->config.retry_interval = IntegerValue::Get(kv.second);
 		} else if (kv.first == "retry_backoff_factor") {
 			bind_data->config.retry_backoff_factor = DoubleValue::Get(kv.second);
+		} else if (kv.first == "sample_size") {
+			bind_data->sample_size = IntegerValue::Get(kv.second);
 		}
 	}
 
@@ -1364,6 +1495,25 @@ static unique_ptr<FunctionData> ElasticsearchSearchBind(ClientContext &context, 
 	                         bind_data->es_types, bind_data->all_mapped_paths);
 
 	yyjson_doc_free(doc);
+
+	// Sample documents to detect which fields contain arrays.
+	// This is needed because Elasticsearch mappings don't distinguish between
+	// single values and arrays - a field can contain either at runtime.
+	if (bind_data->sample_size > 0 && !bind_data->field_paths.empty()) {
+		std::set<std::string> array_fields =
+		    DetectArrayFields(client, bind_data->index, bind_data->query, bind_data->field_paths, bind_data->es_types,
+		                      bind_data->sample_size);
+
+		// Wrap types in LIST for fields detected as arrays.
+		for (size_t i = 0; i < bind_data->field_paths.size(); i++) {
+			if (array_fields.count(bind_data->field_paths[i])) {
+				// Don't double-wrap if already a LIST (e.g., nested type).
+				if (bind_data->column_types[i].id() != LogicalTypeId::LIST) {
+					bind_data->column_types[i] = LogicalType::LIST(bind_data->column_types[i]);
+				}
+			}
+		}
+	}
 
 	// If no columns found, add a default _source column.
 	if (bind_data->column_names.empty()) {
@@ -1602,6 +1752,7 @@ void RegisterElasticsearchSearchFunction(ExtensionLoader &loader) {
 	es_search.named_parameters["max_retries"] = LogicalType::INTEGER;
 	es_search.named_parameters["retry_interval"] = LogicalType::INTEGER;
 	es_search.named_parameters["retry_backoff_factor"] = LogicalType::DOUBLE;
+	es_search.named_parameters["sample_size"] = LogicalType::INTEGER;
 
 	loader.RegisterFunction(es_search);
 }
