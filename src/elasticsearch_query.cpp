@@ -1,6 +1,6 @@
-#include "es_query.hpp"
-#include "es_common.hpp"
-#include "es_filter_translator.hpp"
+#include "elasticsearch_query.hpp"
+#include "elasticsearch_common.hpp"
+#include "elasticsearch_filter_translator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -20,7 +20,7 @@ namespace duckdb {
 
 using namespace duckdb_yyjson;
 
-// Bind data for the es_query function.
+// Bind data for the elasticsearch_query function.
 struct ElasticsearchQueryBindData : public TableFunctionData {
 	ElasticsearchConfig config;
 	std::string index;
@@ -104,15 +104,12 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	yyjson_mut_val *query_clause = nullptr;
 	yyjson_mut_val *base_query_clause = nullptr;
 
-	// Parse base query if provided.
+	// Parse base query if provided (the query parameter IS the query clause itself now).
 	if (!bind_data.base_query.empty()) {
 		yyjson_doc *base_doc = yyjson_read(bind_data.base_query.c_str(), bind_data.base_query.size(), 0);
 		if (base_doc) {
 			yyjson_val *base_root = yyjson_doc_get_root(base_doc);
-			yyjson_val *base_query = yyjson_obj_get(base_root, "query");
-			if (base_query) {
-				base_query_clause = yyjson_val_mut_copy(doc, base_query);
-			}
+			base_query_clause = yyjson_val_mut_copy(doc, base_root);
 			yyjson_doc_free(base_doc);
 		}
 	}
@@ -124,7 +121,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		// IMPORTANT: Filter indices in TableFilterSet are relative to column_ids (the projected columns),
 		// NOT the original bind schema. We need to map them correctly.
 		//
-		// column_ids contains indices into the bind schema: [_id (0), ...fields... (1-N), _unmapped_ (N+1)]
+		// column_ids contains indices into the bind schema: [_id (0), ...fields... (1-N), optionally _unmapped_ (N+1)]
 		// Filter indices are positions within column_ids.
 		vector<string> filter_column_names;
 		for (idx_t col_id : column_ids) {
@@ -170,10 +167,20 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	// Add _source projection if we have specific columns.
 	// Column layout: [_id, ...fields..., _unmapped_].
 	// We need to request only the field paths for projected columns.
-	if (!column_ids.empty()) {
+	// IMPORTANT: If _unmapped_ column is projected, we need the full _source to detect unmapped fields.
+	bool needs_full_source = false;
+	for (idx_t col_id : column_ids) {
+		// _unmapped_ column is always at position field_paths.size() + 1 (after _id and all fields).
+		if (col_id > bind_data.field_paths.size()) {
+			needs_full_source = true;
+			break;
+		}
+	}
+
+	if (!column_ids.empty() && !needs_full_source) {
 		vector<string> source_fields;
 		for (idx_t col_id : column_ids) {
-			// Skip _id (col 0) and _unmapped_ (last col).
+			// Skip _id (col 0).
 			if (col_id == 0) {
 				continue; // _id is always returned by ES.
 			}
@@ -191,6 +198,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 			yyjson_mut_obj_add_val(doc, root, "_source", source_arr);
 		}
 	}
+	// If needs_full_source is true, we don't set _source, so ES returns the full document.
 
 	// Add size/limit if specified.
 	if (limit > 0) {
@@ -247,10 +255,10 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 
 	// Validate required parameters.
 	if (bind_data->config.host.empty()) {
-		throw InvalidInputException("es_query requires 'host' parameter");
+		throw InvalidInputException("elasticsearch_query requires 'host' parameter");
 	}
 	if (bind_data->index.empty()) {
-		throw InvalidInputException("es_query requires 'index' parameter");
+		throw InvalidInputException("elasticsearch_query requires 'index' parameter");
 	}
 
 	// Create client to fetch mapping.
@@ -285,17 +293,19 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 		}
 	}
 
-	// Sample documents to detect which fields contain arrays.
-	std::string sample_query =
-	    bind_data->base_query.empty() ? R"({"query": {"match_all": {}}})" : bind_data->base_query;
+	// Sample documents to detect arrays and unmapped fields.
+	std::string sample_query = R"({"query": {"match_all": {}}})";
+	if (!bind_data->base_query.empty()) {
+		sample_query = R"({"query": )" + bind_data->base_query + "}";
+	}
 	if (bind_data->sample_size > 0 && !bind_data->field_paths.empty()) {
-		std::set<std::string> array_fields =
-		    DetectArrayFields(client, bind_data->index, sample_query, bind_data->field_paths, bind_data->es_types,
-		                      bind_data->sample_size);
+		SampleResult sample_result =
+		    SampleDocuments(client, bind_data->index, sample_query, bind_data->field_paths, bind_data->es_types,
+		                    bind_data->all_mapped_paths, bind_data->sample_size);
 
 		// Wrap types in LIST for fields detected as arrays.
 		for (size_t i = 0; i < bind_data->field_paths.size(); i++) {
-			if (array_fields.count(bind_data->field_paths[i])) {
+			if (sample_result.array_fields.count(bind_data->field_paths[i])) {
 				if (bind_data->all_column_types[i].id() != LogicalTypeId::LIST) {
 					bind_data->all_column_types[i] = LogicalType::LIST(bind_data->all_column_types[i]);
 				}
@@ -311,7 +321,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 		bind_data->es_types.push_back("object");
 	}
 
-	// Build output schema: [_id, ...fields..., _unmapped_].
+	// Build output schema: [_id, ...fields..., optionally _unmapped_].
 	names.push_back("_id");
 	return_types.push_back(LogicalType::VARCHAR);
 
@@ -320,6 +330,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 		return_types.push_back(bind_data->all_column_types[i]);
 	}
 
+	// Always add _unmapped_ column to capture fields not in the mapping.
 	names.push_back("_unmapped_");
 	return_types.push_back(LogicalType::JSON());
 
@@ -337,7 +348,7 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	state->projected_columns = input.column_ids;
 
 	// Build projected field info.
-	// Column layout: [_id (0), ...fields... (1 to N), _unmapped_ (N+1)].
+	// Column layout: [_id (0), ...fields... (1 to N), optionally _unmapped_ (N+1 if present)].
 	for (idx_t col_id : input.column_ids) {
 		if (col_id == 0) {
 			// _id column.
@@ -549,29 +560,29 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 }
 
 void RegisterElasticsearchQueryFunction(ExtensionLoader &loader) {
-	TableFunction es_query("es_query", {}, ElasticsearchQueryScan, ElasticsearchQueryBind,
-	                       ElasticsearchQueryInitGlobal);
+	TableFunction elasticsearch_query("elasticsearch_query", {}, ElasticsearchQueryScan, ElasticsearchQueryBind,
+	                                  ElasticsearchQueryInitGlobal);
 
 	// Enable pushdown.
-	es_query.projection_pushdown = true;
-	es_query.filter_pushdown = true;
+	elasticsearch_query.projection_pushdown = true;
+	elasticsearch_query.filter_pushdown = true;
 
 	// Named parameters.
-	es_query.named_parameters["host"] = LogicalType::VARCHAR;
-	es_query.named_parameters["port"] = LogicalType::INTEGER;
-	es_query.named_parameters["index"] = LogicalType::VARCHAR;
-	es_query.named_parameters["query"] = LogicalType::VARCHAR;
-	es_query.named_parameters["username"] = LogicalType::VARCHAR;
-	es_query.named_parameters["password"] = LogicalType::VARCHAR;
-	es_query.named_parameters["use_ssl"] = LogicalType::BOOLEAN;
-	es_query.named_parameters["verify_ssl"] = LogicalType::BOOLEAN;
-	es_query.named_parameters["timeout"] = LogicalType::INTEGER;
-	es_query.named_parameters["max_retries"] = LogicalType::INTEGER;
-	es_query.named_parameters["retry_interval"] = LogicalType::INTEGER;
-	es_query.named_parameters["retry_backoff_factor"] = LogicalType::DOUBLE;
-	es_query.named_parameters["sample_size"] = LogicalType::INTEGER;
+	elasticsearch_query.named_parameters["host"] = LogicalType::VARCHAR;
+	elasticsearch_query.named_parameters["port"] = LogicalType::INTEGER;
+	elasticsearch_query.named_parameters["index"] = LogicalType::VARCHAR;
+	elasticsearch_query.named_parameters["query"] = LogicalType::VARCHAR;
+	elasticsearch_query.named_parameters["username"] = LogicalType::VARCHAR;
+	elasticsearch_query.named_parameters["password"] = LogicalType::VARCHAR;
+	elasticsearch_query.named_parameters["use_ssl"] = LogicalType::BOOLEAN;
+	elasticsearch_query.named_parameters["verify_ssl"] = LogicalType::BOOLEAN;
+	elasticsearch_query.named_parameters["timeout"] = LogicalType::INTEGER;
+	elasticsearch_query.named_parameters["max_retries"] = LogicalType::INTEGER;
+	elasticsearch_query.named_parameters["retry_interval"] = LogicalType::INTEGER;
+	elasticsearch_query.named_parameters["retry_backoff_factor"] = LogicalType::DOUBLE;
+	elasticsearch_query.named_parameters["sample_size"] = LogicalType::INTEGER;
 
-	loader.RegisterFunction(es_query);
+	loader.RegisterFunction(elasticsearch_query);
 }
 
 } // namespace duckdb

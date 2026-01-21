@@ -1,4 +1,4 @@
-#include "es_common.hpp"
+#include "elasticsearch_common.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 
 #include <algorithm>
@@ -860,13 +860,14 @@ void MergeMappingsFromIndices(yyjson_val *root, vector<string> &column_names, ve
 // Array Detection Functions
 //===--------------------------------------------------------------------===//
 
-std::set<std::string> DetectArrayFields(ElasticsearchClient &client, const std::string &index, const std::string &query,
-                                        const vector<string> &field_paths, const vector<string> &es_types,
-                                        int64_t sample_size) {
-	std::set<std::string> array_fields;
+SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &index, const std::string &query,
+                             const vector<string> &field_paths, const vector<string> &es_types,
+                             const std::set<std::string> &all_mapped_paths, int64_t sample_size) {
+	SampleResult result;
+	result.has_unmapped_fields = false;
 
 	if (sample_size <= 0 || field_paths.empty()) {
-		return array_fields;
+		return result;
 	}
 
 	// Build a set of field paths to skip (geo types use arrays for coordinates, not for multiple values).
@@ -910,14 +911,14 @@ std::set<std::string> DetectArrayFields(ElasticsearchClient &client, const std::
 	// Execute search (using scroll but we only need first batch).
 	auto response = client.ScrollSearch(index, sample_query, "1m", sample_size);
 	if (!response.success) {
-		// If sampling fails, return empty set (conservative: no arrays detected).
-		return array_fields;
+		// If sampling fails, return empty result (conservative: no arrays/unmapped detected).
+		return result;
 	}
 
 	// Parse response.
 	yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
 	if (!doc) {
-		return array_fields;
+		return result;
 	}
 
 	yyjson_val *root = yyjson_doc_get_root(doc);
@@ -931,8 +932,56 @@ std::set<std::string> DetectArrayFields(ElasticsearchClient &client, const std::
 			client.ClearScroll(yyjson_get_str(scroll_id_val));
 		}
 		yyjson_doc_free(doc);
-		return array_fields;
+		return result;
 	}
+
+	// Helper lambda to check if a document has unmapped fields.
+	auto check_for_unmapped = [&all_mapped_paths](yyjson_val *obj, const std::string &prefix) -> bool {
+		std::function<bool(yyjson_val *, const std::string &)> check_recursive = [&](yyjson_val *o,
+		                                                                             const std::string &p) -> bool {
+			if (!o || !yyjson_is_obj(o))
+				return false;
+
+			yyjson_obj_iter iter;
+			yyjson_obj_iter_init(o, &iter);
+			yyjson_val *key;
+
+			while ((key = yyjson_obj_iter_next(&iter))) {
+				const char *field_name = yyjson_get_str(key);
+				yyjson_val *field_val = yyjson_obj_iter_get_val(key);
+				std::string field_path = p.empty() ? field_name : p + "." + field_name;
+
+				// Check if this exact path is mapped.
+				bool is_mapped = all_mapped_paths.count(field_path) > 0;
+
+				if (!is_mapped) {
+					// Check if any mapped path starts with this path (it's a parent of a mapped field).
+					bool is_parent_of_mapped = false;
+					for (const auto &mp : all_mapped_paths) {
+						if (mp.find(field_path + ".") == 0) {
+							is_parent_of_mapped = true;
+							break;
+						}
+					}
+
+					if (!is_parent_of_mapped) {
+						// This is an unmapped field!
+						return true;
+					}
+				}
+
+				// If it's an object, recurse into it.
+				if (yyjson_is_obj(field_val)) {
+					if (check_recursive(field_val, field_path)) {
+						return true;
+					}
+				}
+			}
+			return false;
+		};
+
+		return check_recursive(obj, prefix);
+	};
 
 	// Scan each document.
 	size_t idx, max;
@@ -942,24 +991,30 @@ std::set<std::string> DetectArrayFields(ElasticsearchClient &client, const std::
 		if (!source)
 			continue;
 
-		// Check each field path.
+		// Check for unmapped fields (only if not already detected).
+		if (!result.has_unmapped_fields) {
+			result.has_unmapped_fields = check_for_unmapped(source, "");
+		}
+
+		// Check each field path for arrays.
 		for (const auto &field_path : field_paths) {
 			// Skip geo fields (their array format represents coordinates, not multiple values).
 			if (skip_fields.count(field_path))
 				continue;
 
 			// Skip if already detected as array.
-			if (array_fields.count(field_path))
+			if (result.array_fields.count(field_path))
 				continue;
 
 			yyjson_val *val = GetValueByPath(source, field_path);
 			if (val && yyjson_is_arr(val)) {
-				array_fields.insert(field_path);
+				result.array_fields.insert(field_path);
 			}
 		}
 
-		// Early exit if all non-skipped fields are detected as arrays.
-		if (array_fields.size() + skip_fields.size() >= field_paths.size()) {
+		// Early exit if all non-skipped fields are detected as arrays AND we've found unmapped fields.
+		bool all_arrays_found = (result.array_fields.size() + skip_fields.size() >= field_paths.size());
+		if (all_arrays_found && result.has_unmapped_fields) {
 			break;
 		}
 	}
@@ -971,28 +1026,7 @@ std::set<std::string> DetectArrayFields(ElasticsearchClient &client, const std::
 	}
 
 	yyjson_doc_free(doc);
-	return array_fields;
-}
-
-//===--------------------------------------------------------------------===//
-// Query Parsing Functions
-//===--------------------------------------------------------------------===//
-
-int64_t ExtractSizeFromQuery(const std::string &query) {
-	yyjson_doc *doc = yyjson_read(query.c_str(), query.size(), 0);
-	if (!doc)
-		return -1;
-
-	yyjson_val *root = yyjson_doc_get_root(doc);
-	yyjson_val *size_val = yyjson_obj_get(root, "size");
-
-	int64_t size = -1;
-	if (size_val && (yyjson_is_int(size_val) || yyjson_is_uint(size_val))) {
-		size = yyjson_get_sint(size_val);
-	}
-
-	yyjson_doc_free(doc);
-	return size;
+	return result;
 }
 
 //===--------------------------------------------------------------------===//

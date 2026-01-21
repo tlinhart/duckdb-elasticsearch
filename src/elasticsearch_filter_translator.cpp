@@ -1,4 +1,4 @@
-#include "es_filter_translator.hpp"
+#include "elasticsearch_filter_translator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -64,7 +64,8 @@ yyjson_mut_val *ElasticsearchFilterTranslator::ValueToJson(yyjson_mut_doc *doc, 
 		return yyjson_mut_strcpy(doc, StringValue::Get(value).c_str());
 
 	case LogicalTypeId::DATE: {
-		// Convert to ISO date string.
+		// Convert to ISO 8601 date string (YYYY-MM-DD).
+		// Date::ToString returns YYYY-MM-DD format which ES accepts.
 		auto date = DateValue::Get(value);
 		auto str = Date::ToString(date);
 		return yyjson_mut_strcpy(doc, str.c_str());
@@ -74,9 +75,15 @@ yyjson_mut_val *ElasticsearchFilterTranslator::ValueToJson(yyjson_mut_doc *doc, 
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS: {
-		// Convert to ISO timestamp string.
+		// Convert to ISO 8601 timestamp string.
+		// Timestamp::ToString returns "YYYY-MM-DD HH:MM:SS" but ES expects "YYYY-MM-DDTHH:MM:SS".
 		auto ts = TimestampValue::Get(value);
 		auto str = Timestamp::ToString(ts);
+		// Replace space with 'T' for ISO 8601 compliance.
+		auto space_pos = str.find(' ');
+		if (space_pos != string::npos) {
+			str[space_pos] = 'T';
+		}
 		return yyjson_mut_strcpy(doc, str.c_str());
 	}
 

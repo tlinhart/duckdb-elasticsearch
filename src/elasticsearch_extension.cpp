@@ -1,9 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "elasticsearch_extension.hpp"
-#include "es_search.hpp"
-#include "es_query.hpp"
-#include "es_aggregate.hpp"
+#include "elasticsearch_query.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 
@@ -11,9 +9,7 @@ namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register table functions.
-	RegisterElasticsearchSearchFunction(loader);
 	RegisterElasticsearchQueryFunction(loader);
-	RegisterElasticsearchAggregateFunction(loader);
 }
 
 void ElasticsearchExtension::Load(ExtensionLoader &loader) {

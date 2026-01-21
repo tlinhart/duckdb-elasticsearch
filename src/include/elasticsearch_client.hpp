@@ -41,9 +41,6 @@ public:
 	// Get index mapping.
 	ElasticsearchResponse GetMapping(const std::string &index);
 
-	// Aggregation query.
-	ElasticsearchResponse Aggregate(const std::string &index, const std::string &agg_query);
-
 private:
 	ElasticsearchConfig config_;
 

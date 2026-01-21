@@ -2,7 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "es_client.hpp"
+#include "elasticsearch_client.hpp"
 #include "yyjson.hpp"
 
 #include <map>
@@ -53,10 +53,16 @@ LogicalType MergeStructTypes(const LogicalType &type1, const LogicalType &type2)
 // Array Detection Functions
 //===--------------------------------------------------------------------===//
 
-// Detect which fields contain arrays by sampling documents.
-std::set<std::string> DetectArrayFields(ElasticsearchClient &client, const std::string &index, const std::string &query,
-                                        const vector<string> &field_paths, const vector<string> &es_types,
-                                        int64_t sample_size);
+// Result of sampling documents for schema inference.
+struct SampleResult {
+	std::set<std::string> array_fields; // Fields detected as containing arrays.
+	bool has_unmapped_fields;           // Whether any unmapped fields were found in the sample.
+};
+
+// Sample documents to detect arrays and unmapped fields.
+SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &index, const std::string &query,
+                             const vector<string> &field_paths, const vector<string> &es_types,
+                             const std::set<std::string> &all_mapped_paths, int64_t sample_size);
 
 //===--------------------------------------------------------------------===//
 // JSON Value Extraction Functions
@@ -92,13 +98,6 @@ std::string GeoShapeToGeoJSON(yyjson_val *val);
 
 // Convert WKT string to GeoJSON.
 std::string WktToGeoJSON(const std::string &wkt);
-
-//===--------------------------------------------------------------------===//
-// Query Parsing Functions
-//===--------------------------------------------------------------------===//
-
-// Parse the user query to extract "size" parameter.
-int64_t ExtractSizeFromQuery(const std::string &query);
 
 //===--------------------------------------------------------------------===//
 // String Utility Functions

@@ -2,11 +2,11 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "es_client.hpp"
+#include "elasticsearch_client.hpp"
 
 namespace duckdb {
 
-// Register the es_query table function with filter/projection pushdown support.
+// Register the elasticsearch_query table function with filter/projection pushdown support.
 void RegisterElasticsearchQueryFunction(ExtensionLoader &loader);
 
 } // namespace duckdb

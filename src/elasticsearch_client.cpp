@@ -1,4 +1,4 @@
-#include "es_client.hpp"
+#include "elasticsearch_client.hpp"
 #include "duckdb/common/exception.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -159,11 +159,6 @@ ElasticsearchResponse ElasticsearchClient::ClearScroll(const std::string &scroll
 
 ElasticsearchResponse ElasticsearchClient::GetMapping(const std::string &index) {
 	return PerformRequestWithRetry("GET", "/" + index + "/_mapping", "");
-}
-
-ElasticsearchResponse ElasticsearchClient::Aggregate(const std::string &index, const std::string &agg_query) {
-	std::string path = "/" + index + "/_search?size=0";
-	return PerformRequestWithRetry("POST", path, agg_query);
 }
 
 } // namespace duckdb
