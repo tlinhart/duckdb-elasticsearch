@@ -5,6 +5,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "yyjson.hpp"
 
@@ -37,8 +38,12 @@ public:
 	                                        const unordered_set<string> &text_fields);
 
 	// Translate a single filter for a specific column.
+	// The es_types map contains field name to Elasticsearch type mappings.
+	// The text_fields set contains field names that are text type (need .keyword for exact match).
+	// These maps support nested field paths.
 	static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
-	                                       const string &es_type, bool is_text_field);
+	                                       const unordered_map<string, string> &es_types,
+	                                       const unordered_set<string> &text_fields);
 
 private:
 	// Individual filter translators.
@@ -50,11 +55,14 @@ private:
 	static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name);
 
 	static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const ConjunctionAndFilter &filter,
-	                                               const string &column_name, const string &es_type,
-	                                               bool is_text_field);
+	                                               const string &column_name,
+	                                               const unordered_map<string, string> &es_types,
+	                                               const unordered_set<string> &text_fields);
 
 	static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const ConjunctionOrFilter &filter,
-	                                              const string &column_name, const string &es_type, bool is_text_field);
+	                                              const string &column_name,
+	                                              const unordered_map<string, string> &es_types,
+	                                              const unordered_set<string> &text_fields);
 
 	static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter, const string &field_name,
 	                                         bool is_text_field);

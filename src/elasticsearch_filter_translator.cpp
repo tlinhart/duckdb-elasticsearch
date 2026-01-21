@@ -3,6 +3,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/filter/struct_filter.hpp"
 
 namespace duckdb {
 
@@ -108,14 +109,8 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilters(yyjson_mut_doc *
 		}
 
 		const string &column_name = column_names[col_idx];
-		string es_type;
-		auto es_type_it = es_types.find(column_name);
-		if (es_type_it != es_types.end()) {
-			es_type = es_type_it->second;
-		}
-		bool is_text = text_fields.count(column_name) > 0;
 
-		return TranslateFilter(doc, *filter, column_name, es_type, is_text);
+		return TranslateFilter(doc, *filter, column_name, es_types, text_fields);
 	}
 
 	// Multiple filters, combine with bool.must (AND).
@@ -131,14 +126,8 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilters(yyjson_mut_doc *
 		}
 
 		const string &column_name = column_names[col_idx];
-		string es_type;
-		auto es_type_it = es_types.find(column_name);
-		if (es_type_it != es_types.end()) {
-			es_type = es_type_it->second;
-		}
-		bool is_text = text_fields.count(column_name) > 0;
 
-		yyjson_mut_val *translated = TranslateFilter(doc, *filter, column_name, es_type, is_text);
+		yyjson_mut_val *translated = TranslateFilter(doc, *filter, column_name, es_types, text_fields);
 		if (translated) {
 			yyjson_mut_arr_append(must_arr, translated);
 		}
@@ -161,8 +150,12 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilters(yyjson_mut_doc *
 }
 
 yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter,
-                                                               const string &column_name, const string &es_type,
-                                                               bool is_text_field) {
+                                                               const string &column_name,
+                                                               const unordered_map<string, string> &es_types,
+                                                               const unordered_set<string> &text_fields) {
+	// Look up the text field status for this column.
+	bool is_text_field = text_fields.count(column_name) > 0;
+
 	switch (filter.filter_type) {
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &const_filter = filter.Cast<ConstantFilter>();
@@ -177,12 +170,12 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilter(yyjson_mut_doc *d
 
 	case TableFilterType::CONJUNCTION_AND: {
 		auto &conj_filter = filter.Cast<ConjunctionAndFilter>();
-		return TranslateConjunctionAnd(doc, conj_filter, column_name, es_type, is_text_field);
+		return TranslateConjunctionAnd(doc, conj_filter, column_name, es_types, text_fields);
 	}
 
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conj_filter = filter.Cast<ConjunctionOrFilter>();
-		return TranslateConjunctionOr(doc, conj_filter, column_name, es_type, is_text_field);
+		return TranslateConjunctionOr(doc, conj_filter, column_name, es_types, text_fields);
 	}
 
 	case TableFilterType::IN_FILTER: {
@@ -193,6 +186,19 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilter(yyjson_mut_doc *d
 	case TableFilterType::EXPRESSION_FILTER: {
 		auto &expr_filter = filter.Cast<ExpressionFilter>();
 		return TranslateExpressionFilter(doc, expr_filter, column_name, is_text_field);
+	}
+
+	case TableFilterType::STRUCT_EXTRACT: {
+		// Handle filters on nested struct fields.
+		// The StructFilter wraps the child filter with the nested field name.
+		auto &struct_filter = filter.Cast<StructFilter>();
+
+		// Build the nested field path.
+		string nested_field = column_name + "." + struct_filter.child_name;
+
+		// Recursively translate the child filter with the nested field path.
+		// The es_types and text_fields maps may contain entries for nested paths.
+		return TranslateFilter(doc, *struct_filter.child_filter, nested_field, es_types, text_fields);
 	}
 
 	default:
@@ -327,13 +333,14 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateIsNotNull(yyjson_mut_doc
 
 yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConjunctionAnd(yyjson_mut_doc *doc,
                                                                        const ConjunctionAndFilter &filter,
-                                                                       const string &column_name, const string &es_type,
-                                                                       bool is_text_field) {
+                                                                       const string &column_name,
+                                                                       const unordered_map<string, string> &es_types,
+                                                                       const unordered_set<string> &text_fields) {
 	// {"bool": {"must": [filter1, filter2, ...]}}
 	yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
 
 	for (auto &child_filter : filter.child_filters) {
-		yyjson_mut_val *translated = TranslateFilter(doc, *child_filter, column_name, es_type, is_text_field);
+		yyjson_mut_val *translated = TranslateFilter(doc, *child_filter, column_name, es_types, text_fields);
 		if (translated) {
 			yyjson_mut_arr_append(must_arr, translated);
 		}
@@ -357,13 +364,14 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConjunctionAnd(yyjson_mu
 
 yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConjunctionOr(yyjson_mut_doc *doc,
                                                                       const ConjunctionOrFilter &filter,
-                                                                      const string &column_name, const string &es_type,
-                                                                      bool is_text_field) {
+                                                                      const string &column_name,
+                                                                      const unordered_map<string, string> &es_types,
+                                                                      const unordered_set<string> &text_fields) {
 	// {"bool": {"should": [filter1, filter2, ...], "minimum_should_match": 1}}
 	yyjson_mut_val *should_arr = yyjson_mut_arr(doc);
 
 	for (auto &child_filter : filter.child_filters) {
-		yyjson_mut_val *translated = TranslateFilter(doc, *child_filter, column_name, es_type, is_text_field);
+		yyjson_mut_val *translated = TranslateFilter(doc, *child_filter, column_name, es_types, text_fields);
 		if (translated) {
 			yyjson_mut_arr_append(should_arr, translated);
 		}
