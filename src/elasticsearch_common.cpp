@@ -687,6 +687,35 @@ void CollectAllMappedPaths(yyjson_val *properties, const std::string &prefix, st
 	}
 }
 
+void CollectAllPathTypes(yyjson_val *properties, const std::string &prefix,
+                         std::unordered_map<std::string, std::string> &path_types) {
+	if (!properties || !yyjson_is_obj(properties))
+		return;
+
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(properties, &iter);
+	yyjson_val *key;
+
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		const char *field_name = yyjson_get_str(key);
+		yyjson_val *field_def = yyjson_obj_iter_get_val(key);
+
+		std::string full_path = prefix.empty() ? field_name : prefix + "." + field_name;
+
+		// Get Elasticsearch type for this field.
+		yyjson_val *type_val = yyjson_obj_get(field_def, "type");
+		if (type_val && yyjson_is_str(type_val)) {
+			path_types[full_path] = yyjson_get_str(type_val);
+		}
+
+		// Recursively collect nested paths for object/nested types.
+		yyjson_val *nested_props = yyjson_obj_get(field_def, "properties");
+		if (nested_props && yyjson_is_obj(nested_props)) {
+			CollectAllPathTypes(nested_props, full_path, path_types);
+		}
+	}
+}
+
 bool AreTypesCompatible(const LogicalType &type1, const LogicalType &type2) {
 	// Identical types are always compatible.
 	if (type1 == type2) {

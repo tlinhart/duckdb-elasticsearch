@@ -243,13 +243,16 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConstantComparison(yyjso
 		return result;
 	}
 
+	// For text fields, use .keyword sub-field for range queries.
+	// Text fields are analyzed so range queries operate on tokens, not original values.
+	// The .keyword sub-field stores the original value and supports proper range queries.
 	case ExpressionType::COMPARE_GREATERTHAN: {
 		// {"range": {"field": {"gt": value}}}
 		yyjson_mut_val *range_cond = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_val(doc, range_cond, "gt", value);
 
 		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_gt = yyjson_mut_strcpy(doc, field_name.c_str());
+		yyjson_mut_val *key_gt = yyjson_mut_strcpy(doc, es_field.c_str());
 		yyjson_mut_obj_add(range_inner, key_gt, range_cond);
 
 		yyjson_mut_val *result = yyjson_mut_obj(doc);
@@ -263,7 +266,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConstantComparison(yyjso
 		yyjson_mut_obj_add_val(doc, range_cond, "gte", value);
 
 		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_gte = yyjson_mut_strcpy(doc, field_name.c_str());
+		yyjson_mut_val *key_gte = yyjson_mut_strcpy(doc, es_field.c_str());
 		yyjson_mut_obj_add(range_inner, key_gte, range_cond);
 
 		yyjson_mut_val *result = yyjson_mut_obj(doc);
@@ -277,7 +280,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConstantComparison(yyjso
 		yyjson_mut_obj_add_val(doc, range_cond, "lt", value);
 
 		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_lt = yyjson_mut_strcpy(doc, field_name.c_str());
+		yyjson_mut_val *key_lt = yyjson_mut_strcpy(doc, es_field.c_str());
 		yyjson_mut_obj_add(range_inner, key_lt, range_cond);
 
 		yyjson_mut_val *result = yyjson_mut_obj(doc);
@@ -291,7 +294,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConstantComparison(yyjso
 		yyjson_mut_obj_add_val(doc, range_cond, "lte", value);
 
 		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_lte = yyjson_mut_strcpy(doc, field_name.c_str());
+		yyjson_mut_val *key_lte = yyjson_mut_strcpy(doc, es_field.c_str());
 		yyjson_mut_obj_add(range_inner, key_lte, range_cond);
 
 		yyjson_mut_val *result = yyjson_mut_obj(doc);
@@ -485,15 +488,31 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 		if (percent_pos == pattern.length() - 1 && pattern.find('%') == pattern.rfind('%')) {
 			// Simple prefix query.
 			string prefix = pattern.substr(0, percent_pos);
-			yyjson_mut_val *prefix_inner = yyjson_mut_obj(doc);
-			// Use yyjson_mut_strcpy for dynamic key to ensure string is copied.
-			yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, es_field.c_str());
-			yyjson_mut_val *field_val = yyjson_mut_strcpy(doc, prefix.c_str());
-			yyjson_mut_obj_add(prefix_inner, field_key, field_val);
 
-			yyjson_mut_val *result = yyjson_mut_obj(doc);
-			yyjson_mut_obj_add_val(doc, result, "prefix", prefix_inner);
-			return result;
+			if (is_text_field) {
+				// For text fields, use match_phrase_prefix which works with analyzed text
+				// and is case-insensitive by default.
+				// {"match_phrase_prefix": {"field": "prefix"}}
+				yyjson_mut_val *match_inner = yyjson_mut_obj(doc);
+				yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, field_name.c_str());
+				yyjson_mut_val *field_val = yyjson_mut_strcpy(doc, prefix.c_str());
+				yyjson_mut_obj_add(match_inner, field_key, field_val);
+
+				yyjson_mut_val *result = yyjson_mut_obj(doc);
+				yyjson_mut_obj_add_val(doc, result, "match_phrase_prefix", match_inner);
+				return result;
+			} else {
+				// For keyword fields, use prefix query on the base field.
+				// {"prefix": {"field": "prefix"}}
+				yyjson_mut_val *prefix_inner = yyjson_mut_obj(doc);
+				yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, field_name.c_str());
+				yyjson_mut_val *field_val = yyjson_mut_strcpy(doc, prefix.c_str());
+				yyjson_mut_obj_add(prefix_inner, field_key, field_val);
+
+				yyjson_mut_val *result = yyjson_mut_obj(doc);
+				yyjson_mut_obj_add_val(doc, result, "prefix", prefix_inner);
+				return result;
+			}
 		}
 	}
 
@@ -539,14 +558,19 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 		}
 	}
 
+	// For keyword fields, use the field directly.
 	// {"wildcard": {"field": {"value": "pattern"}}}
+	// Text fields are analyzed (lowercase), so use the base field name (not .keyword) with case_insensitive option.
+	// {"wildcard": {"field": {"value": "pattern", "case_insensitive": true}}}
 	yyjson_mut_val *wildcard_value = yyjson_mut_obj(doc);
-	// "value" is a literal string but es_pattern is dynamic, use strcpy for value.
 	yyjson_mut_obj_add_strcpy(doc, wildcard_value, "value", es_pattern.c_str());
+	if (is_text_field) {
+		yyjson_mut_obj_add_bool(doc, wildcard_value, "case_insensitive", true);
+	}
 
 	yyjson_mut_val *wildcard_inner = yyjson_mut_obj(doc);
-	// Use yyjson_mut_strcpy for dynamic key to ensure string is copied.
-	yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, es_field.c_str());
+	// For text fields use base field name, for keyword fields use as-is.
+	yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, field_name.c_str());
 	yyjson_mut_obj_add(wildcard_inner, field_key, wildcard_value);
 
 	yyjson_mut_val *result = yyjson_mut_obj(doc);

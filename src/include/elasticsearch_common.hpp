@@ -34,6 +34,11 @@ void ParseMapping(yyjson_val *properties, const std::string &prefix, vector<stri
 // Recursively collect all field paths from Elasticsearch mapping properties (including nested children).
 void CollectAllMappedPaths(yyjson_val *properties, const std::string &prefix, std::set<std::string> &paths);
 
+// Recursively collect all field paths with their Elasticsearch types from mapping properties.
+// This includes nested paths for object/nested types.
+void CollectAllPathTypes(yyjson_val *properties, const std::string &prefix,
+                         std::unordered_map<std::string, std::string> &path_types);
+
 // Merge mappings from multiple indices, checking for type compatibility.
 void MergeMappingsFromIndices(yyjson_val *root, vector<string> &column_names, vector<LogicalType> &column_types,
                               vector<string> &field_paths, vector<string> &es_types,

@@ -291,15 +291,41 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	MergeMappingsFromIndices(root, bind_data->all_column_names, bind_data->all_column_types, bind_data->field_paths,
 	                         bind_data->es_types, bind_data->all_mapped_paths);
 
+	// Collect all path types including nested paths.
+	// This is needed for proper filter pushdown on nested struct fields.
+	std::unordered_map<std::string, std::string> all_path_types;
+	yyjson_obj_iter idx_iter;
+	yyjson_obj_iter_init(root, &idx_iter);
+	yyjson_val *idx_key;
+	while ((idx_key = yyjson_obj_iter_next(&idx_iter))) {
+		yyjson_val *idx_obj = yyjson_obj_iter_get_val(idx_key);
+		yyjson_val *mappings = yyjson_obj_get(idx_obj, "mappings");
+		if (mappings) {
+			yyjson_val *properties = yyjson_obj_get(mappings, "properties");
+			if (properties) {
+				CollectAllPathTypes(properties, "", all_path_types);
+			}
+		}
+	}
+
 	yyjson_doc_free(doc);
 
 	// Build Elasticsearch type map and identify text fields.
+	// Include both top-level columns and all nested paths.
 	for (size_t i = 0; i < bind_data->all_column_names.size(); i++) {
 		const string &col_name = bind_data->all_column_names[i];
 		const string &es_type = bind_data->es_types[i];
 		bind_data->es_type_map[col_name] = es_type;
 		if (es_type == "text") {
 			bind_data->text_fields.insert(col_name);
+		}
+	}
+
+	// Add all nested paths to es_type_map and text_fields.
+	for (const auto &entry : all_path_types) {
+		bind_data->es_type_map[entry.first] = entry.second;
+		if (entry.second == "text") {
+			bind_data->text_fields.insert(entry.first);
 		}
 	}
 
