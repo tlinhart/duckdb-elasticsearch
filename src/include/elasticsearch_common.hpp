@@ -21,10 +21,6 @@ struct MergedFieldInfo {
 	std::string first_index; // first index where this field was seen (for error messages)
 };
 
-//===--------------------------------------------------------------------===//
-// Type Mapping Functions
-//===--------------------------------------------------------------------===//
-
 // Build DuckDB type from Elasticsearch field definition.
 LogicalType BuildDuckDBTypeFromMapping(yyjson_val *field_def);
 
@@ -35,7 +31,7 @@ LogicalType BuildStructTypeFromProperties(yyjson_val *properties);
 void ParseMapping(yyjson_val *properties, const std::string &prefix, vector<string> &column_names,
                   vector<LogicalType> &column_types, vector<string> &field_paths, vector<string> &es_types);
 
-// Recursively collect ALL field paths from ES mapping properties (including nested children).
+// Recursively collect all field paths from Elasticsearch mapping properties (including nested children).
 void CollectAllMappedPaths(yyjson_val *properties, const std::string &prefix, std::set<std::string> &paths);
 
 // Merge mappings from multiple indices, checking for type compatibility.
@@ -49,14 +45,10 @@ bool AreTypesCompatible(const LogicalType &type1, const LogicalType &type2);
 // Merge two STRUCT types, combining all fields from both.
 LogicalType MergeStructTypes(const LogicalType &type1, const LogicalType &type2);
 
-//===--------------------------------------------------------------------===//
-// Array Detection Functions
-//===--------------------------------------------------------------------===//
-
 // Result of sampling documents for schema inference.
 struct SampleResult {
-	std::set<std::string> array_fields; // Fields detected as containing arrays.
-	bool has_unmapped_fields;           // Whether any unmapped fields were found in the sample.
+	std::set<std::string> array_fields; // fields detected as containing arrays
+	bool has_unmapped_fields;           // whether any unmapped fields were found in the sample
 };
 
 // Sample documents to detect arrays and unmapped fields.
@@ -64,11 +56,7 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
                              const vector<string> &field_paths, const vector<string> &es_types,
                              const std::set<std::string> &all_mapped_paths, int64_t sample_size);
 
-//===--------------------------------------------------------------------===//
-// JSON Value Extraction Functions
-//===--------------------------------------------------------------------===//
-
-// Helper function to extract a value from a JSON object by path (supports nested fields with dots).
+// Helper function to extract value from a JSON object by path (supports nested fields with dots).
 yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path);
 
 // Extract value from yyjson_val and set it in the result vector.
@@ -86,10 +74,6 @@ void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, cons
 std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string> &mapped_paths,
                                   const std::string &prefix = "");
 
-//===--------------------------------------------------------------------===//
-// Geo Conversion Functions
-//===--------------------------------------------------------------------===//
-
 // Convert Elasticsearch geo_point to GeoJSON format.
 std::string GeoPointToGeoJSON(yyjson_val *val);
 
@@ -98,10 +82,6 @@ std::string GeoShapeToGeoJSON(yyjson_val *val);
 
 // Convert WKT string to GeoJSON.
 std::string WktToGeoJSON(const std::string &wkt);
-
-//===--------------------------------------------------------------------===//
-// String Utility Functions
-//===--------------------------------------------------------------------===//
 
 // Helper to trim whitespace from string.
 std::string TrimString(const std::string &s);

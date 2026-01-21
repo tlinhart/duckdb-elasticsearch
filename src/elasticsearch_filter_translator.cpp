@@ -8,13 +8,9 @@ namespace duckdb {
 
 using namespace duckdb_yyjson;
 
-//===--------------------------------------------------------------------===//
-// Helper Functions
-//===--------------------------------------------------------------------===//
-
 string ElasticsearchFilterTranslator::GetFieldName(const string &column_name, bool is_text_field) {
 	// For text fields, use .keyword sub-field for exact matching.
-	// Text fields are analyzed and don't support exact term queries.
+	// Text fields are analyzed and do not support exact term queries.
 	if (is_text_field) {
 		return column_name + ".keyword";
 	}
@@ -65,7 +61,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::ValueToJson(yyjson_mut_doc *doc, 
 
 	case LogicalTypeId::DATE: {
 		// Convert to ISO 8601 date string (YYYY-MM-DD).
-		// Date::ToString returns YYYY-MM-DD format which ES accepts.
+		// Date::ToString returns YYYY-MM-DD format which Elasticsearch accepts.
 		auto date = DateValue::Get(value);
 		auto str = Date::ToString(date);
 		return yyjson_mut_strcpy(doc, str.c_str());
@@ -76,7 +72,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::ValueToJson(yyjson_mut_doc *doc, 
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_NS: {
 		// Convert to ISO 8601 timestamp string.
-		// Timestamp::ToString returns "YYYY-MM-DD HH:MM:SS" but ES expects "YYYY-MM-DDTHH:MM:SS".
+		// Timestamp::ToString returns YYYY-MM-DD HH:MM:SS but Elasticsearch expects YYYY-MM-DDTHH:MM:SS.
 		auto ts = TimestampValue::Get(value);
 		auto str = Timestamp::ToString(ts);
 		// Replace space with 'T' for ISO 8601 compliance.
@@ -92,10 +88,6 @@ yyjson_mut_val *ElasticsearchFilterTranslator::ValueToJson(yyjson_mut_doc *doc, 
 		return yyjson_mut_strcpy(doc, value.ToString().c_str());
 	}
 }
-
-//===--------------------------------------------------------------------===//
-// Filter Translation
-//===--------------------------------------------------------------------===//
 
 yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilters(yyjson_mut_doc *doc, const TableFilterSet &filters,
                                                                 const vector<string> &column_names,
@@ -126,7 +118,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilters(yyjson_mut_doc *
 		return TranslateFilter(doc, *filter, column_name, es_type, is_text);
 	}
 
-	// Multiple filters - combine with bool.must (AND).
+	// Multiple filters, combine with bool.must (AND).
 	yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
 	yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
 
@@ -204,7 +196,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilter(yyjson_mut_doc *d
 	}
 
 	default:
-		// Unsupported filter type - return nullptr (filter will be applied by DuckDB).
+		// Unsupported filter type, return nullptr (filter will be applied by DuckDB).
 		return nullptr;
 	}
 }
@@ -419,8 +411,8 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateExpressionFilter(yyjson_
                                                                          const ExpressionFilter &filter,
                                                                          const string &column_name,
                                                                          bool is_text_field) {
-	// ExpressionFilter contains arbitrary expressions. We try to detect LIKE patterns.
-	// Other expressions are left for DuckDB to evaluate.
+	// ExpressionFilter contains arbitrary expressions. We try to detect LIKE patterns,
+	// other expressions are left for DuckDB to evaluate.
 	auto &expr = *filter.expr;
 
 	// Check if this is a LIKE expression (implemented as a function call).
@@ -445,19 +437,19 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateExpressionFilter(yyjson_
 		}
 	}
 
-	// Unsupported expression - return nullptr (DuckDB will evaluate it).
+	// Unsupported expression, return nullptr (DuckDB will evaluate it).
 	return nullptr;
 }
 
 yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name,
                                                                     const string &pattern, bool is_text_field) {
-	// Convert SQL LIKE pattern to Elasticsearch wildcard query.
-	// SQL LIKE:  % = any chars, _ = single char
-	// ES wildcard: * = any chars, ? = single char
+	// Convert SQL LIKE pattern to Elasticsearch wildcard query:
+	// SQL LIKE: % = any chars, _ = single char
+	// Elasticsearch wildcard: * = any chars, ? = single char
 	//
 	// Special optimizations:
 	// - "prefix%" -> {"prefix": {"field": "prefix"}} (faster than wildcard)
-	// - Patterns without wildcards -> {"term": {"field": "value"}}
+	// - patterns without wildcards -> {"term": {"field": "value"}}
 
 	string es_field = GetFieldName(field_name, is_text_field);
 
@@ -466,9 +458,9 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 	bool has_underscore = pattern.find('_') != string::npos;
 
 	if (!has_percent && !has_underscore) {
-		// No wildcards - treat as exact match.
+		// No wildcards, treat as exact match.
 		yyjson_mut_val *term_inner = yyjson_mut_obj(doc);
-		// Use yyjson_mut_strcpy for dynamic key to ensure string is copied
+		// Use yyjson_mut_strcpy for dynamic key to ensure string is copied.
 		yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, es_field.c_str());
 		yyjson_mut_val *field_val = yyjson_mut_strcpy(doc, pattern.c_str());
 		yyjson_mut_obj_add(term_inner, field_key, field_val);
@@ -478,15 +470,15 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 		return result;
 	}
 
-	// Check for simple prefix pattern: "prefix%"
+	// Check for simple prefix pattern ("prefix%").
 	if (has_percent && !has_underscore) {
 		size_t percent_pos = pattern.find('%');
-		// Check if there's only one % and it's at the end.
+		// Check if there is only one % and it's at the end.
 		if (percent_pos == pattern.length() - 1 && pattern.find('%') == pattern.rfind('%')) {
 			// Simple prefix query.
 			string prefix = pattern.substr(0, percent_pos);
 			yyjson_mut_val *prefix_inner = yyjson_mut_obj(doc);
-			// Use yyjson_mut_strcpy for dynamic key to ensure string is copied
+			// Use yyjson_mut_strcpy for dynamic key to ensure string is copied.
 			yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, es_field.c_str());
 			yyjson_mut_val *field_val = yyjson_mut_strcpy(doc, prefix.c_str());
 			yyjson_mut_obj_add(prefix_inner, field_key, field_val);
@@ -497,7 +489,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 		}
 	}
 
-	// Convert LIKE pattern to ES wildcard pattern.
+	// Convert LIKE pattern to Elasticsearch wildcard pattern.
 	string es_pattern;
 	es_pattern.reserve(pattern.length());
 
@@ -507,7 +499,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 
 		if (escape_next) {
 			// Previous char was escape, add this char literally.
-			// Escape special ES wildcard chars if needed.
+			// Escape special Elasticsearch wildcard chars if needed.
 			if (c == '*' || c == '?') {
 				es_pattern += '\\';
 			}
@@ -529,7 +521,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 			break;
 		case '*':
 		case '?':
-			// Escape ES wildcard characters that appear literally in the pattern.
+			// Escape Elasticsearch wildcard characters that appear literally in the pattern.
 			es_pattern += '\\';
 			es_pattern += c;
 			break;
@@ -541,11 +533,11 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 
 	// {"wildcard": {"field": {"value": "pattern"}}}
 	yyjson_mut_val *wildcard_value = yyjson_mut_obj(doc);
-	// "value" is a literal string, but es_pattern is dynamic - use strcpy for value
+	// "value" is a literal string but es_pattern is dynamic, use strcpy for value.
 	yyjson_mut_obj_add_strcpy(doc, wildcard_value, "value", es_pattern.c_str());
 
 	yyjson_mut_val *wildcard_inner = yyjson_mut_obj(doc);
-	// Use yyjson_mut_strcpy for dynamic key to ensure string is copied
+	// Use yyjson_mut_strcpy for dynamic key to ensure string is copied.
 	yyjson_mut_val *field_key = yyjson_mut_strcpy(doc, es_field.c_str());
 	yyjson_mut_obj_add(wildcard_inner, field_key, wildcard_value);
 

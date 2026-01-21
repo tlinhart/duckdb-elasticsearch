@@ -24,22 +24,22 @@ using namespace duckdb_yyjson;
 struct ElasticsearchQueryBindData : public TableFunctionData {
 	ElasticsearchConfig config;
 	std::string index;
-	std::string base_query; // User-provided query (optional, merged with filters).
+	std::string base_query; // user-provided query (optional, merged with filters)
 
-	// Schema information - ALL columns from the mapping.
+	// Schema information (all columns from the mapping).
 	vector<string> all_column_names;
 	vector<LogicalType> all_column_types;
 
 	// For storing the Elasticsearch field paths (may differ from column names for nested fields).
 	vector<string> field_paths;
 
-	// For storing ALL mapped field paths including nested (for unmapped detection).
+	// For storing all mapped field paths including nested (for unmapped detection).
 	std::set<string> all_mapped_paths;
 
 	// Store Elasticsearch types for special handling (geo types, text fields).
 	vector<string> es_types;
 
-	// Map from column name to ES type (for filter translation).
+	// Map from column name to Elasticsearch type (for filter translation).
 	unordered_map<string, string> es_type_map;
 
 	// Set of text fields (need .keyword for exact matching).
@@ -94,7 +94,7 @@ struct ElasticsearchQueryGlobalState : public GlobalTableFunctionState {
 	}
 };
 
-// Build the final ES query by merging base query with pushed filters and projection.
+// Build the final Elasticsearch query by merging base query with pushed filters and projection.
 static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, const TableFilterSet *filters,
                                    const vector<idx_t> &column_ids, int64_t limit) {
 	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
@@ -104,7 +104,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	yyjson_mut_val *query_clause = nullptr;
 	yyjson_mut_val *base_query_clause = nullptr;
 
-	// Parse base query if provided (the query parameter IS the query clause itself now).
+	// Parse base query if provided (the query parameter is the query clause itself now).
 	if (!bind_data.base_query.empty()) {
 		yyjson_doc *base_doc = yyjson_read(bind_data.base_query.c_str(), bind_data.base_query.size(), 0);
 		if (base_doc) {
@@ -114,12 +114,12 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		}
 	}
 
-	// Translate pushed filters to ES query DSL.
+	// Translate pushed filters to Elasticsearch query DSL.
 	yyjson_mut_val *filter_clause = nullptr;
 	if (filters && !filters->filters.empty()) {
 		// Build column names vector for the filter translator.
-		// IMPORTANT: Filter indices in TableFilterSet are relative to column_ids (the projected columns),
-		// NOT the original bind schema. We need to map them correctly.
+		// Important: Filter indices in TableFilterSet are relative to column_ids (the projected columns)
+		// and not the original bind schema, we need to map them correctly.
 		//
 		// column_ids contains indices into the bind schema: [_id (0), ...fields... (1-N), optionally _unmapped_ (N+1)]
 		// Filter indices are positions within column_ids.
@@ -128,11 +128,11 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 			if (col_id == 0) {
 				filter_column_names.push_back("_id");
 			} else if (col_id <= bind_data.all_column_names.size()) {
-				// Regular field column - col_id 1 maps to all_column_names[0], etc.
+				// regular field column (col_id 1 maps to all_column_names[0], etc.)
 				const string &name = bind_data.all_column_names[col_id - 1];
 				filter_column_names.push_back(name);
 			} else {
-				// _unmapped_ column.
+				// _unmapped_ column
 				filter_column_names.push_back("_unmapped_");
 			}
 		}
@@ -143,7 +143,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 
 	// Merge base query and filter clause.
 	if (base_query_clause && filter_clause) {
-		// Both exist - combine with bool.must.
+		// Both exist, combine with bool.must.
 		yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
 		yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
 		yyjson_mut_arr_append(must_arr, base_query_clause);
@@ -157,7 +157,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	} else if (filter_clause) {
 		query_clause = filter_clause;
 	} else {
-		// No query - use match_all.
+		// No query, use match_all.
 		query_clause = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_val(doc, query_clause, "match_all", yyjson_mut_obj(doc));
 	}
@@ -167,7 +167,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	// Add _source projection if we have specific columns.
 	// Column layout: [_id, ...fields..., _unmapped_].
 	// We need to request only the field paths for projected columns.
-	// IMPORTANT: If _unmapped_ column is projected, we need the full _source to detect unmapped fields.
+	// Important: If _unmapped_ column is projected, we need the full _source to detect unmapped fields.
 	bool needs_full_source = false;
 	for (idx_t col_id : column_ids) {
 		// _unmapped_ column is always at position field_paths.size() + 1 (after _id and all fields).
@@ -180,11 +180,11 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	if (!column_ids.empty() && !needs_full_source) {
 		vector<string> source_fields;
 		for (idx_t col_id : column_ids) {
-			// Skip _id (col 0).
+			// skip _id (col 0)
 			if (col_id == 0) {
-				continue; // _id is always returned by ES.
+				continue; // _id is always returned by Elasticsearch
 			}
-			idx_t field_idx = col_id - 1; // Adjust for _id column.
+			idx_t field_idx = col_id - 1; // adjust for _id column
 			if (field_idx < bind_data.field_paths.size()) {
 				source_fields.push_back(bind_data.field_paths[field_idx]);
 			}
@@ -198,7 +198,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 			yyjson_mut_obj_add_val(doc, root, "_source", source_arr);
 		}
 	}
-	// If needs_full_source is true, we don't set _source, so ES returns the full document.
+	// If needs_full_source is true, we do not set _source, so Elasticsearch returns the full document.
 
 	// Add size/limit if specified.
 	if (limit > 0) {
@@ -217,7 +217,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	return result;
 }
 
-// Bind function - called to determine output schema.
+// Bind function, called to determine output schema.
 static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, TableFunctionBindInput &input,
                                                        vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<ElasticsearchQueryBindData>();
@@ -283,7 +283,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 
 	yyjson_doc_free(doc);
 
-	// Build ES type map and identify text fields.
+	// Build Elasticsearch type map and identify text fields.
 	for (size_t i = 0; i < bind_data->all_column_names.size(); i++) {
 		const string &col_name = bind_data->all_column_names[i];
 		const string &es_type = bind_data->es_types[i];
@@ -351,18 +351,18 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	// Column layout: [_id (0), ...fields... (1 to N), optionally _unmapped_ (N+1 if present)].
 	for (idx_t col_id : input.column_ids) {
 		if (col_id == 0) {
-			// _id column.
+			// _id column
 			state->projected_field_paths.push_back("_id");
 			state->projected_es_types.push_back("");
 			state->projected_types.push_back(LogicalType::VARCHAR);
 		} else if (col_id <= bind_data.field_paths.size()) {
-			// Regular field column.
+			// regular field column
 			idx_t field_idx = col_id - 1;
 			state->projected_field_paths.push_back(bind_data.field_paths[field_idx]);
 			state->projected_es_types.push_back(bind_data.es_types[field_idx]);
 			state->projected_types.push_back(bind_data.all_column_types[field_idx]);
 		} else {
-			// _unmapped_ column.
+			// _unmapped_ column
 			state->projected_field_paths.push_back("_unmapped_");
 			state->projected_es_types.push_back("");
 			state->projected_types.push_back(LogicalType::JSON());
@@ -523,7 +523,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 			const LogicalType &col_type = state.projected_types[out_col];
 
 			if (col_id == 0) {
-				// _id column.
+				// _id column
 				if (id_val && yyjson_is_str(id_val)) {
 					auto str_val = StringVector::AddString(output.data[out_col], yyjson_get_str(id_val));
 					FlatVector::GetData<string_t>(output.data[out_col])[output_idx] = str_val;
@@ -531,7 +531,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 					FlatVector::SetNull(output.data[out_col], output_idx, true);
 				}
 			} else if (field_path == "_unmapped_") {
-				// _unmapped_ column.
+				// _unmapped_ column
 				std::string unmapped_json = CollectUnmappedFields(source, bind_data.all_mapped_paths);
 				if (unmapped_json.empty()) {
 					FlatVector::SetNull(output.data[out_col], output_idx, true);
@@ -540,7 +540,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 					FlatVector::GetData<string_t>(output.data[out_col])[output_idx] = str_val;
 				}
 			} else {
-				// Regular field.
+				// regular field
 				yyjson_val *val = nullptr;
 				if (field_path == "_source") {
 					val = source;

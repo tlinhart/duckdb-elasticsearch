@@ -115,7 +115,7 @@ ElasticsearchResponse ElasticsearchClient::PerformRequestWithRetry(const std::st
 		bool should_retry = false;
 
 		if (response.status_code > 0) {
-			// We got an HTTP response - check if status code is retryable.
+			// We got an HTTP response, check if status code is retryable.
 			should_retry = RETRYABLE_STATUS_CODES.count(response.status_code) > 0;
 		} else {
 			// status_code of 0 typically means network errors which are generally retryable.
@@ -153,7 +153,7 @@ ElasticsearchResponse ElasticsearchClient::ScrollNext(const std::string &scroll_
 
 ElasticsearchResponse ElasticsearchClient::ClearScroll(const std::string &scroll_id) {
 	std::string body = R"({"scroll_id":")" + scroll_id + R"("})";
-	// Don't retry scroll cleanup as it's not critical if it fails.
+	// Do not retry scroll cleanup as it's not critical if it fails.
 	return PerformRequest("DELETE", "/_search/scroll", body);
 }
 

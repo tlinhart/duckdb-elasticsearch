@@ -6,7 +6,7 @@
 
 namespace duckdb {
 
-// Register the elasticsearch_query table function with filter/projection pushdown support.
+// Register the elasticsearch_query table function.
 void RegisterElasticsearchQueryFunction(ExtensionLoader &loader);
 
 } // namespace duckdb

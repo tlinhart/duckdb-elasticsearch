@@ -8,10 +8,6 @@ namespace duckdb {
 
 using namespace duckdb_yyjson;
 
-//===--------------------------------------------------------------------===//
-// String Utility Functions
-//===--------------------------------------------------------------------===//
-
 std::string TrimString(const std::string &s) {
 	size_t start = s.find_first_not_of(" \t\n\r");
 	if (start == std::string::npos)
@@ -19,10 +15,6 @@ std::string TrimString(const std::string &s) {
 	size_t end = s.find_last_not_of(" \t\n\r");
 	return s.substr(start, end - start + 1);
 }
-
-//===--------------------------------------------------------------------===//
-// WKT Parsing Helper Functions
-//===--------------------------------------------------------------------===//
 
 // Helper to parse a coordinate pair "lon lat" from WKT.
 static bool ParseWktCoordinate(const std::string &s, double &lon, double &lat) {
@@ -86,10 +78,6 @@ static size_t FindMatchingParenthesis(const std::string &s, size_t open_pos) {
 	}
 	return std::string::npos;
 }
-
-//===--------------------------------------------------------------------===//
-// WKT to GeoJSON Conversion Functions
-//===--------------------------------------------------------------------===//
 
 // Parse WKT POINT to GeoJSON.
 static std::string WktPointToGeoJSON(const std::string &wkt) {
@@ -212,7 +200,7 @@ static std::string WktMultiPointToGeoJSON(const std::string &wkt) {
 			pos = point_end + 1;
 		}
 	} else {
-		// It's (lon1 lat1, lon2 lat2) format - simple coordinate list.
+		// It's (lon1 lat1, lon2 lat2) format (simple coordinate list).
 		std::string coord_array = ParseWktCoordinateSequence(content);
 		if (coord_array.empty()) {
 			return "";
@@ -355,7 +343,7 @@ static std::string WktGeometryCollectionToGeoJSON(const std::string &wkt) {
 	std::string result = "{\"type\":\"GeometryCollection\",\"geometries\":[";
 	bool first = true;
 
-	// Parse individual geometries - they are separated by commas at depth 0.
+	// Parse individual geometries (separated by commas at depth 0).
 	size_t pos = 0;
 	while (pos < content.size()) {
 		// Skip whitespace and commas.
@@ -426,17 +414,13 @@ std::string WktToGeoJSON(const std::string &wkt) {
 	return "";
 }
 
-//===--------------------------------------------------------------------===//
-// Geo Conversion Functions
-//===--------------------------------------------------------------------===//
-
 std::string GeoPointToGeoJSON(yyjson_val *val) {
 	if (!val)
 		return "";
 
 	// geo_point can be in multiple formats:
 	// 1. object: {"lat": 41.12, "lon": -71.34}
-	// 2. array: [-71.34, 41.12] (note: lon, lat order)
+	// 2. array: [-71.34, 41.12] (lon, lat order)
 	// 3. string: "41.12,-71.34" or geohash
 	// 4. WKT: "POINT (-71.34 41.12)"
 
@@ -449,7 +433,6 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 			return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon_d) + "," + std::to_string(lat_d) + "]}";
 		}
 	} else if (yyjson_is_arr(val)) {
-		// Array format: [lon, lat].
 		yyjson_val *lon = yyjson_arr_get(val, 0);
 		yyjson_val *lat = yyjson_arr_get(val, 1);
 		if (lat && lon) {
@@ -474,7 +457,7 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 				double lon = std::stod(s.substr(comma_pos + 1));
 				return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon) + "," + std::to_string(lat) + "]}";
 			} catch (...) {
-				// Not a valid lat,lon string, return empty (might be geohash - not supported).
+				// Not a valid "lat,lon" string, return empty (might be geohash - not supported).
 			}
 		}
 	}
@@ -489,13 +472,13 @@ std::string GeoShapeToGeoJSON(yyjson_val *val) {
 
 	// geo_shape can be in GeoJSON format (object) or WKT format (string).
 	if (yyjson_is_str(val)) {
-		// WKT format - parse and convert to GeoJSON.
+		// WKT format, parse and convert to GeoJSON.
 		const char *str = yyjson_get_str(val);
 		std::string wkt(str);
 		return WktToGeoJSON(wkt);
 	}
 
-	// Object format - already GeoJSON, serialize it.
+	// Object format (already GeoJSON), serialize it.
 	char *json_str = yyjson_val_write(val, 0, nullptr);
 	if (json_str) {
 		std::string result(json_str);
@@ -504,10 +487,6 @@ std::string GeoShapeToGeoJSON(yyjson_val *val) {
 	}
 	return "";
 }
-
-//===--------------------------------------------------------------------===//
-// JSON Value Extraction Functions
-//===--------------------------------------------------------------------===//
 
 yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path) {
 	if (!obj || !yyjson_is_obj(obj))
@@ -528,10 +507,6 @@ yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path) {
 
 	return yyjson_obj_get(current, remaining.c_str());
 }
-
-//===--------------------------------------------------------------------===//
-// Type Mapping Functions
-//===--------------------------------------------------------------------===//
 
 LogicalType BuildStructTypeFromProperties(yyjson_val *properties) {
 	if (!properties || !yyjson_is_obj(properties)) {
@@ -614,8 +589,8 @@ LogicalType BuildDuckDBTypeFromMapping(yyjson_val *field_def) {
 			} else if (es_type == "ip") {
 				return LogicalType::VARCHAR;
 			} else if (es_type == "geo_point" || es_type == "geo_shape") {
-				// Return as VARCHAR containing GeoJSON - user can use ST_GeomFromGeoJSON if spatial extension is
-				// loaded.
+				// Return as VARCHAR containing GeoJSON. User can use ST_GeomFromGeoJSON if spatial
+				// extension is loaded.
 				return LogicalType::VARCHAR;
 			} else if (es_type == "nested" || es_type == "object") {
 				return LogicalType::VARCHAR; // return nested objects as JSON string (fallback)
@@ -755,7 +730,7 @@ LogicalType MergeStructTypes(const LogicalType &type1, const LogicalType &type2)
 	for (const auto &child : children2) {
 		auto it = merged.find(child.first);
 		if (it != merged.end()) {
-			// Field exists in both - merge recursively if both are structs.
+			// Field exists in both, merge recursively if both are structs.
 			if (it->second.id() == LogicalTypeId::STRUCT && child.second.id() == LogicalTypeId::STRUCT) {
 				merged[child.first] = MergeStructTypes(it->second, child.second);
 			}
@@ -814,7 +789,7 @@ void MergeMappingsFromIndices(yyjson_val *root, vector<string> &column_names, ve
 			auto it = merged_fields.find(field_path);
 
 			if (it == merged_fields.end()) {
-				// New field - add it.
+				// New field, add it.
 				MergedFieldInfo info;
 				info.type = idx_types[i];
 				info.es_type = idx_es_types[i];
@@ -822,7 +797,7 @@ void MergeMappingsFromIndices(yyjson_val *root, vector<string> &column_names, ve
 				merged_fields[field_path] = info;
 				field_order.push_back(field_path);
 			} else {
-				// Existing field - check compatibility.
+				// Existing field, check compatibility.
 				if (!AreTypesCompatible(it->second.type, idx_types[i])) {
 					throw InvalidInputException(
 					    "Incompatible field types for '%s': index '%s' has type %s, but index '%s' has type %s",
@@ -855,10 +830,6 @@ void MergeMappingsFromIndices(yyjson_val *root, vector<string> &column_names, ve
 		es_types.push_back(info.es_type);
 	}
 }
-
-//===--------------------------------------------------------------------===//
-// Array Detection Functions
-//===--------------------------------------------------------------------===//
 
 SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &index, const std::string &query,
                              const vector<string> &field_paths, const vector<string> &es_types,
@@ -1012,7 +983,7 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 			}
 		}
 
-		// Early exit if all non-skipped fields are detected as arrays AND we've found unmapped fields.
+		// Early exit if all non-skipped fields are detected as arrays AND we have found unmapped fields.
 		bool all_arrays_found = (result.array_fields.size() + skip_fields.size() >= field_paths.size());
 		if (all_arrays_found && result.has_unmapped_fields) {
 			break;
@@ -1028,10 +999,6 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 	yyjson_doc_free(doc);
 	return result;
 }
-
-//===--------------------------------------------------------------------===//
-// Unmapped Fields Collection
-//===--------------------------------------------------------------------===//
 
 std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string> &mapped_paths,
                                   const std::string &prefix) {
@@ -1075,7 +1042,7 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 			    }
 
 			    if (is_mapped) {
-				    // This field is mapped - but check if it's an object/nested type with child fields.
+				    // This field is mapped, but check if it is an object/nested type with child fields.
 				    // If the field has no children in mapped_paths, it's a terminal type (geo_point, etc.)
 				    // and we should NOT recurse into it even if the value is an object.
 				    bool has_mapped_children = false;
@@ -1087,7 +1054,7 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 				    }
 
 				    if (has_mapped_children && yyjson_is_obj(field_val)) {
-					    // This is an object/nested type with defined child fields - check for unmapped children.
+					    // This is an object/nested type with defined child fields, check for unmapped children.
 					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
 					    bool sub_has_unmapped = false;
 
@@ -1111,7 +1078,7 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 							    }
 
 							    if (!is_sub_parent) {
-								    // This sub-field is unmapped - add it.
+								    // This sub-field is unmapped, add it.
 								    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, sub_field_val);
 								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, sub_field_name, copied);
 								    sub_has_unmapped = true;
@@ -1140,9 +1107,9 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 						    has_unmapped = true;
 					    }
 				    }
-				    // Terminal type (geo_point, keyword, etc.) - do not recurse.
+				    // Terminal type (geo_point, keyword, etc.), do not recurse.
 			    } else if (is_parent_of_mapped) {
-				    // This is a parent object of mapped fields - recurse to find unmapped children.
+				    // This is a parent object of mapped fields, recurse to find unmapped children.
 				    if (yyjson_is_obj(field_val)) {
 					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
 					    collect_unmapped(field_val, sub_obj, field_path);
@@ -1152,7 +1119,7 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 					    }
 				    }
 			    } else {
-				    // This field is completely unmapped - add the entire value.
+				    // This field is completely unmapped, add the entire value.
 				    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, field_val);
 				    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, copied);
 				    has_unmapped = true;
@@ -1174,10 +1141,6 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 	yyjson_mut_doc_free(unmapped_doc);
 	return result;
 }
-
-//===--------------------------------------------------------------------===//
-// Value Conversion Functions
-//===--------------------------------------------------------------------===//
 
 void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type) {
 	if (!val || yyjson_is_null(val)) {
@@ -1214,7 +1177,7 @@ void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const 
 
 	// Handle single value as single-element list (Elasticsearch can return single values for array fields).
 	if (!yyjson_is_arr(val)) {
-		// Single value - treat as list with one element.
+		// Single value, treat as list with one element.
 		auto &child_vector = ListVector::GetEntry(result);
 		idx_t current_size = ListVector::GetListSize(result);
 
@@ -1262,15 +1225,15 @@ void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const Logi
 		return;
 	}
 
-	// If the type is LIST, we need to handle it specially - either the value is an array,
-	// or it's a single value that should be wrapped in a single-element list.
+	// If the type is LIST, we need to handle it specially. Either the value is an array,
+	// or it is a single value that should be wrapped in a single-element list.
 	// This must be checked BEFORE any es_type-specific handling.
 	if (type.id() == LogicalTypeId::LIST) {
 		SetListValueFromJson(val, result, row_idx, type, es_type);
 		return;
 	}
 
-	// Handle geo_point and geo_shape specially - convert to GeoJSON string.
+	// Handle geo_point and geo_shape specially, convert to GeoJSON string.
 	if (es_type == "geo_point" || es_type == "geo_shape") {
 		std::string geojson;
 		if (es_type == "geo_point") {
