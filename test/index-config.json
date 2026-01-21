@@ -5,7 +5,12 @@
   "mappings": {
     "dynamic": false,
     "properties": {
-      "name": { "type": "text" },
+      "name": {
+        "type": "text",
+        "fields": {
+          "keyword": { "type": "keyword" }
+        }
+      },
       "colors": { "type": "keyword" },
       "amount": { "type": "integer" },
       "price": { "type": "float" },
@@ -16,7 +21,12 @@
       "ip_address": { "type": "ip" },
       "employee": {
         "properties": {
-          "name": { "type": "text" },
+          "name": {
+            "type": "text",
+            "fields": {
+              "keyword": { "type": "keyword" }
+            }
+          },
           "salary": { "type": "double" }
         }
       },
