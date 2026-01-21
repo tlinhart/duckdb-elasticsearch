@@ -3,10 +3,30 @@
 
 #include <algorithm>
 #include <functional>
+#include <iomanip>
+#include <sstream>
 
 namespace duckdb {
 
 using namespace duckdb_yyjson;
+
+// Formats a coordinate value as a string without trailing zeros.
+// This produces cleaner GeoJSON output like [-74.006,40.7128] instead of [-74.006000,40.712800].
+static std::string CoordinateToString(double val) {
+	std::ostringstream oss;
+	oss << std::setprecision(15) << val;
+	std::string s = oss.str();
+
+	// Remove trailing zeros after decimal point.
+	if (s.find('.') != std::string::npos) {
+		s.erase(s.find_last_not_of('0') + 1, std::string::npos);
+		// Remove trailing decimal point if no decimals remain.
+		if (s.back() == '.') {
+			s.pop_back();
+		}
+	}
+	return s;
+}
 
 std::string TrimString(const std::string &s) {
 	size_t start = s.find_first_not_of(" \t\n\r");
@@ -57,7 +77,7 @@ static std::string ParseWktCoordinateSequence(const std::string &s) {
 		if (!first)
 			result += ",";
 		first = false;
-		result += "[" + std::to_string(lon) + "," + std::to_string(lat) + "]";
+		result += "[" + CoordinateToString(lon) + "," + CoordinateToString(lat) + "]";
 	}
 
 	result += "]";
@@ -93,7 +113,7 @@ static std::string WktPointToGeoJSON(const std::string &wkt) {
 		return "";
 	}
 
-	return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon) + "," + std::to_string(lat) + "]}";
+	return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon) + "," + CoordinateToString(lat) + "]}";
 }
 
 // Parse WKT LINESTRING to GeoJSON.
@@ -195,7 +215,7 @@ static std::string WktMultiPointToGeoJSON(const std::string &wkt) {
 			if (!first)
 				result += ",";
 			first = false;
-			result += "[" + std::to_string(lon) + "," + std::to_string(lat) + "]";
+			result += "[" + CoordinateToString(lon) + "," + CoordinateToString(lat) + "]";
 
 			pos = point_end + 1;
 		}
@@ -430,7 +450,8 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 		if (lat && lon) {
 			double lat_d = yyjson_is_real(lat) ? yyjson_get_real(lat) : static_cast<double>(yyjson_get_sint(lat));
 			double lon_d = yyjson_is_real(lon) ? yyjson_get_real(lon) : static_cast<double>(yyjson_get_sint(lon));
-			return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon_d) + "," + std::to_string(lat_d) + "]}";
+			return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon_d) + "," +
+			       CoordinateToString(lat_d) + "]}";
 		}
 	} else if (yyjson_is_arr(val)) {
 		yyjson_val *lon = yyjson_arr_get(val, 0);
@@ -438,7 +459,8 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 		if (lat && lon) {
 			double lat_d = yyjson_is_real(lat) ? yyjson_get_real(lat) : static_cast<double>(yyjson_get_sint(lat));
 			double lon_d = yyjson_is_real(lon) ? yyjson_get_real(lon) : static_cast<double>(yyjson_get_sint(lon));
-			return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon_d) + "," + std::to_string(lat_d) + "]}";
+			return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon_d) + "," +
+			       CoordinateToString(lat_d) + "]}";
 		}
 	} else if (yyjson_is_str(val)) {
 		const char *str = yyjson_get_str(val);
@@ -455,7 +477,8 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 			try {
 				double lat = std::stod(s.substr(0, comma_pos));
 				double lon = std::stod(s.substr(comma_pos + 1));
-				return "{\"type\":\"Point\",\"coordinates\":[" + std::to_string(lon) + "," + std::to_string(lat) + "]}";
+				return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon) + "," +
+				       CoordinateToString(lat) + "]}";
 			} catch (...) {
 				// Not a valid "lat,lon" string, return empty (might be geohash - not supported).
 			}
