@@ -5,6 +5,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "yyjson.hpp"
@@ -25,6 +26,9 @@ struct ElasticsearchQueryBindData : public TableFunctionData {
 	ElasticsearchConfig config;
 	std::string index;
 	std::string base_query; // user-provided query (optional, merged with filters)
+
+	// Logger for HTTP request logging, captured from ClientContext during bind.
+	shared_ptr<Logger> logger;
 
 	// Schema information (all columns from the mapping).
 	vector<string> all_column_names;
@@ -222,6 +226,12 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
                                                        vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<ElasticsearchQueryBindData>();
 
+	// Capture logger from ClientContext if HTTP logging is enabled.
+	auto &client_config = ClientConfig::GetConfig(context);
+	if (client_config.enable_http_logging) {
+		bind_data->logger = context.logger;
+	}
+
 	// Parse arguments.
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "host") {
@@ -262,7 +272,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	}
 
 	// Create client to fetch mapping.
-	ElasticsearchClient client(bind_data->config);
+	ElasticsearchClient client(bind_data->config, bind_data->logger);
 	auto mapping_response = client.GetMapping(bind_data->index);
 
 	if (!mapping_response.success) {
@@ -377,7 +387,7 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	state->final_query = BuildFinalQuery(bind_data, input.filters.get(), input.column_ids, state->max_rows);
 
 	// Create client.
-	state->client = make_uniq<ElasticsearchClient>(bind_data.config);
+	state->client = make_uniq<ElasticsearchClient>(bind_data.config, bind_data.logger);
 
 	// Determine batch size.
 	int64_t batch_size = 1000;

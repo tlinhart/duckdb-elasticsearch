@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/logging/logger.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -29,7 +30,7 @@ struct ElasticsearchResponse {
 
 class ElasticsearchClient {
 public:
-	explicit ElasticsearchClient(const ElasticsearchConfig &config);
+	explicit ElasticsearchClient(const ElasticsearchConfig &config, shared_ptr<Logger> logger = nullptr);
 	~ElasticsearchClient();
 
 	// Scroll API for large result sets.
@@ -43,6 +44,7 @@ public:
 
 private:
 	ElasticsearchConfig config_;
+	shared_ptr<Logger> logger_;
 
 	// Perform HTTP request using httplib with OpenSSL.
 	ElasticsearchResponse PerformRequest(const std::string &method, const std::string &path,

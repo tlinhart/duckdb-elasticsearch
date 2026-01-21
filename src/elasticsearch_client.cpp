@@ -1,5 +1,6 @@
 #include "elasticsearch_client.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/logging/log_type.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
@@ -19,7 +20,60 @@ static const std::unordered_set<int> RETRYABLE_STATUS_CODES = {
     504  // Gateway Timeout
 };
 
-ElasticsearchClient::ElasticsearchClient(const ElasticsearchConfig &config) : config_(config) {
+// Format headers map as a string for logging.
+static std::string FormatHeaders(const duckdb_httplib_openssl::Headers &headers) {
+	std::string headers_str = "{";
+	bool first = true;
+	for (const auto &header : headers) {
+		if (!first) {
+			headers_str += ", ";
+		}
+		first = false;
+		headers_str += header.first + "='" + header.second + "'";
+	}
+	headers_str += "}";
+	return headers_str;
+}
+
+// Construct HTTP log message in the same format as DuckDB's HTTPLogType.
+static std::string ConstructHttpLogMessage(const duckdb_httplib_openssl::Request &request,
+                                           const duckdb_httplib_openssl::Response &response,
+                                           std::chrono::system_clock::time_point start_time,
+                                           std::chrono::system_clock::time_point end_time) {
+	// Format start time as string.
+	auto start_time_t = std::chrono::system_clock::to_time_t(start_time);
+	char start_time_str[64];
+	std::strftime(start_time_str, sizeof(start_time_str), "%Y-%m-%d %H:%M:%S", std::gmtime(&start_time_t));
+
+	// Calculate duration in milliseconds.
+	auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+	// Build request part.
+	std::string log_msg = "{'request': {'type': " + request.method + ", 'url': '" + request.path +
+	                      "', 'headers': " + FormatHeaders(request.headers);
+
+	// Only include body if it is not empty.
+	if (!request.body.empty()) {
+		log_msg += ", 'body': '" + request.body + "'";
+	}
+
+	log_msg += ", 'start_time': '" + std::string(start_time_str) + "', 'duration_ms': " + std::to_string(duration_ms) +
+	           "}, 'response': ";
+
+	// Build response part if we have a valid response.
+	if (response.status != -1) {
+		log_msg += "{'status': " + std::to_string(response.status) + ", 'reason': " + response.reason +
+		           ", 'headers': " + FormatHeaders(response.headers) + "}";
+	} else {
+		log_msg += "NULL";
+	}
+
+	log_msg += "}";
+	return log_msg;
+}
+
+ElasticsearchClient::ElasticsearchClient(const ElasticsearchConfig &config, shared_ptr<Logger> logger)
+    : config_(config), logger_(std::move(logger)) {
 }
 
 ElasticsearchClient::~ElasticsearchClient() {
@@ -30,6 +84,14 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 	ElasticsearchResponse response;
 	response.success = false;
 	response.status_code = 0;
+
+	// Record start time for logging.
+	auto start_time = std::chrono::system_clock::now();
+
+	// Variables to capture request and response details for logging.
+	duckdb_httplib_openssl::Request logged_request;
+	duckdb_httplib_openssl::Response logged_response;
+	bool should_log = logger_ && logger_->ShouldLog(HTTPLogType::NAME, HTTPLogType::LEVEL);
 
 	try {
 		// Create client with base URL.
@@ -60,7 +122,23 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 		// Prepare headers.
 		duckdb_httplib_openssl::Headers headers = {{"Accept", "application/json"}};
 
-		// Make request based on method.
+		if (should_log) {
+			// Set up httplib logger to capture actual request and response details.
+			// Important: This callback is only invoked when requests complete successfully,
+			// failed requests (connection errors, timeouts, SSL failures) are never logged.
+			client.set_logger(
+			    [&](const duckdb_httplib_openssl::Request &req, const duckdb_httplib_openssl::Response &resp) {
+				    logged_request.method = req.method;
+				    logged_request.path = req.path;
+				    logged_request.headers = req.headers;
+				    logged_request.body = req.body;
+				    logged_response.status = resp.status;
+				    logged_response.reason = resp.reason;
+				    logged_response.headers = resp.headers;
+			    });
+		}
+
+		// Make request.
 		duckdb_httplib_openssl::Result result;
 
 		if (method == "GET") {
@@ -92,6 +170,13 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 
 	} catch (const std::exception &e) {
 		response.error_message = std::string("Exception during HTTP request: ") + e.what();
+	}
+
+	// Log the request after successful completion using details captured by httplib logger.
+	if (should_log && response.status_code > 0) {
+		auto end_time = std::chrono::system_clock::now();
+		std::string log_msg = ConstructHttpLogMessage(logged_request, logged_response, start_time, end_time);
+		logger_->WriteLog(HTTPLogType::NAME, HTTPLogType::LEVEL, log_msg);
 	}
 
 	return response;
