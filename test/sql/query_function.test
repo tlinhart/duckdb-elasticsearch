@@ -1,0 +1,38 @@
+# name: test/sql/query_function.test
+# description: Test elasticsearch_query function interface
+# group: [sql]
+
+require elasticsearch
+
+# Verify parameter names and types.
+query II
+SELECT unnest(list_zip(parameters, parameter_types), recursive := true)
+FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_query'
+ORDER BY 1;
+----
+host						VARCHAR
+index						VARCHAR
+max_retries					INTEGER
+password					VARCHAR
+port						INTEGER
+query						VARCHAR
+retry_backoff_factor		DOUBLE
+retry_interval				INTEGER
+sample_size					INTEGER
+timeout						INTEGER
+use_ssl						BOOLEAN
+username					VARCHAR
+verify_ssl					BOOLEAN
+
+# The index parameter is required.
+statement error
+SELECT * FROM elasticsearch_query();
+----
+requires 'index' parameter
+
+# Unknown parameters should be rejected.
+statement error
+SELECT * FROM elasticsearch_query(index := 'test', unknown_param := 'value');
+----
+Invalid named parameter
