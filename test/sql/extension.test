@@ -1,0 +1,40 @@
+# name: test/sql/extension.test
+# description: Test extension loading and functions registration
+# group: [sql]
+
+# Verify the extension isn't loaded by default.
+query I
+SELECT COUNT(*) FROM duckdb_extensions()
+WHERE extension_name = 'elasticsearch' AND loaded = true;
+----
+0
+
+# Verify the elasticsearch_query function doesn't exist before loading the extension.
+query I
+SELECT COUNT(*) FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_query';
+----
+0
+
+require elasticsearch
+
+# Verify the extension is loaded.
+query I
+SELECT COUNT(*) FROM duckdb_extensions()
+WHERE extension_name = 'elasticsearch' AND loaded = true;
+----
+1
+
+# Verify the elasticsearch_query function is registered.
+query I
+SELECT COUNT(*) FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_query';
+----
+1
+
+# Verify it is registered as a table function.
+query I
+SELECT function_type FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_query';
+----
+table
