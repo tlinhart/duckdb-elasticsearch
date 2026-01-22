@@ -1,0 +1,174 @@
+# name: test/sql/basic_queries.test
+# description: Test basic queries, data types and schema mapping
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Verify document count.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Verify the _id column is present and contains expected values.
+query I
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+1
+
+# Test text type mapping.
+query II
+SELECT name, typeof(name) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+Alice Johnson	VARCHAR
+
+# Test integer type mapping.
+query II
+SELECT amount, typeof(amount) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+42	INTEGER
+
+# Test float type mapping.
+query II
+SELECT round(price, 2) AS price, typeof(price) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+4523.75	FLOAT
+
+# Test boolean type mapping.
+query II
+SELECT deprecated, typeof(deprecated) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '2';
+----
+true	BOOLEAN
+
+# Test NULL for missing boolean field.
+query I
+SELECT deprecated FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+NULL
+
+# Test date type mapping.
+query II
+SELECT birth_date, typeof(birth_date) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+2005-03-15 00:00:00	TIMESTAMP
+
+# Test IP type mapping.
+query II
+SELECT ip_address, typeof(ip_address) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+192.168.1.101	VARCHAR
+
+# Test custom query parameter with match query on analyzed field.
+query I
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match": {"name": "alice brown"}}'
+);
+----
+1
+2
+
+# Test custom query parameter with term query on analyzed field with keyword subfield.
+query I
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"term": {"name.keyword": "Alice Johnson"}}'
+);
+----
+1
+
+# Test custom query parameter with range query.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"range": {"amount": {"gte": 50}}}'
+);
+----
+5
+
+# Test query returning no results.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 1000;
+----
+0
+
+# Test aggregation functions on results.
+query II
+SELECT min(amount), max(amount) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+8	91
