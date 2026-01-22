@@ -109,8 +109,12 @@ struct ElasticsearchQueryGlobalState : public GlobalTableFunctionState {
 };
 
 // Build the final Elasticsearch query by merging base query with pushed filters and projection.
+// projection_ids contains indices into column_ids for columns that need to be in the output.
+// If projection_ids is empty, all column_ids are output columns. Otherwise, columns not in
+// projection_ids are filter-only columns and can be excluded from _source since Elasticsearch
+// handles filtering server-side.
 static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, const TableFilterSet *filters,
-                                   const vector<idx_t> &column_ids) {
+                                   const vector<idx_t> &column_ids, const vector<idx_t> &projection_ids) {
 	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
 	yyjson_mut_val *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
@@ -180,10 +184,36 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 
 	// Add _source projection if we have specific columns.
 	// Column layout: [_id, ...fields..., _unmapped_].
-	// We need to request only the field paths for projected columns.
+	// We need to request only the field paths for output columns (not filter-only columns).
+	//
+	// projection_ids contains indices into column_ids for columns that need to be in the output.
+	// If projection_ids is empty, all column_ids are output columns (no filter-only columns).
+	// Otherwise, columns at indices not in projection_ids are filter-only and can be excluded
+	// from _source since Elasticsearch handles filtering server-side.
+	//
 	// Important: If _unmapped_ column is projected, we need the full _source to detect unmapped fields.
+
+	// Build set of output column indices (indices into column_ids that are actual output).
+	std::set<idx_t> output_column_indices;
+	if (projection_ids.empty()) {
+		// No filter-only columns, all column_ids are output columns.
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			output_column_indices.insert(i);
+		}
+	} else {
+		// Only columns at projection_ids indices are output columns.
+		for (idx_t proj_id : projection_ids) {
+			output_column_indices.insert(proj_id);
+		}
+	}
+
 	bool needs_full_source = false;
-	for (idx_t col_id : column_ids) {
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		// Skip filter-only columns when checking for _unmapped_.
+		if (output_column_indices.count(i) == 0) {
+			continue;
+		}
+		idx_t col_id = column_ids[i];
 		// _unmapped_ column is always at position field_paths.size() + 1 (after _id and all fields).
 		if (col_id > bind_data.field_paths.size()) {
 			needs_full_source = true;
@@ -193,10 +223,15 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 
 	if (!column_ids.empty() && !needs_full_source) {
 		vector<string> source_fields;
-		for (idx_t col_id : column_ids) {
-			// skip _id (col 0)
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			// Skip filter-only columns (not in output).
+			if (output_column_indices.count(i) == 0) {
+				continue;
+			}
+			idx_t col_id = column_ids[i];
+			// Skip _id (col 0), it's always returned by Elasticsearch.
 			if (col_id == 0) {
-				continue; // _id is always returned by Elasticsearch
+				continue;
 			}
 			idx_t field_idx = col_id - 1; // adjust for _id column
 			if (field_idx < bind_data.field_paths.size()) {
@@ -393,29 +428,67 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	auto &bind_data = input.bind_data->Cast<ElasticsearchQueryBindData>();
 	auto state = make_uniq<ElasticsearchQueryGlobalState>();
 
-	// Handle projection pushdown.
-	// column_ids contains the indices of columns that are actually needed.
-	state->projected_columns = input.column_ids;
+	// Handle projection pushdown with filter pruning.
+	// column_ids contains indices of all columns needed (output + filter-only).
+	// projection_ids contains indices into column_ids for output columns only.
+	// If projection_ids is empty, all column_ids are output columns (no filter pruning).
+	//
+	// We build projected_* arrays only for output columns, since:
+	// 1. filter-only columns are excluded from _source (Elasticsearch filters server-side)
+	// 2. the output DataChunk has projection_ids.size() columns (or column_ids.size() if empty)
+	// 3. we write directly to output.data[i] where i corresponds to output column index
 
-	// Build projected field info.
-	// Column layout: [_id (0), ...fields... (1 to N), optionally _unmapped_ (N+1 if present)].
-	for (idx_t col_id : input.column_ids) {
-		if (col_id == 0) {
-			// _id column
-			state->projected_field_paths.push_back("_id");
-			state->projected_es_types.push_back("");
-			state->projected_types.push_back(LogicalType::VARCHAR);
-		} else if (col_id <= bind_data.field_paths.size()) {
-			// regular field column
-			idx_t field_idx = col_id - 1;
-			state->projected_field_paths.push_back(bind_data.field_paths[field_idx]);
-			state->projected_es_types.push_back(bind_data.es_types[field_idx]);
-			state->projected_types.push_back(bind_data.all_column_types[field_idx]);
-		} else {
-			// _unmapped_ column
-			state->projected_field_paths.push_back("_unmapped_");
-			state->projected_es_types.push_back("");
-			state->projected_types.push_back(LogicalType::JSON());
+	bool has_filter_prune = !input.projection_ids.empty() && input.projection_ids.size() < input.column_ids.size();
+
+	if (has_filter_prune) {
+		// Filter pruning is active, only build metadata for output columns.
+		// projected_columns will contain the actual column IDs for output columns.
+		for (idx_t proj_idx : input.projection_ids) {
+			idx_t col_id = input.column_ids[proj_idx];
+			state->projected_columns.push_back(col_id);
+
+			if (col_id == 0) {
+				// _id column
+				state->projected_field_paths.push_back("_id");
+				state->projected_es_types.push_back("");
+				state->projected_types.push_back(LogicalType::VARCHAR);
+			} else if (col_id <= bind_data.field_paths.size()) {
+				// regular field column
+				idx_t field_idx = col_id - 1;
+				state->projected_field_paths.push_back(bind_data.field_paths[field_idx]);
+				state->projected_es_types.push_back(bind_data.es_types[field_idx]);
+				state->projected_types.push_back(bind_data.all_column_types[field_idx]);
+			} else {
+				// _unmapped_ column
+				state->projected_field_paths.push_back("_unmapped_");
+				state->projected_es_types.push_back("");
+				state->projected_types.push_back(LogicalType::JSON());
+			}
+		}
+	} else {
+		// No filter pruning: all column_ids are output columns.
+		state->projected_columns = input.column_ids;
+
+		// Build projected field info for all columns.
+		// Column layout: [_id (0), ...fields... (1 to N), optionally _unmapped_ (N+1 if present)].
+		for (idx_t col_id : input.column_ids) {
+			if (col_id == 0) {
+				// _id column
+				state->projected_field_paths.push_back("_id");
+				state->projected_es_types.push_back("");
+				state->projected_types.push_back(LogicalType::VARCHAR);
+			} else if (col_id <= bind_data.field_paths.size()) {
+				// regular field column
+				idx_t field_idx = col_id - 1;
+				state->projected_field_paths.push_back(bind_data.field_paths[field_idx]);
+				state->projected_es_types.push_back(bind_data.es_types[field_idx]);
+				state->projected_types.push_back(bind_data.all_column_types[field_idx]);
+			} else {
+				// _unmapped_ column
+				state->projected_field_paths.push_back("_unmapped_");
+				state->projected_es_types.push_back("");
+				state->projected_types.push_back(LogicalType::JSON());
+			}
 		}
 	}
 
@@ -432,7 +505,7 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	}
 
 	// Build the final query with pushdown.
-	state->final_query = BuildFinalQuery(bind_data, input.filters.get(), input.column_ids);
+	state->final_query = BuildFinalQuery(bind_data, input.filters.get(), input.column_ids, input.projection_ids);
 
 	// Create client.
 	state->client = make_uniq<ElasticsearchClient>(bind_data.config, bind_data.logger);
@@ -635,6 +708,7 @@ void RegisterElasticsearchQueryFunction(ExtensionLoader &loader) {
 	// Enable pushdown.
 	elasticsearch_query.projection_pushdown = true;
 	elasticsearch_query.filter_pushdown = true;
+	elasticsearch_query.filter_prune = true;
 
 	// Named parameters.
 	elasticsearch_query.named_parameters["host"] = LogicalType::VARCHAR;
