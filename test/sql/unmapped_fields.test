@@ -1,0 +1,71 @@
+# name: test/sql/unmapped_fields.test
+# description: Test unmapped fields captured in the _unmapped_ JSON column
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Verify documents with unmapped fields are detected.
+# Documents 2, 5 and 8 have the 'extra' field which is not in the mapping.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _unmapped_ IS NOT NULL;
+----
+3
+
+# Test selecting _unmapped_ column.
+query I
+SELECT _unmapped_ FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id IN ('2', '5', '8')
+ORDER BY _id;
+----
+{"extra":10}
+{"extra":["one","two","three"]}
+{"extra":{"note":"This is a note","value":20.3}}
+
+# Verify _unmapped_ column has a JSON type.
+query I
+SELECT typeof(_unmapped_) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '2';
+----
+JSON
+
+# Test extracting nested data from the _unmapped_ column.
+query I
+SELECT _unmapped_->>'$.extra[1]' FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '5';
+----
+two
+
+# Test document without unmapped fields returns NULL in the _unmapped_ column.
+query I
+SELECT _unmapped_ FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+NULL
