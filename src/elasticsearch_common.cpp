@@ -901,63 +901,6 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 		}
 	}
 
-	// Build sample query by modifying the user query to limit size.
-	// Parse the original query and override/add "size" parameter.
-	std::string sample_query;
-	yyjson_doc *query_doc = yyjson_read(query.c_str(), query.size(), 0);
-
-	if (query_doc) {
-		yyjson_mut_doc *mut_doc = yyjson_doc_mut_copy(query_doc, nullptr);
-		yyjson_doc_free(query_doc);
-
-		if (mut_doc) {
-			yyjson_mut_val *mut_root = yyjson_mut_doc_get_root(mut_doc);
-			if (mut_root && yyjson_mut_is_obj(mut_root)) {
-				// Set or override "size" parameter.
-				yyjson_mut_obj_put(mut_root, yyjson_mut_str(mut_doc, "size"), yyjson_mut_int(mut_doc, sample_size));
-
-				char *json_str = yyjson_mut_write(mut_doc, 0, nullptr);
-				if (json_str) {
-					sample_query = json_str;
-					free(json_str);
-				}
-			}
-			yyjson_mut_doc_free(mut_doc);
-		}
-	}
-
-	// Fallback if query modification failed.
-	if (sample_query.empty()) {
-		sample_query = "{\"query\": {\"match_all\": {}}, \"size\": " + std::to_string(sample_size) + "}";
-	}
-
-	// Execute search (using scroll but we only need first batch).
-	auto response = client.ScrollSearch(index, sample_query, "1m", sample_size);
-	if (!response.success) {
-		// If sampling fails, return empty result (conservative: no arrays/unmapped detected).
-		return result;
-	}
-
-	// Parse response.
-	yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
-	if (!doc) {
-		return result;
-	}
-
-	yyjson_val *root = yyjson_doc_get_root(doc);
-	yyjson_val *hits_obj = yyjson_obj_get(root, "hits");
-	yyjson_val *hits_array = hits_obj ? yyjson_obj_get(hits_obj, "hits") : nullptr;
-
-	if (!hits_array || !yyjson_is_arr(hits_array)) {
-		// Clear scroll if we got one.
-		yyjson_val *scroll_id_val = yyjson_obj_get(root, "_scroll_id");
-		if (scroll_id_val && yyjson_is_str(scroll_id_val)) {
-			client.ClearScroll(yyjson_get_str(scroll_id_val));
-		}
-		yyjson_doc_free(doc);
-		return result;
-	}
-
 	// Helper lambda to check if a document has unmapped fields.
 	auto check_for_unmapped = [&all_mapped_paths](yyjson_val *obj, const std::string &prefix) -> bool {
 		std::function<bool(yyjson_val *, const std::string &)> check_recursive = [&](yyjson_val *o,
@@ -988,7 +931,7 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 					}
 
 					if (!is_parent_of_mapped) {
-						// This is an unmapped field!
+						// This is an unmapped field.
 						return true;
 					}
 				}
@@ -1006,49 +949,107 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 		return check_recursive(obj, prefix);
 	};
 
-	// Scan each document.
-	size_t idx, max;
-	yyjson_val *hit;
-	yyjson_arr_foreach(hits_array, idx, max, hit) {
-		yyjson_val *source = yyjson_obj_get(hit, "_source");
-		if (!source)
-			continue;
+	// Helper lambda to check if we have found everything we're looking for.
+	auto all_detected = [&]() -> bool {
+		bool all_arrays_found = (result.array_fields.size() + skip_fields.size() >= field_paths.size());
+		return all_arrays_found && result.has_unmapped_fields;
+	};
 
-		// Check for unmapped fields (only if not already detected).
-		if (!result.has_unmapped_fields) {
-			result.has_unmapped_fields = check_for_unmapped(source, "");
-		}
+	// Helper lambda to process documents from a batch and check for arrays and unmapped fields.
+	auto process_batch = [&](yyjson_val *hits_array, int64_t &docs_remaining) -> void {
+		size_t idx, max;
+		yyjson_val *hit;
+		yyjson_arr_foreach(hits_array, idx, max, hit) {
+			if (docs_remaining <= 0 || all_detected()) {
+				break;
+			}
 
-		// Check each field path for arrays.
-		for (const auto &field_path : field_paths) {
-			// Skip geo fields (their array format represents coordinates, not multiple values).
-			if (skip_fields.count(field_path))
+			yyjson_val *source = yyjson_obj_get(hit, "_source");
+			if (!source) {
 				continue;
+			}
 
-			// Skip if already detected as array.
-			if (result.array_fields.count(field_path))
-				continue;
+			docs_remaining--;
 
-			yyjson_val *val = GetValueByPath(source, field_path);
-			if (val && yyjson_is_arr(val)) {
-				result.array_fields.insert(field_path);
+			// Check for unmapped fields (only if not already detected).
+			if (!result.has_unmapped_fields) {
+				result.has_unmapped_fields = check_for_unmapped(source, "");
+			}
+
+			// Check each field path for arrays.
+			for (const auto &field_path : field_paths) {
+				// Skip geo fields (their array format represents coordinates, not multiple values).
+				if (skip_fields.count(field_path)) {
+					continue;
+				}
+
+				// Skip if already detected as array.
+				if (result.array_fields.count(field_path)) {
+					continue;
+				}
+
+				yyjson_val *val = GetValueByPath(source, field_path);
+				if (val && yyjson_is_arr(val)) {
+					result.array_fields.insert(field_path);
+				}
 			}
 		}
+	};
 
-		// Early exit if all non-skipped fields are detected as arrays AND we have found unmapped fields.
-		bool all_arrays_found = (result.array_fields.size() + skip_fields.size() >= field_paths.size());
-		if (all_arrays_found && result.has_unmapped_fields) {
+	// Use scroll API to fetch documents in batches until we have sampled enough or exhausted results.
+	// The batch size is controlled by the URL parameter in ScrollSearch().
+	int64_t docs_remaining = sample_size;
+	std::string scroll_id;
+
+	// Initial search request.
+	auto response = client.ScrollSearch(index, query, "1m", sample_size);
+	if (!response.success) {
+		// If sampling fails, return empty result (conservative: no arrays/unmapped detected).
+		return result;
+	}
+
+	// Process batches until we have sampled enough documents or exhausted results.
+	while (docs_remaining > 0 && !all_detected()) {
+		yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
+		if (!doc) {
+			break;
+		}
+
+		yyjson_val *root = yyjson_doc_get_root(doc);
+		yyjson_val *hits_obj = yyjson_obj_get(root, "hits");
+		yyjson_val *hits_array = hits_obj ? yyjson_obj_get(hits_obj, "hits") : nullptr;
+
+		// Extract scroll_id for cleanup and subsequent requests.
+		yyjson_val *scroll_id_val = yyjson_obj_get(root, "_scroll_id");
+		if (scroll_id_val && yyjson_is_str(scroll_id_val)) {
+			scroll_id = yyjson_get_str(scroll_id_val);
+		}
+
+		if (!hits_array || !yyjson_is_arr(hits_array) || yyjson_arr_size(hits_array) == 0) {
+			// No more documents to process.
+			yyjson_doc_free(doc);
+			break;
+		}
+
+		process_batch(hits_array, docs_remaining);
+		yyjson_doc_free(doc);
+
+		// Check if we need more documents.
+		if (docs_remaining > 0 && !all_detected() && !scroll_id.empty()) {
+			response = client.ScrollNext(scroll_id, "1m");
+			if (!response.success) {
+				break;
+			}
+		} else {
 			break;
 		}
 	}
 
-	// Clear scroll if we got one.
-	yyjson_val *scroll_id_val = yyjson_obj_get(root, "_scroll_id");
-	if (scroll_id_val && yyjson_is_str(scroll_id_val)) {
-		client.ClearScroll(yyjson_get_str(scroll_id_val));
+	// Clean up the scroll context.
+	if (!scroll_id.empty()) {
+		client.ClearScroll(scroll_id);
 	}
 
-	yyjson_doc_free(doc);
 	return result;
 }
 

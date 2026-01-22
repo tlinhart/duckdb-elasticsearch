@@ -51,6 +51,11 @@ struct ElasticsearchQueryBindData : public TableFunctionData {
 
 	// Sample size for array detection (0 = disabled, default = 100).
 	int64_t sample_size = 100;
+
+	// Limit pushdown values (set by optimizer extension).
+	// -1 means no limit, 0 means no offset.
+	int64_t limit = -1;
+	int64_t offset = 0;
 };
 
 // Global state for scanning.
@@ -68,6 +73,10 @@ struct ElasticsearchQueryGlobalState : public GlobalTableFunctionState {
 	// Total rows to return (from limit pushdown).
 	int64_t max_rows;
 
+	// Offset handling for OFFSET pushdown.
+	int64_t rows_to_skip;
+	int64_t rows_skipped;
+
 	// Projected column indices (from projection pushdown).
 	vector<idx_t> projected_columns;
 
@@ -79,7 +88,8 @@ struct ElasticsearchQueryGlobalState : public GlobalTableFunctionState {
 	// The final query sent to Elasticsearch (with filters merged).
 	std::string final_query;
 
-	ElasticsearchQueryGlobalState() : finished(false), current_row(0), current_hit_idx(0), max_rows(-1) {
+	ElasticsearchQueryGlobalState()
+	    : finished(false), current_row(0), current_hit_idx(0), max_rows(-1), rows_to_skip(0), rows_skipped(0) {
 	}
 
 	~ElasticsearchQueryGlobalState() {
@@ -100,7 +110,7 @@ struct ElasticsearchQueryGlobalState : public GlobalTableFunctionState {
 
 // Build the final Elasticsearch query by merging base query with pushed filters and projection.
 static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, const TableFilterSet *filters,
-                                   const vector<idx_t> &column_ids, int64_t limit) {
+                                   const vector<idx_t> &column_ids) {
 	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
 	yyjson_mut_val *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
@@ -204,10 +214,9 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	}
 	// If needs_full_source is true, we do not set _source, so Elasticsearch returns the full document.
 
-	// Add size/limit if specified.
-	if (limit > 0) {
-		yyjson_mut_obj_add_int(doc, root, "size", limit);
-	}
+	// Note: We do not add "size" to the query body here. For scroll API, the batch size is controlled
+	// by the URL parameter in ScrollSearch(). Adding "size" to the body would be misleading since
+	// Elasticsearch ignores it for scroll requests.
 
 	// Serialize the query.
 	char *json_str = yyjson_mut_write(doc, 0, nullptr);
@@ -330,13 +339,18 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	}
 
 	// Sample documents to detect arrays and unmapped fields.
-	std::string sample_query = R"({"query": {"match_all": {}}})";
+	// Sampling uses the user-provided query parameter (base_query) if specified, otherwise match_all.
+	// This is the best approximation of the actual query because filter pushdown (WHERE clauses)
+	// happens after bind time, so the final query with pushed-down filters is not known when
+	// sampling occurs. The actual query sent to Elasticsearch might include additional pushed-down
+	// filters that are not reflected in the sampling query.
+	std::string sampling_query = R"({"query": {"match_all": {}}})";
 	if (!bind_data->base_query.empty()) {
-		sample_query = R"({"query": )" + bind_data->base_query + "}";
+		sampling_query = R"({"query": )" + bind_data->base_query + "}";
 	}
 	if (bind_data->sample_size > 0 && !bind_data->field_paths.empty()) {
 		SampleResult sample_result =
-		    SampleDocuments(client, bind_data->index, sample_query, bind_data->field_paths, bind_data->es_types,
+		    SampleDocuments(client, bind_data->index, sampling_query, bind_data->field_paths, bind_data->es_types,
 		                    bind_data->all_mapped_paths, bind_data->sample_size);
 
 		// Wrap types in LIST for fields detected as arrays.
@@ -405,20 +419,32 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 		}
 	}
 
-	// Determine limit from MaxRows() if available.
-	// Note: DuckDB doesn't always populate this, so we might not have a limit.
-	state->max_rows = -1;
+	// Use limit and offset from bind_data (set by optimizer extension).
+	state->max_rows = bind_data.limit;
+	state->rows_to_skip = bind_data.offset;
+	state->rows_skipped = 0;
+
+	// Calculate the query limit. We need to fetch limit + offset rows from Elasticsearch,
+	// then skip the first offset rows and return the next limit rows.
+	int64_t query_limit = bind_data.limit;
+	if (bind_data.limit > 0 && bind_data.offset > 0) {
+		query_limit = bind_data.limit + bind_data.offset;
+	}
 
 	// Build the final query with pushdown.
-	state->final_query = BuildFinalQuery(bind_data, input.filters.get(), input.column_ids, state->max_rows);
+	state->final_query = BuildFinalQuery(bind_data, input.filters.get(), input.column_ids);
 
 	// Create client.
 	state->client = make_uniq<ElasticsearchClient>(bind_data.config, bind_data.logger);
 
-	// Determine batch size.
+	// Determine batch size. For small query limits (up to 5000), fetch all needed rows in one request.
+	// For larger limits, keep the default batch size to avoid memory issues with large single requests.
+	// Note: When query_limit > 5000, the last batch may overfetch documents. For example, if we need
+	// 5010 documents total, we fetch 5 batches of 1000 and one batch of 1000 (instead of 10). This is
+	// acceptable given the expected usage pattern of small limits and rare large offsets.
 	int64_t batch_size = 1000;
-	if (state->max_rows > 0 && state->max_rows < batch_size) {
-		batch_size = state->max_rows;
+	if (query_limit > 0 && query_limit <= 5000) {
+		batch_size = query_limit;
 	}
 
 	// Start scroll search.
@@ -546,6 +572,13 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 			}
 		}
 
+		// Handle OFFSET (skip rows until we've skipped enough).
+		if (state.rows_skipped < state.rows_to_skip) {
+			state.current_hit_idx++;
+			state.rows_skipped++;
+			continue;
+		}
+
 		// Process current hit.
 		yyjson_val *hit = state.hits[state.current_hit_idx];
 		yyjson_val *source = yyjson_obj_get(hit, "_source");
@@ -619,6 +652,14 @@ void RegisterElasticsearchQueryFunction(ExtensionLoader &loader) {
 	elasticsearch_query.named_parameters["sample_size"] = LogicalType::INTEGER;
 
 	loader.RegisterFunction(elasticsearch_query);
+}
+
+// Helper function for the optimizer extension to set limit/offset in bind data.
+// Called from elasticsearch_optimizer.cpp after verifying the function name is "elasticsearch_query".
+void SetElasticsearchLimitOffset(FunctionData &bind_data, int64_t limit, int64_t offset) {
+	auto &es_bind_data = bind_data.Cast<ElasticsearchQueryBindData>();
+	es_bind_data.limit = limit;
+	es_bind_data.offset = offset;
 }
 
 } // namespace duckdb
