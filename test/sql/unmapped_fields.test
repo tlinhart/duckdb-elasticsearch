@@ -46,18 +46,6 @@ WHERE _id = '2';
 ----
 JSON
 
-# Test extracting nested data from the _unmapped_ column.
-query I
-SELECT _unmapped_->>'$.extra[1]' FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE _id = '5';
-----
-two
-
 # Test document without unmapped fields returns NULL in the _unmapped_ column.
 query I
 SELECT _unmapped_ FROM elasticsearch_query(
@@ -69,3 +57,21 @@ SELECT _unmapped_ FROM elasticsearch_query(
 WHERE _id = '1';
 ----
 NULL
+
+statement ok
+INSTALL json;
+
+statement ok
+LOAD json;
+
+# Test extracting nested data from the _unmapped_ column.
+query I
+SELECT _unmapped_->>'$.extra[1]' FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '5';
+----
+two
