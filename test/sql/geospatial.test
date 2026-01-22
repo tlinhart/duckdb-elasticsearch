@@ -1,0 +1,133 @@
+# name: test/sql/geospatial.test
+# description: Test geo_point and geo_shape type handling and GeoJSON conversion
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test geo_point with object format ({"lat": 40.7128, "lon": -74.006}).
+query I
+SELECT location FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+{"type":"Point","coordinates":[-74.006,40.7128]}
+
+# Test geo_point with string format ("51.5074,-0.1278").
+query I
+SELECT location FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '2';
+----
+{"type":"Point","coordinates":[-0.1278,51.5074]}
+
+# Test geo_point with array format ([-118.2437, 34.0522]).
+query I
+SELECT location FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '3';
+----
+{"type":"Point","coordinates":[-118.2437,34.0522]}
+
+# Test geo_point with WKT format ("POINT (139.6917 35.6895)").
+query I
+SELECT location FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '4';
+----
+{"type":"Point","coordinates":[139.6917,35.6895]}
+
+# Test geo_shape Point.
+query I
+SELECT geometry FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+{"type":"Point","coordinates":[-122.4194,37.7749]}
+
+# Test geo_shape LineString.
+query I
+SELECT geometry FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '2';
+----
+{"type":"LineString","coordinates":[[-73.9857,40.7484],[-73.9851,40.7479],[-73.9845,40.7475]]}
+
+# Test geo_shape Polygon.
+query I
+SELECT geometry FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '3';
+----
+{"type":"Polygon","coordinates":[[[-0.1357,51.5194],[-0.1197,51.5194],[-0.1197,51.5094],[-0.1357,51.5094],[-0.1357,51.5194]]]}
+
+# Test geo_shape MultiPoint.
+query I
+SELECT geometry FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '4';
+----
+{"type":"MultiPoint","coordinates":[[2.3522,48.8566],[2.3488,48.8534],[2.3555,48.8601]]}
+
+statement ok
+INSTALL spatial;
+
+statement ok
+LOAD spatial;
+
+# Test deserialization from GeoJSON to GEOMETRY type (geo_point field).
+query I
+SELECT ST_GeomFromGeoJSON(location) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '3';
+----
+POINT (-118.2437 34.0522)
+
+# Test deserialization from GeoJSON to GEOMETRY type (geo_shape field).
+query I
+SELECT ST_GeomFromGeoJSON(geometry) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '4';
+----
+MULTIPOINT (2.3522 48.8566, 2.3488 48.8534, 2.3555 48.8601)
