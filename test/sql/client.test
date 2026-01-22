@@ -1,0 +1,63 @@
+# name: test/sql/client.test
+# description: Test Elasticsearch client
+# group: [sql]
+
+require elasticsearch
+
+# Clear the default ignore_error_messages list so HTTP errors are not skipped.
+set ignore_error_messages
+
+# Connection to non-existent host should fail.
+statement error
+SELECT * FROM elasticsearch_query(
+    host := 'nonexistent.invalid',
+    index := 'test',
+    timeout := 1000
+);
+----
+connection
+
+# Connection should be retried before failing.
+statement error
+SELECT * FROM elasticsearch_query(
+    host := 'nonexistent.invalid',
+    port := 99999,
+    index := 'test',
+    timeout := 1000,
+    max_retries := 5
+);
+----
+after 5 retries
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Connection to incorrect port should fail.
+statement error
+SELECT * FROM elasticsearch_query(
+    host := 'localhost',
+    port := 99999,
+    index := 'test',
+    timeout := 1000
+);
+----
+connection
+
+# Request should fail if authentication credentials are not provided.
+statement error
+SELECT * FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test'
+);
+----
+missing authentication credentials
+
+# Request should fail if authentication credentials are invalid.
+statement error
+SELECT * FROM elasticsearch_query(
+    host := 'localhost',
+    username := 'elastic',
+    password := 'invalid-password',
+    index := 'test'
+);
+----
+unable to authenticate
