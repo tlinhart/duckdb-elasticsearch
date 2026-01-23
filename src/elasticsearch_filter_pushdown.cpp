@@ -37,7 +37,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
                                                  const string &column_name, bool is_text_field);
 
 static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
-                                            bool is_text_field);
+                                            bool is_text_field, bool case_insensitive);
 
 static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_name);
 
@@ -367,9 +367,13 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
                                                  const string &column_name, bool is_text_field) {
-	// ExpressionFilter contains arbitrary expressions. We try to detect LIKE patterns
-	// and optimized string functions (prefix, suffix, contains).
-	// Other expressions are left for DuckDB to evaluate.
+	// ExpressionFilter contains arbitrary expressions. We handle:
+	// - LIKE/ILIKE patterns (~~, ~~~, like_escape, ilike_escape)
+	// - Optimized string functions from LikeOptimizationRule (prefix, suffix, contains)
+	//
+	// Note: For text fields, only ILIKE patterns are pushed down (by ElasticsearchPushdownComplexFilter).
+	// LIKE patterns and optimized functions (prefix, suffix, contains) are case-sensitive and
+	// cannot be correctly implemented on analyzed text fields, so they are not pushed down.
 	auto &expr = *filter.expr;
 
 	// Check if this is a function expression.
@@ -377,8 +381,10 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 		auto &func_expr = expr.Cast<BoundFunctionExpression>();
 		auto func_name = func_expr.function.name;
 
-		// Handle LIKE and ILIKE (case-insensitive).
-		if (func_name == "~~" || func_name == "like_escape" || func_name == "~~~" || func_name == "ilike_escape") {
+		// Handle LIKE and ILIKE.
+		// For text fields, only ILIKE (~~*, ilike_escape) will reach here.
+		// For non-text fields, both LIKE and ILIKE will reach here.
+		if (func_name == "~~" || func_name == "like_escape" || func_name == "~~*" || func_name == "ilike_escape") {
 			// LIKE pattern is typically the second argument (index 1).
 			// First argument (index 0) is the column reference.
 			if (func_expr.children.size() >= 2) {
@@ -387,7 +393,10 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 					auto &const_expr = pattern_expr->Cast<BoundConstantExpression>();
 					if (const_expr.value.type().id() == LogicalTypeId::VARCHAR) {
 						string pattern = StringValue::Get(const_expr.value);
-						return TranslateLikePattern(doc, column_name, pattern, is_text_field);
+						// ~~* and ilike_escape are case-insensitive (ILIKE)
+						// ~~ and like_escape are case-sensitive (LIKE)
+						bool case_insensitive = (func_name == "~~*" || func_name == "ilike_escape");
+						return TranslateLikePattern(doc, column_name, pattern, is_text_field, case_insensitive);
 					}
 				}
 			}
@@ -397,6 +406,9 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 		// - prefix(col, 'str') from LIKE 'str%'
 		// - suffix(col, 'str') from LIKE '%str'
 		// - contains(col, 'str') from LIKE '%str%'
+		// These always come from case-sensitive LIKE (not ILIKE), so case_insensitive = false.
+		// For text fields, these are NOT pushed down by ElasticsearchPushdownComplexFilter,
+		// so we only receive them for non-text fields (keyword, etc.)
 		if (func_name == "prefix" || func_name == "suffix" || func_name == "contains") {
 			if (func_expr.children.size() >= 2) {
 				auto &value_expr = func_expr.children[1];
@@ -417,7 +429,8 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 						} else { // contains
 							pattern = "%" + value + "%";
 						}
-						return TranslateLikePattern(doc, column_name, pattern, is_text_field);
+						// These come from LIKE optimization, so they are case-sensitive.
+						return TranslateLikePattern(doc, column_name, pattern, is_text_field, false);
 					}
 				}
 			}
@@ -429,7 +442,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 }
 
 static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
-                                            bool is_text_field) {
+                                            bool is_text_field, bool case_insensitive) {
 	// Convert SQL LIKE pattern to Elasticsearch wildcard query:
 	// SQL LIKE: % = any chars, _ = single char
 	// Elasticsearch wildcard: * = any chars, ? = single char
@@ -536,11 +549,11 @@ static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &f
 
 	// For keyword fields, use the field directly.
 	// {"wildcard": {"field": {"value": "pattern"}}}
-	// Text fields are analyzed (lowercase), so use the base field name (not .keyword) with case_insensitive option.
+	// For text fields with case_insensitive=true (ILIKE), use case_insensitive option.
 	// {"wildcard": {"field": {"value": "pattern", "case_insensitive": true}}}
 	yyjson_mut_val *wildcard_value = yyjson_mut_obj(doc);
 	yyjson_mut_obj_add_strcpy(doc, wildcard_value, "value", es_pattern.c_str());
-	if (is_text_field) {
+	if (case_insensitive) {
 		yyjson_mut_obj_add_bool(doc, wildcard_value, "case_insensitive", true);
 	}
 

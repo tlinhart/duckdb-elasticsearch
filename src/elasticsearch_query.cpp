@@ -741,14 +741,20 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 		//
 		// By intercepting prefix/suffix/contains here, we can use Elasticsearch's native
 		// prefix/wildcard queries which are more efficient than range filters.
+		//
+		// Note: For text fields, we can only push ILIKE patterns (case-insensitive) because
+		// text fields are analyzed (lowercased) during indexing. LIKE patterns (case-sensitive)
+		// cannot be correctly implemented on text fields, so we let DuckDB evaluate them.
+		// The optimized functions (prefix, suffix, contains) come from LIKE optimization,
+		// so they are also case-sensitive and cannot be pushed for text fields.
 		if (filter->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 			auto &func_expr = filter->Cast<BoundFunctionExpression>();
 			const auto &func_name = func_expr.function.name;
 
-			// Handle LIKE (~~) and ILIKE (~~~) operators.
+			// Handle LIKE (~~) and ILIKE (~~*) operators.
 			// Also handle like_escape and ilike_escape variants.
 			// Also handle optimized string functions: prefix, suffix, contains.
-			if (func_name == "~~" || func_name == "like_escape" || func_name == "~~~" || func_name == "ilike_escape" ||
+			if (func_name == "~~" || func_name == "like_escape" || func_name == "~~*" || func_name == "ilike_escape" ||
 			    func_name == "prefix" || func_name == "suffix" || func_name == "contains") {
 				// These functions have 2 children: column reference and pattern/value.
 				if (func_expr.children.size() < 2) {
@@ -778,6 +784,25 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				}
 
 				const ColumnIndex &col_index = column_ids[output_col_idx];
+				idx_t bind_col_id = col_index.GetPrimaryIndex();
+
+				// Get the column name to check if it's a text field.
+				// Skip _id column (bind_col_id == 0) and _unmapped_ column.
+				if (bind_col_id == 0 || bind_col_id > bind_data.all_column_names.size()) {
+					continue;
+				}
+				const string &col_name = bind_data.all_column_names[bind_col_id - 1];
+				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
+
+				// For text fields, only push ILIKE patterns (case-insensitive).
+				// LIKE patterns and optimized functions (prefix, suffix, contains) are
+				// case-sensitive and cannot be correctly implemented on analyzed text fields.
+				if (is_text_field) {
+					bool is_ilike = (func_name == "~~*" || func_name == "ilike_escape");
+					if (!is_ilike) {
+						continue;
+					}
+				}
 
 				// Create an ExpressionFilter wrapping the function expression.
 				// The filter translation code in elasticsearch_filter_pushdown.cpp will
