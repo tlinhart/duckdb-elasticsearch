@@ -9,9 +9,11 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
@@ -706,77 +708,116 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 	output.SetCardinality(output_idx);
 }
 
-// Pushdown complex filter callback - extracts IS NULL / IS NOT NULL filters from expressions.
-// DuckDB's FilterCombiner doesn't convert OPERATOR_IS_NULL/IS_NOT_NULL to TableFilters,
-// so we need to handle them here via pushdown_complex_filter and add them to table_filters.
+// Pushdown complex filter callback extracts filters from expressions that DuckDB's FilterCombiner
+// would not (or only partially) push down. By handling them here, we can fully push them to Elasticsearch.
+// For partially pushed down filters it allows us to avoid a redundant FILTER node in the query plan.
+//
+// Handles:
+// - IS NULL / IS NOT NULL: FilterCombiner doesn't convert these to TableFilters
+// - IN expressions: FilterCombiner wraps non-dense IN filters in OptionalFilter (PUSHED_DOWN_PARTIALLY)
 static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                                vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
+	const auto &column_ids = get.GetColumnIds();
 
-	// Iterate through filters and extract IS NULL / IS NOT NULL expressions.
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
 		if (!filter) {
 			continue;
 		}
 
-		// Check if this is an OPERATOR_IS_NULL or OPERATOR_IS_NOT_NULL expression.
-		if (filter->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
-			continue;
+		// Handle BOUND_OPERATOR expressions (IS NULL, IS NOT NULL, IN).
+		if (filter->GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+			auto &op_expr = filter->Cast<BoundOperatorExpression>();
+			auto expr_type = op_expr.GetExpressionType();
+
+			// Handle IS NULL / IS NOT NULL.
+			if (expr_type == ExpressionType::OPERATOR_IS_NULL || expr_type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+				if (op_expr.children.size() != 1) {
+					continue;
+				}
+
+				auto &child = op_expr.children[0];
+				if (child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					continue;
+				}
+
+				auto &col_ref = child->Cast<BoundColumnRefExpression>();
+				idx_t output_col_idx = col_ref.binding.column_index;
+
+				if (output_col_idx >= column_ids.size()) {
+					continue;
+				}
+
+				const ColumnIndex &col_index = column_ids[output_col_idx];
+				idx_t bind_col_id = col_index.GetPrimaryIndex();
+
+				// Skip _id column (bind_col_id == 0) and _unmapped_ column.
+				if (bind_col_id == 0 || bind_col_id > bind_data.all_column_names.size()) {
+					continue;
+				}
+
+				if (expr_type == ExpressionType::OPERATOR_IS_NULL) {
+					get.table_filters.PushFilter(col_index, make_uniq<IsNullFilter>());
+				} else {
+					get.table_filters.PushFilter(col_index, make_uniq<IsNotNullFilter>());
+				}
+
+				filters[i] = nullptr;
+				continue;
+			}
+
+			// Handle IN expressions (col IN (val1, val2, ...)).
+			// DuckDB's FilterCombiner wraps non-dense IN filters in OptionalFilter and returns
+			// PUSHED_DOWN_PARTIALLY, which keeps a FILTER node. By handling IN here, we can
+			// fully push it down to Elasticsearch and remove the redundant filter.
+			if (expr_type == ExpressionType::COMPARE_IN) {
+				if (op_expr.children.size() < 2) {
+					continue;
+				}
+
+				// First child must be a column reference.
+				if (op_expr.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					continue;
+				}
+
+				auto &col_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
+				idx_t output_col_idx = col_ref.binding.column_index;
+
+				if (output_col_idx >= column_ids.size()) {
+					continue;
+				}
+
+				const ColumnIndex &col_index = column_ids[output_col_idx];
+
+				// Remaining children must all be constants (no NULLs).
+				vector<Value> in_values;
+				bool all_constants = true;
+				for (idx_t j = 1; j < op_expr.children.size(); j++) {
+					if (op_expr.children[j]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+						all_constants = false;
+						break;
+					}
+					auto &const_expr = op_expr.children[j]->Cast<BoundConstantExpression>();
+					if (const_expr.value.IsNull()) {
+						all_constants = false;
+						break;
+					}
+					in_values.push_back(const_expr.value);
+				}
+
+				if (!all_constants || in_values.empty()) {
+					continue;
+				}
+
+				// Create and push the InFilter.
+				auto in_filter = make_uniq<InFilter>(std::move(in_values));
+				get.table_filters.PushFilter(col_index, std::move(in_filter));
+
+				filters[i] = nullptr;
+				continue;
+			}
 		}
-
-		auto &op_expr = filter->Cast<BoundOperatorExpression>();
-		bool is_null_check = op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL;
-		bool is_not_null_check = op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL;
-
-		if (!is_null_check && !is_not_null_check) {
-			continue;
-		}
-
-		// IS NULL / IS NOT NULL should have exactly one child (the column reference).
-		if (op_expr.children.size() != 1) {
-			continue;
-		}
-
-		auto &child = op_expr.children[0];
-		if (child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-			continue;
-		}
-
-		auto &col_ref = child->Cast<BoundColumnRefExpression>();
-
-		// The column binding's column_index refers to the column in the LogicalGet's output.
-		// We need to map this to the actual column index in bind_data.all_column_names.
-		// The LogicalGet's column_ids map from output index to bind schema column ID.
-		// Column layout: [_id (0), ...fields... (1-N), optionally _unmapped_ (N+1)]
-		// So bind schema column_id 1 corresponds to all_column_names[0], etc.
-
-		idx_t output_col_idx = col_ref.binding.column_index;
-		const auto &column_ids = get.GetColumnIds();
-
-		if (output_col_idx >= column_ids.size()) {
-			continue;
-		}
-
-		// Get the actual ColumnIndex for this column (used for table_filters).
-		const ColumnIndex &col_index = column_ids[output_col_idx];
-		idx_t bind_col_id = col_index.GetPrimaryIndex();
-
-		// Skip _id column (bind_col_id == 0) and _unmapped_ column.
-		if (bind_col_id == 0 || bind_col_id > bind_data.all_column_names.size()) {
-			continue;
-		}
-
-		// Add the filter to get.table_filters. The filter will be translated to Elasticsearch
-		// Query DSL in BuildFinalQuery via TranslateFilters, which handles IS_NULL/IS_NOT_NULL.
-		if (is_null_check) {
-			get.table_filters.PushFilter(col_index, make_uniq<IsNullFilter>());
-		} else {
-			get.table_filters.PushFilter(col_index, make_uniq<IsNotNullFilter>());
-		}
-
-		// Remove the filter from the list (we've handled it).
-		filters[i] = nullptr;
 	}
 
 	// Remove null entries from filters vector.
