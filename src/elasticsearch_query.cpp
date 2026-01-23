@@ -10,10 +10,12 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
@@ -715,6 +717,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 // Handles:
 // - IS NULL / IS NOT NULL: FilterCombiner doesn't convert these to TableFilters
 // - IN expressions: FilterCombiner wraps non-dense IN filters in OptionalFilter (PUSHED_DOWN_PARTIALLY)
+// - LIKE expressions: FilterCombiner converts LIKE 'prefix%' to range filters (PUSHED_DOWN_PARTIALLY)
 static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                                vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
@@ -724,6 +727,67 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 		auto &filter = filters[i];
 		if (!filter) {
 			continue;
+		}
+
+		// Handle BOUND_FUNCTION expressions (LIKE patterns and optimized string functions) first
+		// before checking BOUND_OPERATOR.
+		//
+		// DuckDB's optimizer transforms LIKE patterns before filter pushdown:
+		// - LikeOptimizationRule transforms: LIKE 'prefix%' -> prefix(col, 'prefix')
+		//                                    LIKE '%suffix' -> suffix(col, 'suffix')
+		//                                    LIKE '%infix%' -> contains(col, 'infix')
+		// - FilterCombiner then converts prefix() to range filters (>= prefix AND < prefix+1)
+		//   and returns PUSHED_DOWN_PARTIALLY
+		//
+		// By intercepting prefix/suffix/contains here, we can use Elasticsearch's native
+		// prefix/wildcard queries which are more efficient than range filters.
+		if (filter->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			auto &func_expr = filter->Cast<BoundFunctionExpression>();
+			const auto &func_name = func_expr.function.name;
+
+			// Handle LIKE (~~) and ILIKE (~~~) operators.
+			// Also handle like_escape and ilike_escape variants.
+			// Also handle optimized string functions: prefix, suffix, contains.
+			if (func_name == "~~" || func_name == "like_escape" || func_name == "~~~" || func_name == "ilike_escape" ||
+			    func_name == "prefix" || func_name == "suffix" || func_name == "contains") {
+				// These functions have 2 children: column reference and pattern/value.
+				if (func_expr.children.size() < 2) {
+					continue;
+				}
+
+				// First child must be a column reference.
+				if (func_expr.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+					continue;
+				}
+
+				// Second child must be a constant string pattern.
+				if (func_expr.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+					continue;
+				}
+
+				auto &col_ref = func_expr.children[0]->Cast<BoundColumnRefExpression>();
+				auto &pattern_expr = func_expr.children[1]->Cast<BoundConstantExpression>();
+
+				if (pattern_expr.value.type().id() != LogicalTypeId::VARCHAR) {
+					continue;
+				}
+
+				idx_t output_col_idx = col_ref.binding.column_index;
+				if (output_col_idx >= column_ids.size()) {
+					continue;
+				}
+
+				const ColumnIndex &col_index = column_ids[output_col_idx];
+
+				// Create an ExpressionFilter wrapping the function expression.
+				// The filter translation code in elasticsearch_filter_pushdown.cpp will
+				// convert this to the appropriate Elasticsearch query (prefix, wildcard, etc.)
+				auto expr_filter = make_uniq<ExpressionFilter>(filter->Copy());
+				get.table_filters.PushFilter(col_index, std::move(expr_filter));
+
+				filters[i] = nullptr;
+				continue;
+			}
 		}
 
 		// Handle BOUND_OPERATOR expressions (IS NULL, IS NOT NULL, IN).

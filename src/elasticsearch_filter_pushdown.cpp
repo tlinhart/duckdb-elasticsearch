@@ -367,11 +367,12 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
                                                  const string &column_name, bool is_text_field) {
-	// ExpressionFilter contains arbitrary expressions. We try to detect LIKE patterns,
-	// other expressions are left for DuckDB to evaluate.
+	// ExpressionFilter contains arbitrary expressions. We try to detect LIKE patterns
+	// and optimized string functions (prefix, suffix, contains).
+	// Other expressions are left for DuckDB to evaluate.
 	auto &expr = *filter.expr;
 
-	// Check if this is a LIKE expression (implemented as a function call).
+	// Check if this is a function expression.
 	if (expr.type == ExpressionType::BOUND_FUNCTION) {
 		auto &func_expr = expr.Cast<BoundFunctionExpression>();
 		auto func_name = func_expr.function.name;
@@ -386,6 +387,36 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 					auto &const_expr = pattern_expr->Cast<BoundConstantExpression>();
 					if (const_expr.value.type().id() == LogicalTypeId::VARCHAR) {
 						string pattern = StringValue::Get(const_expr.value);
+						return TranslateLikePattern(doc, column_name, pattern, is_text_field);
+					}
+				}
+			}
+		}
+
+		// Handle optimized string functions from DuckDB's LikeOptimizationRule:
+		// - prefix(col, 'str') from LIKE 'str%'
+		// - suffix(col, 'str') from LIKE '%str'
+		// - contains(col, 'str') from LIKE '%str%'
+		if (func_name == "prefix" || func_name == "suffix" || func_name == "contains") {
+			if (func_expr.children.size() >= 2) {
+				auto &value_expr = func_expr.children[1];
+				if (value_expr->type == ExpressionType::VALUE_CONSTANT) {
+					auto &const_expr = value_expr->Cast<BoundConstantExpression>();
+					if (const_expr.value.type().id() == LogicalTypeId::VARCHAR) {
+						string value = StringValue::Get(const_expr.value);
+
+						// Convert to equivalent LIKE pattern and use existing translation.
+						// prefix(col, 'str') -> 'str%'
+						// suffix(col, 'str') -> '%str'
+						// contains(col, 'str') -> '%str%'
+						string pattern;
+						if (func_name == "prefix") {
+							pattern = value + "%";
+						} else if (func_name == "suffix") {
+							pattern = "%" + value;
+						} else { // contains
+							pattern = "%" + value + "%";
+						}
 						return TranslateLikePattern(doc, column_name, pattern, is_text_field);
 					}
 				}
