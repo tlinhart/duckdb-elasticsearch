@@ -1,99 +1,52 @@
-#include "elasticsearch_filter_translator.hpp"
+#include "elasticsearch_filter_pushdown.hpp"
+#include "elasticsearch_common.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/filter/struct_filter.hpp"
 
 namespace duckdb {
 
 using namespace duckdb_yyjson;
 
-string ElasticsearchFilterTranslator::GetFieldName(const string &column_name, bool is_text_field) {
-	// For text fields, use .keyword sub-field for exact matching.
-	// Text fields are analyzed and do not support exact term queries.
-	if (is_text_field) {
-		return column_name + ".keyword";
-	}
-	return column_name;
-}
+// Forward declarations of static helper functions.
+static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
+                                       const unordered_map<string, string> &es_types,
+                                       const unordered_set<string> &text_fields);
 
-yyjson_mut_val *ElasticsearchFilterTranslator::ValueToJson(yyjson_mut_doc *doc, const Value &value) {
-	if (value.IsNull()) {
-		return yyjson_mut_null(doc);
-	}
+static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const ConstantFilter &filter,
+                                                   const string &field_name, bool is_text_field);
 
-	switch (value.type().id()) {
-	case LogicalTypeId::BOOLEAN:
-		return yyjson_mut_bool(doc, BooleanValue::Get(value));
+static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const ConjunctionAndFilter &filter,
+                                               const string &column_name, const unordered_map<string, string> &es_types,
+                                               const unordered_set<string> &text_fields);
 
-	case LogicalTypeId::TINYINT:
-		return yyjson_mut_sint(doc, TinyIntValue::Get(value));
+static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const ConjunctionOrFilter &filter,
+                                              const string &column_name, const unordered_map<string, string> &es_types,
+                                              const unordered_set<string> &text_fields);
 
-	case LogicalTypeId::SMALLINT:
-		return yyjson_mut_sint(doc, SmallIntValue::Get(value));
+static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter, const string &field_name,
+                                         bool is_text_field);
 
-	case LogicalTypeId::INTEGER:
-		return yyjson_mut_sint(doc, IntegerValue::Get(value));
+static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
+                                                 const string &column_name, bool is_text_field);
 
-	case LogicalTypeId::BIGINT:
-		return yyjson_mut_sint(doc, BigIntValue::Get(value));
+static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
+                                            bool is_text_field);
 
-	case LogicalTypeId::UTINYINT:
-		return yyjson_mut_uint(doc, UTinyIntValue::Get(value));
+static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_name);
 
-	case LogicalTypeId::USMALLINT:
-		return yyjson_mut_uint(doc, USmallIntValue::Get(value));
+static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name);
 
-	case LogicalTypeId::UINTEGER:
-		return yyjson_mut_uint(doc, UIntegerValue::Get(value));
-
-	case LogicalTypeId::UBIGINT:
-		return yyjson_mut_uint(doc, UBigIntValue::Get(value));
-
-	case LogicalTypeId::FLOAT:
-		return yyjson_mut_real(doc, FloatValue::Get(value));
-
-	case LogicalTypeId::DOUBLE:
-		return yyjson_mut_real(doc, DoubleValue::Get(value));
-
-	case LogicalTypeId::VARCHAR:
-		return yyjson_mut_strcpy(doc, StringValue::Get(value).c_str());
-
-	case LogicalTypeId::DATE: {
-		// Convert to ISO 8601 date string (YYYY-MM-DD).
-		// Date::ToString returns YYYY-MM-DD format which Elasticsearch accepts.
-		auto date = DateValue::Get(value);
-		auto str = Date::ToString(date);
-		return yyjson_mut_strcpy(doc, str.c_str());
-	}
-
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS: {
-		// Convert to ISO 8601 timestamp string.
-		// Timestamp::ToString returns YYYY-MM-DD HH:MM:SS but Elasticsearch expects YYYY-MM-DDTHH:MM:SS.
-		auto ts = TimestampValue::Get(value);
-		auto str = Timestamp::ToString(ts);
-		// Replace space with 'T' for ISO 8601 compliance.
-		auto space_pos = str.find(' ');
-		if (space_pos != string::npos) {
-			str[space_pos] = 'T';
-		}
-		return yyjson_mut_strcpy(doc, str.c_str());
-	}
-
-	default:
-		// For other types, convert to string.
-		return yyjson_mut_strcpy(doc, value.ToString().c_str());
-	}
-}
-
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilters(yyjson_mut_doc *doc, const TableFilterSet &filters,
-                                                                const vector<string> &column_names,
-                                                                const unordered_map<string, string> &es_types,
-                                                                const unordered_set<string> &text_fields) {
+// Public API implementation.
+yyjson_mut_val *TranslateFilters(yyjson_mut_doc *doc, const TableFilterSet &filters, const vector<string> &column_names,
+                                 const unordered_map<string, string> &es_types,
+                                 const unordered_set<string> &text_fields) {
 	if (filters.filters.empty()) {
 		return nullptr;
 	}
@@ -149,10 +102,10 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilters(yyjson_mut_doc *
 	return result;
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter,
-                                                               const string &column_name,
-                                                               const unordered_map<string, string> &es_types,
-                                                               const unordered_set<string> &text_fields) {
+// Translate a single filter for a specific column.
+static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
+                                       const unordered_map<string, string> &es_types,
+                                       const unordered_set<string> &text_fields) {
 	// Look up the text field status for this column.
 	bool is_text_field = text_fields.count(column_name) > 0;
 
@@ -207,12 +160,10 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateFilter(yyjson_mut_doc *d
 	}
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConstantComparison(yyjson_mut_doc *doc,
-                                                                           const ConstantFilter &filter,
-                                                                           const string &field_name,
-                                                                           bool is_text_field) {
-	string es_field = GetFieldName(field_name, is_text_field);
-	yyjson_mut_val *value = ValueToJson(doc, filter.constant);
+static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const ConstantFilter &filter,
+                                                   const string &field_name, bool is_text_field) {
+	string es_field = GetElasticsearchFieldName(field_name, is_text_field);
+	yyjson_mut_val *value = DuckDBValueToJson(doc, filter.constant);
 
 	switch (filter.comparison_type) {
 	case ExpressionType::COMPARE_EQUAL: {
@@ -243,9 +194,9 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConstantComparison(yyjso
 		return result;
 	}
 
-	// For text fields, use .keyword sub-field for range queries.
+	// For text fields, use .keyword subfield for range queries.
 	// Text fields are analyzed so range queries operate on tokens, not original values.
-	// The .keyword sub-field stores the original value and supports proper range queries.
+	// The .keyword subfield stores the original value and supports proper range queries.
 	case ExpressionType::COMPARE_GREATERTHAN: {
 		// {"range": {"field": {"gt": value}}}
 		yyjson_mut_val *range_cond = yyjson_mut_obj(doc);
@@ -308,7 +259,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConstantComparison(yyjso
 	}
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateIsNull(yyjson_mut_doc *doc, const string &field_name) {
+static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_name) {
 	// {"bool": {"must_not": {"exists": {"field": "name"}}}}
 	yyjson_mut_val *exists_inner = yyjson_mut_obj(doc);
 	yyjson_mut_obj_add_strcpy(doc, exists_inner, "field", field_name.c_str());
@@ -324,7 +275,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateIsNull(yyjson_mut_doc *d
 	return result;
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name) {
+static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name) {
 	// {"exists": {"field": "name"}}
 	yyjson_mut_val *exists_inner = yyjson_mut_obj(doc);
 	yyjson_mut_obj_add_strcpy(doc, exists_inner, "field", field_name.c_str());
@@ -334,11 +285,9 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateIsNotNull(yyjson_mut_doc
 	return result;
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConjunctionAnd(yyjson_mut_doc *doc,
-                                                                       const ConjunctionAndFilter &filter,
-                                                                       const string &column_name,
-                                                                       const unordered_map<string, string> &es_types,
-                                                                       const unordered_set<string> &text_fields) {
+static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const ConjunctionAndFilter &filter,
+                                               const string &column_name, const unordered_map<string, string> &es_types,
+                                               const unordered_set<string> &text_fields) {
 	// {"bool": {"must": [filter1, filter2, ...]}}
 	yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
 
@@ -365,11 +314,9 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConjunctionAnd(yyjson_mu
 	return result;
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConjunctionOr(yyjson_mut_doc *doc,
-                                                                      const ConjunctionOrFilter &filter,
-                                                                      const string &column_name,
-                                                                      const unordered_map<string, string> &es_types,
-                                                                      const unordered_set<string> &text_fields) {
+static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const ConjunctionOrFilter &filter,
+                                              const string &column_name, const unordered_map<string, string> &es_types,
+                                              const unordered_set<string> &text_fields) {
 	// {"bool": {"should": [filter1, filter2, ...], "minimum_should_match": 1}}
 	yyjson_mut_val *should_arr = yyjson_mut_arr(doc);
 
@@ -397,15 +344,15 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateConjunctionOr(yyjson_mut
 	return result;
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter,
-                                                                 const string &field_name, bool is_text_field) {
+static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter, const string &field_name,
+                                         bool is_text_field) {
 	// {"terms": {"field": [value1, value2, ...]}}
 	// or for text fields: {"terms": {"field.keyword": [value1, value2, ...]}}
-	string es_field = GetFieldName(field_name, is_text_field);
+	string es_field = GetElasticsearchFieldName(field_name, is_text_field);
 
 	yyjson_mut_val *values_arr = yyjson_mut_arr(doc);
 	for (auto &value : filter.values) {
-		yyjson_mut_val *json_val = ValueToJson(doc, value);
+		yyjson_mut_val *json_val = DuckDBValueToJson(doc, value);
 		yyjson_mut_arr_append(values_arr, json_val);
 	}
 
@@ -418,10 +365,8 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateInFilter(yyjson_mut_doc 
 	return result;
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateExpressionFilter(yyjson_mut_doc *doc,
-                                                                         const ExpressionFilter &filter,
-                                                                         const string &column_name,
-                                                                         bool is_text_field) {
+static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
+                                                 const string &column_name, bool is_text_field) {
 	// ExpressionFilter contains arbitrary expressions. We try to detect LIKE patterns,
 	// other expressions are left for DuckDB to evaluate.
 	auto &expr = *filter.expr;
@@ -452,8 +397,8 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateExpressionFilter(yyjson_
 	return nullptr;
 }
 
-yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name,
-                                                                    const string &pattern, bool is_text_field) {
+static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
+                                            bool is_text_field) {
 	// Convert SQL LIKE pattern to Elasticsearch wildcard query:
 	// SQL LIKE: % = any chars, _ = single char
 	// Elasticsearch wildcard: * = any chars, ? = single char
@@ -462,7 +407,7 @@ yyjson_mut_val *ElasticsearchFilterTranslator::TranslateLikePattern(yyjson_mut_d
 	// - "prefix%" -> {"prefix": {"field": "prefix"}} (faster than wildcard)
 	// - patterns without wildcards -> {"term": {"field": "value"}}
 
-	string es_field = GetFieldName(field_name, is_text_field);
+	string es_field = GetElasticsearchFieldName(field_name, is_text_field);
 
 	// Check if pattern has any wildcards.
 	bool has_percent = pattern.find('%') != string::npos;

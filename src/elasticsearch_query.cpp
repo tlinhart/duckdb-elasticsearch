@@ -1,6 +1,6 @@
 #include "elasticsearch_query.hpp"
 #include "elasticsearch_common.hpp"
-#include "elasticsearch_filter_translator.hpp"
+#include "elasticsearch_filter_pushdown.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -8,6 +8,10 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
@@ -132,7 +136,8 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		}
 	}
 
-	// Translate pushed filters to Elasticsearch query DSL.
+	// Translate pushed filters to Elasticsearch Query DSL.
+	// IS NULL / IS NOT NULL filters are now handled through table_filters (added by pushdown_complex_filter).
 	yyjson_mut_val *filter_clause = nullptr;
 	if (filters && !filters->filters.empty()) {
 		// Build column names vector for the filter translator.
@@ -155,8 +160,8 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 			}
 		}
 
-		filter_clause = ElasticsearchFilterTranslator::TranslateFilters(doc, *filters, filter_column_names,
-		                                                                bind_data.es_type_map, bind_data.text_fields);
+		filter_clause =
+		    TranslateFilters(doc, *filters, filter_column_names, bind_data.es_type_map, bind_data.text_fields);
 	}
 
 	// Merge base query and filter clause.
@@ -701,6 +706,85 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 	output.SetCardinality(output_idx);
 }
 
+// Pushdown complex filter callback - extracts IS NULL / IS NOT NULL filters from expressions.
+// DuckDB's FilterCombiner doesn't convert OPERATOR_IS_NULL/IS_NOT_NULL to TableFilters,
+// so we need to handle them here via pushdown_complex_filter and add them to table_filters.
+static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                               vector<unique_ptr<Expression>> &filters) {
+	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
+
+	// Iterate through filters and extract IS NULL / IS NOT NULL expressions.
+	for (idx_t i = 0; i < filters.size(); i++) {
+		auto &filter = filters[i];
+		if (!filter) {
+			continue;
+		}
+
+		// Check if this is an OPERATOR_IS_NULL or OPERATOR_IS_NOT_NULL expression.
+		if (filter->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
+			continue;
+		}
+
+		auto &op_expr = filter->Cast<BoundOperatorExpression>();
+		bool is_null_check = op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL;
+		bool is_not_null_check = op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL;
+
+		if (!is_null_check && !is_not_null_check) {
+			continue;
+		}
+
+		// IS NULL / IS NOT NULL should have exactly one child (the column reference).
+		if (op_expr.children.size() != 1) {
+			continue;
+		}
+
+		auto &child = op_expr.children[0];
+		if (child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			continue;
+		}
+
+		auto &col_ref = child->Cast<BoundColumnRefExpression>();
+
+		// The column binding's column_index refers to the column in the LogicalGet's output.
+		// We need to map this to the actual column index in bind_data.all_column_names.
+		// The LogicalGet's column_ids map from output index to bind schema column ID.
+		// Column layout: [_id (0), ...fields... (1-N), optionally _unmapped_ (N+1)]
+		// So bind schema column_id 1 corresponds to all_column_names[0], etc.
+
+		idx_t output_col_idx = col_ref.binding.column_index;
+		const auto &column_ids = get.GetColumnIds();
+
+		if (output_col_idx >= column_ids.size()) {
+			continue;
+		}
+
+		// Get the actual ColumnIndex for this column (used for table_filters).
+		const ColumnIndex &col_index = column_ids[output_col_idx];
+		idx_t bind_col_id = col_index.GetPrimaryIndex();
+
+		// Skip _id column (bind_col_id == 0) and _unmapped_ column.
+		if (bind_col_id == 0 || bind_col_id > bind_data.all_column_names.size()) {
+			continue;
+		}
+
+		// Add the filter to get.table_filters. The filter will be translated to Elasticsearch
+		// Query DSL in BuildFinalQuery via TranslateFilters, which handles IS_NULL/IS_NOT_NULL.
+		if (is_null_check) {
+			get.table_filters.PushFilter(col_index, make_uniq<IsNullFilter>());
+		} else {
+			get.table_filters.PushFilter(col_index, make_uniq<IsNotNullFilter>());
+		}
+
+		// Remove the filter from the list (we've handled it).
+		filters[i] = nullptr;
+	}
+
+	// Remove null entries from filters vector.
+	filters.erase(
+	    std::remove_if(filters.begin(), filters.end(), [](const unique_ptr<Expression> &e) { return e == nullptr; }),
+	    filters.end());
+}
+
 void RegisterElasticsearchQueryFunction(ExtensionLoader &loader) {
 	TableFunction elasticsearch_query("elasticsearch_query", {}, ElasticsearchQueryScan, ElasticsearchQueryBind,
 	                                  ElasticsearchQueryInitGlobal);
@@ -709,6 +793,7 @@ void RegisterElasticsearchQueryFunction(ExtensionLoader &loader) {
 	elasticsearch_query.projection_pushdown = true;
 	elasticsearch_query.filter_pushdown = true;
 	elasticsearch_query.filter_prune = true;
+	elasticsearch_query.pushdown_complex_filter = ElasticsearchPushdownComplexFilter;
 
 	// Named parameters.
 	elasticsearch_query.named_parameters["host"] = LogicalType::VARCHAR;

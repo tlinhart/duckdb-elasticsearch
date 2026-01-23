@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "elasticsearch_client.hpp"
 #include "yyjson.hpp"
@@ -90,5 +91,11 @@ std::string WktToGeoJSON(const std::string &wkt);
 
 // Helper to trim whitespace from string.
 std::string TrimString(const std::string &s);
+
+// Convert DuckDB value to yyjson mutable value for query building.
+yyjson_mut_val *DuckDBValueToJson(yyjson_mut_doc *doc, const Value &value);
+
+// Get Elasticsearch field name, adding .keyword suffix for text fields that need exact matching.
+std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field);
 
 } // namespace duckdb

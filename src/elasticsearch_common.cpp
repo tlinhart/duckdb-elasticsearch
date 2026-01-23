@@ -1,5 +1,7 @@
 #include "elasticsearch_common.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -1116,40 +1118,40 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 					    yyjson_val *sub_key;
 
 					    while ((sub_key = yyjson_obj_iter_next(&sub_iter))) {
-						    const char *sub_field_name = yyjson_get_str(sub_key);
-						    yyjson_val *sub_field_val = yyjson_obj_iter_get_val(sub_key);
-						    std::string sub_field_path = field_path + "." + sub_field_name;
+						    const char *subfield_name = yyjson_get_str(sub_key);
+						    yyjson_val *subfield_val = yyjson_obj_iter_get_val(sub_key);
+						    std::string subfield_path = field_path + "." + subfield_name;
 
-						    if (mapped_paths.count(sub_field_path) == 0) {
+						    if (mapped_paths.count(subfield_path) == 0) {
 							    // Check if it's a parent of any mapped field.
 							    bool is_sub_parent = false;
 							    for (const auto &mp : mapped_paths) {
-								    if (mp.find(sub_field_path + ".") == 0) {
+								    if (mp.find(subfield_path + ".") == 0) {
 									    is_sub_parent = true;
 									    break;
 								    }
 							    }
 
 							    if (!is_sub_parent) {
-								    // This sub-field is unmapped, add it.
-								    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, sub_field_val);
-								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, sub_field_name, copied);
+								    // This subfield is unmapped, add it.
+								    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, subfield_val);
+								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, copied);
 								    sub_has_unmapped = true;
 							    } else {
 								    // Recurse into this object.
 								    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
-								    collect_unmapped(sub_field_val, nested_obj, sub_field_path);
+								    collect_unmapped(subfield_val, nested_obj, subfield_path);
 								    if (yyjson_mut_obj_size(nested_obj) > 0) {
-									    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, sub_field_name, nested_obj);
+									    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, nested_obj);
 									    sub_has_unmapped = true;
 								    }
 							    }
-						    } else if (yyjson_is_obj(sub_field_val)) {
+						    } else if (yyjson_is_obj(subfield_val)) {
 							    // Recurse for nested mapped objects.
 							    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
-							    collect_unmapped(sub_field_val, nested_obj, sub_field_path);
+							    collect_unmapped(subfield_val, nested_obj, subfield_path);
 							    if (yyjson_mut_obj_size(nested_obj) > 0) {
-								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, sub_field_name, nested_obj);
+								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, nested_obj);
 								    sub_has_unmapped = true;
 							    }
 						    }
@@ -1402,6 +1404,87 @@ void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const Logi
 		break;
 	default:
 		FlatVector::SetNull(result, row_idx, true);
+	}
+}
+
+std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field) {
+	// For text fields, use .keyword subfield for exact matching.
+	// Text fields are analyzed and do not support exact term queries.
+	if (is_text_field) {
+		return column_name + ".keyword";
+	}
+	return column_name;
+}
+
+yyjson_mut_val *DuckDBValueToJson(yyjson_mut_doc *doc, const Value &value) {
+	if (value.IsNull()) {
+		return yyjson_mut_null(doc);
+	}
+
+	switch (value.type().id()) {
+	case LogicalTypeId::BOOLEAN:
+		return yyjson_mut_bool(doc, BooleanValue::Get(value));
+
+	case LogicalTypeId::TINYINT:
+		return yyjson_mut_sint(doc, TinyIntValue::Get(value));
+
+	case LogicalTypeId::SMALLINT:
+		return yyjson_mut_sint(doc, SmallIntValue::Get(value));
+
+	case LogicalTypeId::INTEGER:
+		return yyjson_mut_sint(doc, IntegerValue::Get(value));
+
+	case LogicalTypeId::BIGINT:
+		return yyjson_mut_sint(doc, BigIntValue::Get(value));
+
+	case LogicalTypeId::UTINYINT:
+		return yyjson_mut_uint(doc, UTinyIntValue::Get(value));
+
+	case LogicalTypeId::USMALLINT:
+		return yyjson_mut_uint(doc, USmallIntValue::Get(value));
+
+	case LogicalTypeId::UINTEGER:
+		return yyjson_mut_uint(doc, UIntegerValue::Get(value));
+
+	case LogicalTypeId::UBIGINT:
+		return yyjson_mut_uint(doc, UBigIntValue::Get(value));
+
+	case LogicalTypeId::FLOAT:
+		return yyjson_mut_real(doc, FloatValue::Get(value));
+
+	case LogicalTypeId::DOUBLE:
+		return yyjson_mut_real(doc, DoubleValue::Get(value));
+
+	case LogicalTypeId::VARCHAR:
+		return yyjson_mut_strcpy(doc, StringValue::Get(value).c_str());
+
+	case LogicalTypeId::DATE: {
+		// Convert to ISO 8601 date string (YYYY-MM-DD).
+		// Date::ToString returns YYYY-MM-DD format which Elasticsearch accepts.
+		auto date = DateValue::Get(value);
+		auto str = Date::ToString(date);
+		return yyjson_mut_strcpy(doc, str.c_str());
+	}
+
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS: {
+		// Convert to ISO 8601 timestamp string.
+		// Timestamp::ToString returns YYYY-MM-DD HH:MM:SS but Elasticsearch expects YYYY-MM-DDTHH:MM:SS.
+		auto ts = TimestampValue::Get(value);
+		auto str = Timestamp::ToString(ts);
+		// Replace space with 'T' for ISO 8601 compliance.
+		auto space_pos = str.find(' ');
+		if (space_pos != string::npos) {
+			str[space_pos] = 'T';
+		}
+		return yyjson_mut_strcpy(doc, str.c_str());
+	}
+
+	default:
+		// For other types, convert to string.
+		return yyjson_mut_strcpy(doc, value.ToString().c_str());
 	}
 }
 
