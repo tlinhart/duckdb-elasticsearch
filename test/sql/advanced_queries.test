@@ -1,0 +1,198 @@
+# name: test/sql/advanced_queries.test
+# description: Test advanced SQL features including joins, CTEs and subqueries
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test simple subquery.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+	WHERE amount > 50
+);
+----
+5
+
+# Test subquery with filter on outer query.
+query I
+SELECT count(*) FROM (
+    SELECT _id, amount, price FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+) data
+WHERE data.amount > 50 AND data.price > 7000;
+----
+3
+
+# Test simple CTE.
+query I
+WITH data AS (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+)
+SELECT count(*) FROM data
+WHERE amount > 50;
+----
+5
+
+# Test CTE with aggregation.
+query II
+WITH data AS (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+)
+SELECT count(*), avg(amount) FROM data;
+----
+10	49.8
+
+# Create a temporary table for join tests.
+statement ok
+CREATE TEMPORARY TABLE lookup (id VARCHAR, category VARCHAR);
+
+statement ok
+INSERT INTO lookup
+VALUES ('1', 'A'), ('2', 'B'), ('3', 'A'), ('4', 'B'), ('5', 'A');
+
+# Test INNER JOIN with temporary table.
+query II
+SELECT d._id, l.category FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) d
+INNER JOIN lookup l ON d._id = l.id
+ORDER BY d._id;
+----
+1	A
+2	B
+3	A
+4	B
+5	A
+
+# Test LEFT JOIN with temporary table.
+query II
+SELECT d._id, l.category FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) d
+LEFT JOIN lookup l ON d._id = l.id
+WHERE d._id IN ('1', '6')
+ORDER BY d._id;
+----
+1	A
+6	NULL
+
+# Clean up temporary table.
+statement ok
+DROP TABLE lookup;
+
+# Test UNION of two Elasticsearch queries.
+query I
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 80
+UNION
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated = true
+ORDER BY _id;
+----
+2
+4
+6
+7
+9
+
+# Test INTERSECT of two Elasticsearch queries.
+query I
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 60
+INTERSECT
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated = true
+ORDER BY _id;
+----
+2
+4
+9
+
+# Test EXCEPT of two Elasticsearch queries.
+query I
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 50
+EXCEPT
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated = true
+ORDER BY _id;
+----
+6
+8
+
+# Test correlated subquery using IN on a supported field.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount IN (
+    SELECT amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+	WHERE deprecated = true
+);
+----
+4
