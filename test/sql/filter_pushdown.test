@@ -1,0 +1,1124 @@
+# name: test/sql/filter_pushdown.test
+# description: Test SQL filter translation to Elasticsearch Query DSL
+# group: [sql]
+
+# This test file verifies which filters are pushed down to Elasticsearch and which
+# are handled by DuckDB. It covers all field types and operators.
+#
+# Test Index Schema:
+# - name: text WITH .keyword subfield
+# - email: keyword
+# - description: text WITHOUT .keyword subfield
+# - colors: keyword (array)
+# - amount: integer
+# - price: float
+# - deprecated: boolean
+# - birth_date: date
+# - employee.name: text WITH .keyword subfield (nested struct)
+# - employee.salary: double (nested struct)
+# - users.name: text WITHOUT .keyword (nested array)
+# - users.email: keyword (nested array)
+#
+# Pushdown Behavior Summary:
+# +------------------+----------+----------+----------+----------+----------+----------+
+# | Field Type       | =, !=    | <, >, <= | IN       | LIKE     | ILIKE    | IS NULL  |
+# +------------------+----------+----------+----------+----------+----------+----------+
+# | keyword          | PUSHED   | PUSHED   | PUSHED   | PUSHED   | PUSHED   | PUSHED   |
+# | text + .keyword  | PUSHED   | PUSHED   | PUSHED   | PUSHED   | PUSHED   | PUSHED   |
+# | text (no .kw)    | ERROR    | ERROR    | ERROR    | ERROR    | ERROR    | PUSHED   |
+# | integer/float    | PUSHED   | PUSHED   | PUSHED   | N/A      | N/A      | PUSHED   |
+# | boolean          | PUSHED   | N/A      | PUSHED   | N/A      | N/A      | PUSHED   |
+# | date             | PUSHED   | PUSHED   | PUSHED   | N/A      | N/A      | PUSHED   |
+# +------------------+----------+----------+----------+----------+----------+----------+
+#
+# Legend:
+# - PUSHED: Filter is translated to Elasticsearch Query DSL
+# - ERROR: Throws error with suggestions (add .keyword, use MATERIALIZED CTE, or use query param)
+# - FILTER: Filter cannot be pushed at all (volatile, multi-column, function on column)
+# - N/A: Not applicable for this field type
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# ==============================================================================
+# SECTION 1: NUMERIC FIELDS (integer, float, double)
+# All operators are PUSHED to Elasticsearch
+# ==============================================================================
+
+# --- Equality ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount = 42;
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount = 42;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount=42.*
+
+# --- Inequality ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount != 42;
+----
+9
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount != 42;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount!=42.*
+
+# --- Greater Than ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > 50;
+----
+5
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>50.*
+
+# --- Less Than or Equal ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount <= 30;
+----
+3
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount <= 30;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount<=30.*
+
+# --- IN clause ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount IN (42, 87, 15);
+----
+3
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount IN (42, 87, 15);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount IN \(42, 87, 15\).*
+
+# --- Range (BETWEEN equivalent) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount >= 30 AND amount <= 70;
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount >= 30 AND amount <= 70;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>=30 AND amount<=70.*
+
+# --- Float field ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE price > 9000;
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE price > 9000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*price>9000.*
+
+# --- IS NULL ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE deprecated IS NULL;
+----
+6
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE deprecated IS NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated IS NULL.*
+
+# --- IS NOT NULL ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE deprecated IS NOT NULL;
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE deprecated IS NOT NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated IS NOT NULL.*
+
+# ==============================================================================
+# SECTION 2: DATE FIELDS
+# All operators are PUSHED to Elasticsearch
+# ==============================================================================
+
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE birth_date > '2010-01-01';
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE birth_date > '2010-01-01';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date>'2010-01-01.*
+
+# ==============================================================================
+# SECTION 3: BOOLEAN FIELDS
+# Equality is PUSHED to Elasticsearch
+# ==============================================================================
+
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE deprecated = true;
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE deprecated = true;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated=true.*
+
+# ==============================================================================
+# SECTION 4: KEYWORD FIELDS
+# All operators are PUSHED to Elasticsearch
+# ==============================================================================
+
+# --- Equality on keyword field (_id is special but behaves like keyword) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*_id='1'.*
+
+# --- Equality on email (keyword field) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email = 'alice.johnson@example.com';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email = 'alice.johnson@example.com';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email=.*
+
+# --- IN clause on keyword ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id IN ('1', '2', '3');
+----
+3
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id IN ('1', '2', '3');
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*_id IN \('1', '2', '3'\).*
+
+# --- LIKE prefix on keyword field (email) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email LIKE 'alice%';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email LIKE 'alice%';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*prefix\(email, 'alice'\).*
+
+# --- LIKE suffix on keyword field ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email LIKE '%.com';
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email LIKE '%.com';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*suffix\(email, '.com'\).*
+
+# --- LIKE contains on keyword field ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email LIKE '%@%';
+----
+10
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email LIKE '%@%';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*contains\(email, '@'\).*
+
+# --- ILIKE on keyword field ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email ILIKE 'ALICE%';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE email ILIKE 'ALICE%';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email ~~\* 'ALICE%'.*
+
+# ==============================================================================
+# SECTION 5: TEXT FIELDS WITH .keyword SUBFIELD
+# All operators are PUSHED using the .keyword subfield
+# ==============================================================================
+
+# --- Equality ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name = 'Alice Johnson';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name = 'Alice Johnson';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name='Alice Johnson'.*
+
+# --- Inequality ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name != 'Alice Johnson';
+----
+9
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name != 'Alice Johnson';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name!='Alice Johnson'.*
+
+# --- Range comparison ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name >= 'M';
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name >= 'M';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name>='M'.*
+
+# --- IN clause ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name IN ('Alice Johnson', 'Emma Wilson', 'Non Existent');
+----
+2
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name IN ('Alice Johnson', 'Emma Wilson', 'Non Existent');
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name IN.*
+
+# --- LIKE prefix (PUSHED via .keyword) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE 'Alice%';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE 'Alice%';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*prefix\(name, 'Alice'\).*
+
+# --- LIKE suffix (PUSHED via .keyword) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE '%son';
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE '%son';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*suffix\(name, 'son'\).*
+
+# --- LIKE contains (PUSHED via .keyword) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE '%a%';
+----
+9
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE '%a%';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*contains\(name, 'a'\).*
+
+# --- ILIKE prefix (PUSHED via .keyword with case_insensitive) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE 'alice%';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE 'alice%';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name ~~\* 'alice%'.*
+
+# --- ILIKE suffix (PUSHED via .keyword with case_insensitive) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE '%SON';
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE '%SON';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name ~~\* '%SON'.*
+
+# --- ILIKE contains (PUSHED via .keyword with case_insensitive) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE '%A%';
+----
+10
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE '%A%';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name ~~\* '%A%'.*
+
+# --- IS NOT NULL ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name IS NOT NULL;
+----
+10
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name IS NOT NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name IS NOT NULL.*
+
+# ==============================================================================
+# SECTION 6: TEXT FIELDS WITHOUT .keyword SUBFIELD
+# Only IS NULL/IS NOT NULL are supported.
+# All other filters throw an error with helpful suggestions.
+# ==============================================================================
+
+# --- Equality (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description = 'Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- Inequality (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description != 'Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- Range comparison (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description >= 'S';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- IN clause (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IN ('Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.', 'Non existent description');
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- LIKE prefix (ERROR - case-sensitive matching not possible on analyzed text) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description LIKE 'Premium%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- LIKE suffix (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description LIKE '%comfort.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- LIKE contains (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description LIKE '%wireless%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- ILIKE prefix (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description ILIKE 'premium%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- ILIKE suffix (ERROR - wildcard queries don't work on analyzed text) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description ILIKE '%COMFORT.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- ILIKE contains (ERROR - wildcard queries don't work on analyzed text) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description ILIKE '%WIRELESS%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- IS NOT NULL (PUSHED - exists query works on any field) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IS NOT NULL;
+----
+10
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IS NOT NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*description IS NOT NULL.*
+
+# --- IS NULL (PUSHED - exists query works on any field) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IS NULL;
+----
+0
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IS NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*description IS NULL.*
+
+# ==============================================================================
+# SECTION 7: NESTED STRUCT FIELDS
+# Filters on struct fields are PUSHED to Elasticsearch
+# ==============================================================================
+
+# --- Numeric field in struct ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.salary > 80000;
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.salary > 80000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.salary>80000.*
+
+# --- Text field with .keyword in struct ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name = 'Robert Chen';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name = 'Robert Chen';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.name='Robert Chen'.*
+
+# --- Range on text field with .keyword in struct ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name >= 'R';
+----
+3
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name >= 'R';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.name>='R'.*
+
+# --- LIKE on text field with .keyword in struct ---
+# Note: DuckDB may not push LIKE on nested struct fields - handled by FILTER node
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name LIKE 'Robert%';
+----
+1
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name LIKE 'Robert%';
+----
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# ==============================================================================
+# SECTION 8: BOOLEAN LOGIC (AND, OR)
+# ==============================================================================
+
+# --- AND combination ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > 50 AND deprecated = true;
+----
+3
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > 50 AND deprecated = true;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>50.*deprecated=true.*
+
+# --- OR combination (marked as optional) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount < 20 OR amount > 80;
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount < 20 OR amount > 80;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*optional:.*amount<20 OR.*amount>80.*
+
+# --- Complex nested boolean logic ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE (amount > 50 AND deprecated = true) OR price > 9000;
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE (amount > 50 AND deprecated = true) OR price > 9000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*
+
+# ==============================================================================
+# SECTION 9: COMBINING BASE QUERY WITH SQL FILTER
+# ==============================================================================
+
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"exists": {"field": "deprecated"}}'
+) WHERE deprecated = true;
+----
+4
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"exists": {"field": "deprecated"}}'
+) WHERE deprecated = true;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated=true.*
+
+# ==============================================================================
+# SECTION 10: ARRAY ELEMENT ACCESS - NOT PUSHED
+# Elasticsearch treats arrays as flat lists - no way to filter on specific index
+# ==============================================================================
+
+# --- LIKE on array element (NOT pushed - evaluated by DuckDB) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] LIKE 'red%';
+----
+5
+
+# Array element access shows FILTER operator above scan
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] LIKE 'red%';
+----
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# --- ILIKE on array element (NOT pushed) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] ILIKE 'RED%';
+----
+5
+
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] ILIKE 'RED%';
+----
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# ==============================================================================
+# SECTION 11: FILTERS THAT CANNOT BE PUSHED (FILTER operator above scan)
+# ==============================================================================
+
+# --- Volatile function (RANDOM) ---
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE RANDOM() > 0.5;
+----
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# --- Expression involving multiple columns ---
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > price;
+----
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# --- Function on column ---
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE LENGTH(name) > 5;
+----
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# --- Arithmetic on column ---
+# Note: DuckDB may simplify arithmetic expressions - amount + 10 > 50 becomes amount > 40
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount + 10 > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>40.*
+
+# --- CASE expression ---
+query II
+EXPLAIN SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE CASE WHEN deprecated THEN amount ELSE 0 END > 50;
+----
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*

@@ -1,0 +1,377 @@
+# name: test/sql/projection_limit.test
+# description: Tests for projection and limit pushdown optimizations.
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test single column projection.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+Alice Johnson
+
+# Test multiple column projection.
+query III
+SELECT _id, name, amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+1	Alice Johnson	42
+
+# Test projection with aggregation.
+query I
+SELECT SUM(amount) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+498
+
+# Test projection with nested struct field.
+query I
+SELECT employee.name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+Robert Chen
+
+# Test basic LIMIT.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 5
+);
+----
+5
+
+# Test LIMIT 1.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 1
+);
+----
+1
+
+# Test LIMIT larger than result set.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 100
+);
+----
+10
+
+# Test LIMIT with filter.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) WHERE amount > 50 LIMIT 2
+);
+----
+2
+
+# Test LIMIT with ORDER BY.
+query I
+SELECT amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) ORDER BY amount DESC LIMIT 3;
+----
+91
+87
+76
+
+# Test GROUP BY with projection.
+query II
+SELECT deprecated, COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) GROUP BY deprecated ORDER BY deprecated;
+----
+true	4
+NULL	6
+
+# Test subquery projection.
+query I
+SELECT name FROM (
+    SELECT name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) WHERE amount > 50
+) ORDER BY name LIMIT 3;
+----
+Benjamin Lee
+Charlotte Anderson
+James Garcia
+
+# =============================================================================
+# LIMIT and OFFSET pushdown tests.
+# These tests verify that LIMIT and OFFSET are pushed down to Elasticsearch.
+# =============================================================================
+
+# Test OFFSET without LIMIT (returns all rows after offset).
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) OFFSET 3
+);
+----
+7
+
+# Test LIMIT with OFFSET (basic pagination).
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 3 OFFSET 2
+);
+----
+3
+
+# Test LIMIT with OFFSET that exceeds result set.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 5 OFFSET 8
+);
+----
+2
+
+# Test OFFSET that equals result set size (should return 0 rows).
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 5 OFFSET 10
+);
+----
+0
+
+# Test OFFSET larger than result set (should return 0 rows).
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 5 OFFSET 100
+);
+----
+0
+
+# Test LIMIT 0 (should return 0 rows).
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 0
+);
+----
+0
+
+# Test OFFSET 0 (same as no offset).
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) LIMIT 3 OFFSET 0
+);
+----
+3
+
+# Test LIMIT with OFFSET and ORDER BY (pagination with sorting).
+query I
+SELECT amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) ORDER BY amount DESC LIMIT 3 OFFSET 2;
+----
+76
+63
+54
+
+# Test LIMIT with OFFSET and filter pushdown.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    ) WHERE amount > 20 LIMIT 2 OFFSET 1
+);
+----
+2
+
+# Test LIMIT with projection (only specific columns).
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) ORDER BY name LIMIT 2;
+----
+Alice Johnson
+Benjamin Lee
+
+# Test LIMIT with OFFSET and projection.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) ORDER BY name LIMIT 2 OFFSET 2;
+----
+Charlotte Anderson
+Daniel Taylor
+
+# =============================================================================
+# Filter field pruning tests.
+# These tests verify that filter-only columns work correctly when excluded from
+# the SELECT clause. The optimization excludes filter-only columns from _source.
+# =============================================================================
+
+# Test filter on column not in SELECT (basic case).
+# The 'amount' column is used only in WHERE, not in SELECT.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount = 42;
+----
+Alice Johnson
+
+# Test filter on column not in SELECT with multiple results.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > 50 ORDER BY name;
+----
+Benjamin Lee
+Charlotte Anderson
+James Garcia
+Michael Brown
+William Thompson
+
+# Test filter on multiple columns not in SELECT.
+# Both 'amount' and 'deprecated' are used only in WHERE.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > 50 AND deprecated = true ORDER BY name;
+----
+Charlotte Anderson
+James Garcia
+Michael Brown
+
+# Test filter column also in SELECT (should still work).
+# The 'amount' column is in both SELECT and WHERE.
+query II
+SELECT name, amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE amount > 80 ORDER BY amount DESC;
+----
+William Thompson	91
+Michael Brown	87
+
+# Test filter on nested struct field not in SELECT.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.salary > 80000 ORDER BY name;
+----
+Benjamin Lee
+James Garcia
+Michael Brown
+Olivia Davis
+
+# Test filter with LIKE on column not in SELECT.
+query I
+SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE '%son' ORDER BY _id;
+----
+1
+3
+6
+9

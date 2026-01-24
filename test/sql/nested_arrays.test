@@ -1,0 +1,163 @@
+# name: test/sql/nested_arrays.test
+# description: Tests for nested objects, arrays, and the sample_size parameter.
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test object type mapped to STRUCT (employee field).
+query I
+SELECT employee.name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+Robert Chen
+
+# Test accessing nested struct field for salary.
+query R
+SELECT employee.salary FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+75000.0
+
+# Test keyword array field (colors).
+query I
+SELECT colors FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+[red, blue]
+
+# Test single-element array.
+query I
+SELECT colors FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '2';
+----
+[green]
+
+# Test multi-element array.
+query I
+SELECT colors FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '3';
+----
+[red, green, blue]
+
+# Test array length function.
+query I
+SELECT len(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '3';
+----
+3
+
+# Test list_contains on array.
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE list_contains(colors, 'red');
+----
+6
+
+# Test nested type mapped to LIST of STRUCT (users field).
+query I
+SELECT len(users) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+2
+
+# Test accessing first element of nested array.
+query I
+SELECT users[1].email FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE _id = '1';
+----
+alice@example.com
+
+# Test sample_size parameter with default value.
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Test sample_size parameter set to 0 (disabled).
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    sample_size := 0
+);
+----
+10
+
+# Test sample_size parameter with small value.
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    sample_size := 5
+);
+----
+10
+
+# Test filtering on struct field.
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.salary > 100000;
+----
+2
+
+# Test aggregation on struct field.
+query R
+SELECT AVG(employee.salary) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+75450.0

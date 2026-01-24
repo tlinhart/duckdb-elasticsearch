@@ -1,0 +1,448 @@
+# name: test/sql/text_field_keyword.test
+# description: Functional tests for text field filtering with and without .keyword subfield.
+# group: [sql]
+
+# This test file verifies the correctness of query results when filtering on text fields.
+# It tests the actual behavior (correct row counts) rather than query plans.
+# For pushdown verification (EXPLAIN tests), see filter_pushdown.test.
+#
+# Test Index Schema:
+# - name: text WITH .keyword subfield
+# - description: text WITHOUT .keyword subfield
+# - email: keyword
+# - employee.name: text WITH .keyword subfield (nested struct)
+# - users.name: text WITHOUT .keyword (nested array)
+# - users.email: keyword (nested array)
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# ==============================================================================
+# TEXT FIELDS WITH .keyword SUBFIELD (name, employee.name)
+# ==============================================================================
+
+# --- Equality ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name = 'Alice Johnson';
+----
+1
+
+# --- Inequality ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name != 'Alice Johnson';
+----
+9
+
+# --- Range comparison ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name >= 'M';
+----
+4
+
+# --- IN clause ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name IN ('Alice Johnson', 'Emma Wilson', 'Non Existent');
+----
+2
+
+# --- LIKE prefix ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE 'Alice%';
+----
+1
+
+# --- LIKE suffix ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE '%son';
+----
+4
+
+# --- LIKE contains ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE '%a%';
+----
+9
+
+# --- LIKE prefix with lowercase (case-sensitive, should not match 'Alice') ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name LIKE 'a%';
+----
+0
+
+# --- ILIKE prefix (case-insensitive) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE 'alice%';
+----
+1
+
+# --- ILIKE suffix (case-insensitive) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE '%SON';
+----
+4
+
+# --- ILIKE contains (case-insensitive) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name ILIKE '%A%';
+----
+10
+
+# --- IS NOT NULL ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE name IS NOT NULL;
+----
+10
+
+# --- Nested struct: employee.name (text with .keyword) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name = 'Robert Chen';
+----
+1
+
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name LIKE 'Robert%';
+----
+1
+
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE employee.name >= 'R';
+----
+3
+
+# ==============================================================================
+# TEXT FIELDS WITHOUT .keyword SUBFIELD (description, users.name)
+# Only IS NULL/IS NOT NULL are supported.
+# All other filters throw an error with helpful suggestions.
+# ==============================================================================
+
+# --- Equality (ERROR) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description = 'Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- Inequality (ERROR) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description != 'Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- Range comparison (ERROR) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description >= 'S';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- IN clause (ERROR) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IN ('Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.', 'Non existent description');
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- LIKE prefix (ERROR - case-sensitive matching not possible on analyzed text) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description LIKE 'Premium%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- LIKE suffix (ERROR) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description LIKE '%comfort.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- LIKE contains (ERROR) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description LIKE '%wireless%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- ILIKE prefix (ERROR - not supported on text without .keyword) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description ILIKE 'premium%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- ILIKE suffix (ERROR - wildcard queries don't work on analyzed text) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description ILIKE '%COMFORT.';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- ILIKE contains (ERROR - wildcard queries don't work on analyzed text) ---
+statement error
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description ILIKE '%WIRELESS%';
+----
+Cannot filter on text field 'description' because it lacks a .keyword subfield.
+
+# --- IS NOT NULL (PUSHED - exists query works on any field) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IS NOT NULL;
+----
+10
+
+# --- IS NULL (PUSHED - exists query works on any field) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE description IS NULL;
+----
+0
+
+# ==============================================================================
+# NESTED ARRAY TEXT FIELD WITHOUT .keyword (users.name)
+# Demonstrates that nested array text fields without .keyword cannot be filtered
+# by pushing to Elasticsearch - the .keyword subfield doesn't exist.
+# ==============================================================================
+
+# Using the query parameter to directly test Elasticsearch term query on
+# missing .keyword. This query searches for users.name.keyword which doesn't
+# exist in the mapping. Expected result: 0 (the field doesn't exist).
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"term": {"users.name.keyword": "Alice Smith"}}'
+);
+----
+0
+
+# Compare with users.email which IS a keyword field (should return 1 result).
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"nested": {"path": "users", "query": {"term": {"users.email": "alice@example.com"}}}}'
+);
+----
+1
+
+# ==============================================================================
+# ARRAY ELEMENT ACCESS (colors[1])
+# Elasticsearch treats arrays as flat lists - no way to filter on specific index.
+# These filters are evaluated by DuckDB after fetching.
+# ==============================================================================
+
+# --- LIKE prefix on array element (first color) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] LIKE 'red%';
+----
+5
+
+# --- LIKE suffix on array element ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] LIKE '%ue';
+----
+2
+
+# --- LIKE contains on array element ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] LIKE '%ee%';
+----
+3
+
+# --- ILIKE prefix on array element (case-insensitive) ---
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+) WHERE colors[1] ILIKE 'RED%';
+----
+5
+
+# ==============================================================================
+# WORKAROUND: NATIVE ELASTICSEARCH QUERY PARAMETER
+# Use the query parameter for native Elasticsearch text queries on text fields
+# without .keyword subfield.
+# ==============================================================================
+
+# match query performs full-text search on analyzed text fields.
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match": {"description": "wireless"}}'
+);
+----
+1
+
+# match_phrase query for phrase search on text fields.
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match_phrase": {"description": "noise cancellation"}}'
+);
+----
+1
+
+# match_phrase_prefix for prefix search on text fields.
+query I
+SELECT COUNT(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match_phrase_prefix": {"description": "premium wire"}}'
+);
+----
+1
