@@ -11,6 +11,8 @@
           "keyword": { "type": "keyword" }
         }
       },
+      "email": { "type": "keyword" },
+      "description": { "type": "text" },
       "colors": { "type": "keyword" },
       "amount": { "type": "integer" },
       "price": { "type": "float" },
