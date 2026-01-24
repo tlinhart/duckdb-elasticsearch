@@ -40,6 +40,12 @@ void CollectAllMappedPaths(yyjson_val *properties, const std::string &prefix, st
 void CollectAllPathTypes(yyjson_val *properties, const std::string &prefix,
                          std::unordered_map<std::string, std::string> &path_types);
 
+// Collect text fields that have a .keyword subfield.
+// These text fields can be filtered via the .keyword subfield which stores the raw
+// (not analyzed) value. Text fields without .keyword cannot be filtered (except IS NULL/IS NOT NULL).
+void CollectTextFieldsWithKeyword(yyjson_val *properties, const std::string &prefix,
+                                  std::unordered_set<std::string> &text_fields_with_keyword);
+
 // Merge mappings from multiple indices, checking for type compatibility.
 void MergeMappingsFromIndices(yyjson_val *root, vector<string> &column_names, vector<LogicalType> &column_types,
                               vector<string> &field_paths, vector<string> &es_types,
@@ -95,7 +101,8 @@ std::string TrimString(const std::string &s);
 // Convert DuckDB value to yyjson mutable value for query building.
 yyjson_mut_val *DuckDBValueToJson(yyjson_mut_doc *doc, const Value &value);
 
-// Get Elasticsearch field name, adding .keyword suffix for text fields that need exact matching.
-std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field);
+// Get Elasticsearch field name, adding .keyword suffix for text fields that have a .keyword subfield.
+// For text fields without .keyword subfield, returns the base field name (caller should handle appropriately).
+std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field, bool has_keyword_subfield);
 
 } // namespace duckdb

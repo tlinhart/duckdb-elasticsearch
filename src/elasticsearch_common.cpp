@@ -718,6 +718,52 @@ void CollectAllPathTypes(yyjson_val *properties, const std::string &prefix,
 	}
 }
 
+void CollectTextFieldsWithKeyword(yyjson_val *properties, const std::string &prefix,
+                                  std::unordered_set<std::string> &text_fields_with_keyword) {
+	if (!properties || !yyjson_is_obj(properties))
+		return;
+
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(properties, &iter);
+	yyjson_val *key;
+
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		const char *field_name = yyjson_get_str(key);
+		yyjson_val *field_def = yyjson_obj_iter_get_val(key);
+
+		std::string full_path = prefix.empty() ? field_name : prefix + "." + field_name;
+
+		// Check if this is a text field with a .keyword subfield.
+		yyjson_val *type_val = yyjson_obj_get(field_def, "type");
+		if (type_val && yyjson_is_str(type_val)) {
+			const char *type_str = yyjson_get_str(type_val);
+			if (type_str && std::string(type_str) == "text") {
+				// Check for "fields" property containing a "keyword" subfield.
+				yyjson_val *fields = yyjson_obj_get(field_def, "fields");
+				if (fields && yyjson_is_obj(fields)) {
+					yyjson_val *keyword_field = yyjson_obj_get(fields, "keyword");
+					if (keyword_field && yyjson_is_obj(keyword_field)) {
+						// Verify it's actually a keyword type.
+						yyjson_val *keyword_type = yyjson_obj_get(keyword_field, "type");
+						if (keyword_type && yyjson_is_str(keyword_type)) {
+							const char *kt = yyjson_get_str(keyword_type);
+							if (kt && std::string(kt) == "keyword") {
+								text_fields_with_keyword.insert(full_path);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Recursively collect nested paths for object/nested types.
+		yyjson_val *nested_props = yyjson_obj_get(field_def, "properties");
+		if (nested_props && yyjson_is_obj(nested_props)) {
+			CollectTextFieldsWithKeyword(nested_props, full_path, text_fields_with_keyword);
+		}
+	}
+}
+
 bool AreTypesCompatible(const LogicalType &type1, const LogicalType &type2) {
 	// Identical types are always compatible.
 	if (type1 == type2) {
@@ -1407,10 +1453,12 @@ void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const Logi
 	}
 }
 
-std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field) {
-	// For text fields, use .keyword subfield for exact matching.
-	// Text fields are analyzed and do not support exact term queries.
-	if (is_text_field) {
+std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field, bool has_keyword_subfield) {
+	// For text fields with .keyword subfield, use .keyword for exact matching.
+	// Text fields are analyzed and do not support exact term queries on the base field.
+	// For text fields without .keyword subfield, return the base field name.
+	// The caller should decide whether to push down the filter or not.
+	if (is_text_field && has_keyword_subfield) {
 		return column_name + ".keyword";
 	}
 	return column_name;

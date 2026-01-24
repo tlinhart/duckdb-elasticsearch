@@ -10,6 +10,8 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -19,8 +21,6 @@
 #include "yyjson.hpp"
 
 #include <algorithm>
-#include <functional>
-#include <map>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,6 +56,9 @@ struct ElasticsearchQueryBindData : public TableFunctionData {
 
 	// Set of text fields (need .keyword for exact matching).
 	unordered_set<string> text_fields;
+
+	// Set of text fields that have a .keyword subfield (enables filter pushdown).
+	unordered_set<string> text_fields_with_keyword;
 
 	// Sample size for array detection (0 = disabled, default = 100).
 	int64_t sample_size = 100;
@@ -123,6 +126,8 @@ struct ElasticsearchQueryGlobalState : public GlobalTableFunctionState {
 // handles filtering server-side.
 static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, const TableFilterSet *filters,
                                    const vector<idx_t> &column_ids, const vector<idx_t> &projection_ids) {
+	std::string result;
+
 	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
 	yyjson_mut_val *root = yyjson_mut_obj(doc);
 	yyjson_mut_doc_set_root(doc, root);
@@ -164,8 +169,11 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 			}
 		}
 
-		filter_clause =
-		    TranslateFilters(doc, *filters, filter_column_names, bind_data.es_type_map, bind_data.text_fields);
+		FilterTranslationResult translation_result =
+		    TranslateFilters(doc, *filters, filter_column_names, bind_data.es_type_map, bind_data.text_fields,
+		                     bind_data.text_fields_with_keyword);
+
+		filter_clause = translation_result.es_query;
 	}
 
 	// Merge base query and filter clause.
@@ -264,7 +272,6 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 
 	// Serialize the query.
 	char *json_str = yyjson_mut_write(doc, 0, nullptr);
-	std::string result;
 	if (json_str) {
 		result = json_str;
 		free(json_str);
@@ -346,6 +353,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 
 	// Collect all path types including nested paths.
 	// This is needed for proper filter pushdown on nested struct fields.
+	// Also collect text fields that have a .keyword subfield.
 	std::unordered_map<std::string, std::string> all_path_types;
 	yyjson_obj_iter idx_iter;
 	yyjson_obj_iter_init(root, &idx_iter);
@@ -357,6 +365,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 			yyjson_val *properties = yyjson_obj_get(mappings, "properties");
 			if (properties) {
 				CollectAllPathTypes(properties, "", all_path_types);
+				CollectTextFieldsWithKeyword(properties, "", bind_data->text_fields_with_keyword);
 			}
 		}
 	}
@@ -741,12 +750,6 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 		//
 		// By intercepting prefix/suffix/contains here, we can use Elasticsearch's native
 		// prefix/wildcard queries which are more efficient than range filters.
-		//
-		// Note: For text fields, we can only push ILIKE patterns (case-insensitive) because
-		// text fields are analyzed (lowercased) during indexing. LIKE patterns (case-sensitive)
-		// cannot be correctly implemented on text fields, so we let DuckDB evaluate them.
-		// The optimized functions (prefix, suffix, contains) come from LIKE optimization,
-		// so they are also case-sensitive and cannot be pushed for text fields.
 		if (filter->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 			auto &func_expr = filter->Cast<BoundFunctionExpression>();
 			const auto &func_name = func_expr.function.name;
@@ -793,15 +796,17 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				}
 				const string &col_name = bind_data.all_column_names[bind_col_id - 1];
 				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
+				bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
 
-				// For text fields, only push ILIKE patterns (case-insensitive).
-				// LIKE patterns and optimized functions (prefix, suffix, contains) are
-				// case-sensitive and cannot be correctly implemented on analyzed text fields.
-				if (is_text_field) {
-					bool is_ilike = (func_name == "~~*" || func_name == "ilike_escape");
-					if (!is_ilike) {
-						continue;
-					}
+				// For text fields without .keyword subfield, throw error because text fields are
+				// analyzed (tokenized, lowercased) and don't support pattern matching correctly.
+				// For text fields with .keyword subfield or non-text fields, all patterns are supported.
+				if (is_text_field && !has_keyword_subfield) {
+					throw InvalidInputException(
+					    "Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
+					    "  - Add a .keyword subfield to the Elasticsearch mapping\n"
+					    "  - Use the 'query' parameter with native Elasticsearch text queries",
+					    col_name);
 				}
 
 				// Create an ExpressionFilter wrapping the function expression.
@@ -860,6 +865,9 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 			// DuckDB's FilterCombiner wraps non-dense IN filters in OptionalFilter and returns
 			// PUSHED_DOWN_PARTIALLY, which keeps a FILTER node. By handling IN here, we can
 			// fully push it down to Elasticsearch and remove the redundant filter.
+			//
+			// For text fields without .keyword subfield, we can't push IN filters because
+			// terms queries don't work correctly on analyzed text. Let DuckDB handle the filtering.
 			if (expr_type == ExpressionType::COMPARE_IN) {
 				if (op_expr.children.size() < 2) {
 					continue;
@@ -878,6 +886,23 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				}
 
 				const ColumnIndex &col_index = column_ids[output_col_idx];
+				idx_t bind_col_id = col_index.GetPrimaryIndex();
+
+				// Throw error for text fields without .keyword subfield.
+				// Note: _id column (bind_col_id == 0) and _unmapped_ column are not text fields,
+				// so IN filters can be pushed for them.
+				if (bind_col_id > 0 && bind_col_id <= bind_data.all_column_names.size()) {
+					const string &col_name = bind_data.all_column_names[bind_col_id - 1];
+					bool is_text_field = bind_data.text_fields.count(col_name) > 0;
+					bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
+					if (is_text_field && !has_keyword_subfield) {
+						throw InvalidInputException(
+						    "Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
+						    "  - Add a .keyword subfield to the Elasticsearch mapping\n"
+						    "  - Use the 'query' parameter with native Elasticsearch text queries",
+						    col_name);
+					}
+				}
 
 				// Remaining children must all be constants (no NULLs).
 				vector<Value> in_values;
