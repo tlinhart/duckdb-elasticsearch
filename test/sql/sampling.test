@@ -1,0 +1,63 @@
+# name: test/sql/sampling.test
+# description: Test sampling behavior and sample_size parameter edge cases
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Elasticsearch mappings don't distinguish between scalar fields and array fields.
+# The extension samples documents from Elasticsearch to detect which fields actually contain arrays.
+# When query parameter is provided, sampling uses that query instead of match_all.
+
+# This query matches only document with _id='1' where the colors field is an array.
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match": {"name": "Alice Johnson"}}'
+);
+----
+VARCHAR[]
+
+# This query matches only document with _id='2' where the colors field is a single value.
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match": {"name": "Michael Brown"}}'
+);
+----
+VARCHAR
+
+# Test with sample_size larger than available documents.
+# Should correctly detect the colors field as an array.
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    sample_size := 1000
+)
+WHERE _id = '1';
+----
+VARCHAR[]
+
+# Test sample_size of 0 (disabled sampling).
+# Without sampling, the colors field is not detected as an array.
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    sample_size := 0
+)
+WHERE _id = '1';
+----
+VARCHAR
