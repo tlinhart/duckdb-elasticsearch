@@ -243,3 +243,33 @@ SELECT users[1].email FROM elasticsearch_query(
 WHERE _id = '1';
 ----
 alice@example.com
+
+# Test GROUP BY with projection.
+query II
+SELECT deprecated, count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+GROUP BY deprecated
+ORDER BY deprecated;
+----
+true	4
+NULL	6
+
+# Test filter on nested struct field not in SELECT.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE employee.salary > 80000
+ORDER BY name;
+----
+Benjamin Lee
+James Garcia
+Michael Brown
+Olivia Davis
