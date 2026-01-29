@@ -1,0 +1,211 @@
+# name: test/sql/limit_offset.test
+# description: Test limit and offset clauses
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test basic LIMIT.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 5
+);
+----
+5
+
+# Test LIMIT larger than result set.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 100
+);
+----
+10
+
+# Test LIMIT with filter.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    WHERE amount > 50
+    LIMIT 2
+);
+----
+2
+
+# Test LIMIT with ORDER BY.
+query I
+SELECT amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+ORDER BY amount DESC
+LIMIT 3;
+----
+91
+87
+76
+
+# Test subquery projection.
+query I
+SELECT name FROM (
+    SELECT name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    WHERE amount > 50
+)
+ORDER BY name
+LIMIT 3;
+----
+Benjamin Lee
+Charlotte Anderson
+James Garcia
+
+# Test OFFSET without LIMIT.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    OFFSET 3
+);
+----
+7
+
+# Test LIMIT with OFFSET.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 3 OFFSET 2
+);
+----
+3
+
+# Test LIMIT with OFFSET that exceeds result set.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 5 OFFSET 8
+);
+----
+2
+
+# Test OFFSET that equals result set size.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 5 OFFSET 10
+);
+----
+0
+
+# Test OFFSET larger than result set.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 5 OFFSET 100
+);
+----
+0
+
+# Test LIMIT 0.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 0
+);
+----
+0
+
+# Test OFFSET 0.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 3 OFFSET 0
+);
+----
+3
+
+# Test LIMIT with OFFSET and ORDER BY.
+query I
+SELECT amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+ORDER BY amount DESC
+LIMIT 3 OFFSET 2;
+----
+76
+63
+54
+
+# Test LIMIT with OFFSET and filter pushdown.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    WHERE amount > 20
+    LIMIT 2 OFFSET 1
+);
+----
+2
