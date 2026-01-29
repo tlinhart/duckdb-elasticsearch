@@ -13,6 +13,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -719,14 +720,111 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 	output.SetCardinality(output_idx);
 }
 
-// Pushdown complex filter callback extracts filters from expressions that DuckDB's FilterCombiner
-// would not (or only partially) push down. By handling them here, we can fully push them to Elasticsearch.
-// For partially pushed down filters it allows us to avoid a redundant FILTER node in the query plan.
+// Result of ExtractColumnPath containing column info needed for filter pushdown.
+struct ColumnPathInfo {
+	idx_t output_col_idx = DConstants::INVALID_INDEX;
+	string full_path;
+	vector<string> nested_fields;
+
+	bool IsValid() const {
+		return output_col_idx != DConstants::INVALID_INDEX;
+	}
+};
+
+// Extract column path from an expression for filter pushdown.
+// Handles direct column references and struct_extract chains for nested object fields.
+//
+// Examples:
+// - BOUND_COLUMN_REF(col=2) -> {2, "name", []}
+// - struct_extract(col, 'name') -> {col_idx, "employee.name", ["name"]}
+// - struct_extract(struct_extract(col, 'address'), 'city') -> {col_idx, "employee.address.city", ["address", "city"]}
+static ColumnPathInfo ExtractColumnPath(const Expression &expr, const ElasticsearchQueryBindData &bind_data,
+                                        const vector<ColumnIndex> &column_ids) {
+	ColumnPathInfo result;
+
+	// Direct column reference.
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
+		idx_t output_col_idx = col_ref.binding.column_index;
+
+		if (output_col_idx >= column_ids.size()) {
+			return result;
+		}
+
+		const ColumnIndex &col_index = column_ids[output_col_idx];
+		idx_t bind_col_id = col_index.GetPrimaryIndex();
+
+		// _id column has bind_col_id == 0
+		if (bind_col_id == 0) {
+			result.output_col_idx = output_col_idx;
+			result.full_path = "_id";
+			return result;
+		}
+
+		if (bind_col_id > bind_data.all_column_names.size()) {
+			return result;
+		}
+
+		result.output_col_idx = output_col_idx;
+		result.full_path = bind_data.all_column_names[bind_col_id - 1];
+		return result;
+	}
+
+	// struct_extract function for nested fields (e.g. employee.name, employee.address.city)
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &func_expr = expr.Cast<BoundFunctionExpression>();
+
+		if (func_expr.function.name != "struct_extract" || func_expr.children.size() != 2) {
+			return result;
+		}
+
+		if (func_expr.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return result;
+		}
+
+		auto &field_name_expr = func_expr.children[1]->Cast<BoundConstantExpression>();
+		if (field_name_expr.value.type().id() != LogicalTypeId::VARCHAR) {
+			return result;
+		}
+
+		string field_name = StringValue::Get(field_name_expr.value);
+
+		// Recursively get the parent path.
+		ColumnPathInfo parent_result = ExtractColumnPath(*func_expr.children[0], bind_data, column_ids);
+		if (!parent_result.IsValid()) {
+			return result;
+		}
+
+		result.output_col_idx = parent_result.output_col_idx;
+		result.full_path = parent_result.full_path + "." + field_name;
+		result.nested_fields = std::move(parent_result.nested_fields);
+		result.nested_fields.push_back(field_name);
+		return result;
+	}
+
+	return result;
+}
+
+// Wrap a filter in StructFilter for each nesting level.
+// For nested_fields = ["address", "city"] wraps as StructFilter("address", StructFilter("city", inner_filter)).
+static unique_ptr<TableFilter> WrapInStructFilters(unique_ptr<TableFilter> inner_filter,
+                                                   const vector<string> &nested_fields) {
+	unique_ptr<TableFilter> result = std::move(inner_filter);
+	for (auto it = nested_fields.rbegin(); it != nested_fields.rend(); ++it) {
+		result = make_uniq<StructFilter>(0, *it, std::move(result));
+	}
+	return result;
+}
+
+// Pushdown complex filter callback.
+// Extracts filters from expressions that DuckDB's FilterCombiner would not (or only partially)
+// push down. By handling them here, we can fully push them to Elasticsearch and avoid a redundant
+// FILTER node in the query plan.
 //
 // Handles:
 // - IS NULL / IS NOT NULL: FilterCombiner doesn't convert these to TableFilters
-// - IN expressions: FilterCombiner wraps non-dense IN filters in OptionalFilter (PUSHED_DOWN_PARTIALLY)
-// - LIKE expressions: FilterCombiner converts LIKE 'prefix%' to range filters (PUSHED_DOWN_PARTIALLY)
+// - IN expressions: FilterCombiner wraps non-dense IN filters in OptionalFilter (partial pushdown)
+// - LIKE/ILIKE expressions: FilterCombiner converts prefix patterns to range filters (partial pushdown)
 static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                                vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
@@ -738,69 +836,41 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 			continue;
 		}
 
-		// Handle BOUND_FUNCTION expressions (LIKE patterns and optimized string functions) first
-		// before checking BOUND_OPERATOR.
-		//
+		// Handle LIKE/ILIKE patterns and optimized string functions (prefix, suffix, contains).
 		// DuckDB's optimizer transforms LIKE patterns before filter pushdown:
-		// - LikeOptimizationRule transforms: LIKE 'prefix%' -> prefix(col, 'prefix')
-		//                                    LIKE '%suffix' -> suffix(col, 'suffix')
-		//                                    LIKE '%infix%' -> contains(col, 'infix')
-		// - FilterCombiner then converts prefix() to range filters (>= prefix AND < prefix+1)
-		//   and returns PUSHED_DOWN_PARTIALLY
-		//
-		// By intercepting prefix/suffix/contains here, we can use Elasticsearch's native
-		// prefix/wildcard queries which are more efficient than range filters.
+		// - LikeOptimizationRule: LIKE 'prefix%' -> prefix(), LIKE '%suffix' -> suffix() etc.
+		// - FilterCombiner: converts prefix() to range filters and returns PUSHED_DOWN_PARTIALLY
+		// By intercepting here, we can use Elasticsearch's native prefix/wildcard queries.
 		if (filter->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 			auto &func_expr = filter->Cast<BoundFunctionExpression>();
 			const auto &func_name = func_expr.function.name;
 
-			// Handle LIKE (~~) and ILIKE (~~*) operators.
-			// Also handle like_escape and ilike_escape variants.
-			// Also handle optimized string functions: prefix, suffix, contains.
 			if (func_name == "~~" || func_name == "like_escape" || func_name == "~~*" || func_name == "ilike_escape" ||
 			    func_name == "prefix" || func_name == "suffix" || func_name == "contains") {
-				// These functions have 2 children: column reference and pattern/value.
 				if (func_expr.children.size() < 2) {
 					continue;
 				}
 
-				// First child must be a column reference.
-				if (func_expr.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-					continue;
-				}
-
-				// Second child must be a constant string pattern.
 				if (func_expr.children[1]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 					continue;
 				}
 
-				auto &col_ref = func_expr.children[0]->Cast<BoundColumnRefExpression>();
 				auto &pattern_expr = func_expr.children[1]->Cast<BoundConstantExpression>();
-
 				if (pattern_expr.value.type().id() != LogicalTypeId::VARCHAR) {
 					continue;
 				}
 
-				idx_t output_col_idx = col_ref.binding.column_index;
-				if (output_col_idx >= column_ids.size()) {
+				ColumnPathInfo col_path_info = ExtractColumnPath(*func_expr.children[0], bind_data, column_ids);
+				if (!col_path_info.IsValid()) {
 					continue;
 				}
 
-				const ColumnIndex &col_index = column_ids[output_col_idx];
-				idx_t bind_col_id = col_index.GetPrimaryIndex();
-
-				// Get the column name to check if it's a text field.
-				// Skip _id column (bind_col_id == 0) and _unmapped_ column.
-				if (bind_col_id == 0 || bind_col_id > bind_data.all_column_names.size()) {
-					continue;
-				}
-				const string &col_name = bind_data.all_column_names[bind_col_id - 1];
+				const string &col_name = col_path_info.full_path;
+				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
 				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
 				bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
 
-				// For text fields without .keyword subfield, throw error because text fields are
-				// analyzed (tokenized, lowercased) and don't support pattern matching correctly.
-				// For text fields with .keyword subfield or non-text fields, all patterns are supported.
+				// Text fields without .keyword subfield don't support pattern matching correctly.
 				if (is_text_field && !has_keyword_subfield) {
 					throw InvalidInputException(
 					    "Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
@@ -809,102 +879,76 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					    col_name);
 				}
 
-				// Create an ExpressionFilter wrapping the function expression.
-				// The filter translation code in elasticsearch_filter_pushdown.cpp will
-				// convert this to the appropriate Elasticsearch query (prefix, wildcard, etc.)
-				auto expr_filter = make_uniq<ExpressionFilter>(filter->Copy());
-				get.table_filters.PushFilter(col_index, std::move(expr_filter));
+				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(filter->Copy());
+				if (!col_path_info.nested_fields.empty()) {
+					expr_filter = WrapInStructFilters(std::move(expr_filter), col_path_info.nested_fields);
+				}
 
+				get.table_filters.PushFilter(col_index, std::move(expr_filter));
 				filters[i] = nullptr;
 				continue;
 			}
 		}
 
-		// Handle BOUND_OPERATOR expressions (IS NULL, IS NOT NULL, IN).
+		// Handle IS NULL, IS NOT NULL and IN expressions.
 		if (filter->GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
 			auto &op_expr = filter->Cast<BoundOperatorExpression>();
 			auto expr_type = op_expr.GetExpressionType();
 
-			// Handle IS NULL / IS NOT NULL.
+			// IS NULL / IS NOT NULL
 			if (expr_type == ExpressionType::OPERATOR_IS_NULL || expr_type == ExpressionType::OPERATOR_IS_NOT_NULL) {
 				if (op_expr.children.size() != 1) {
 					continue;
 				}
 
-				auto &child = op_expr.children[0];
-				if (child->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				ColumnPathInfo col_path_info = ExtractColumnPath(*op_expr.children[0], bind_data, column_ids);
+				if (!col_path_info.IsValid()) {
 					continue;
 				}
 
-				auto &col_ref = child->Cast<BoundColumnRefExpression>();
-				idx_t output_col_idx = col_ref.binding.column_index;
+				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
 
-				if (output_col_idx >= column_ids.size()) {
-					continue;
-				}
-
-				const ColumnIndex &col_index = column_ids[output_col_idx];
-				idx_t bind_col_id = col_index.GetPrimaryIndex();
-
-				// Skip _id column (bind_col_id == 0) and _unmapped_ column.
-				if (bind_col_id == 0 || bind_col_id > bind_data.all_column_names.size()) {
-					continue;
-				}
-
+				unique_ptr<TableFilter> null_filter;
 				if (expr_type == ExpressionType::OPERATOR_IS_NULL) {
-					get.table_filters.PushFilter(col_index, make_uniq<IsNullFilter>());
+					null_filter = make_uniq<IsNullFilter>();
 				} else {
-					get.table_filters.PushFilter(col_index, make_uniq<IsNotNullFilter>());
+					null_filter = make_uniq<IsNotNullFilter>();
 				}
 
+				if (!col_path_info.nested_fields.empty()) {
+					null_filter = WrapInStructFilters(std::move(null_filter), col_path_info.nested_fields);
+				}
+
+				get.table_filters.PushFilter(col_index, std::move(null_filter));
 				filters[i] = nullptr;
 				continue;
 			}
 
-			// Handle IN expressions (col IN (val1, val2, ...)).
-			// DuckDB's FilterCombiner wraps non-dense IN filters in OptionalFilter and returns
-			// PUSHED_DOWN_PARTIALLY, which keeps a FILTER node. By handling IN here, we can
-			// fully push it down to Elasticsearch and remove the redundant filter.
-			//
-			// For text fields without .keyword subfield, we can't push IN filters because
-			// terms queries don't work correctly on analyzed text. Let DuckDB handle the filtering.
+			// IN expressions
 			if (expr_type == ExpressionType::COMPARE_IN) {
 				if (op_expr.children.size() < 2) {
 					continue;
 				}
 
-				// First child must be a column reference.
-				if (op_expr.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				ColumnPathInfo col_path_info = ExtractColumnPath(*op_expr.children[0], bind_data, column_ids);
+				if (!col_path_info.IsValid()) {
 					continue;
 				}
 
-				auto &col_ref = op_expr.children[0]->Cast<BoundColumnRefExpression>();
-				idx_t output_col_idx = col_ref.binding.column_index;
+				const string &col_name = col_path_info.full_path;
+				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
 
-				if (output_col_idx >= column_ids.size()) {
-					continue;
+				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
+				bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
+				if (is_text_field && !has_keyword_subfield) {
+					throw InvalidInputException(
+					    "Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
+					    "  - Add a .keyword subfield to the Elasticsearch mapping\n"
+					    "  - Use the 'query' parameter with native Elasticsearch text queries",
+					    col_name);
 				}
 
-				const ColumnIndex &col_index = column_ids[output_col_idx];
-				idx_t bind_col_id = col_index.GetPrimaryIndex();
-
-				// Throw error for text fields without .keyword subfield.
-				// Note: _id column (bind_col_id == 0) and _unmapped_ column are not text fields,
-				// so IN filters can be pushed for them.
-				if (bind_col_id > 0 && bind_col_id <= bind_data.all_column_names.size()) {
-					const string &col_name = bind_data.all_column_names[bind_col_id - 1];
-					bool is_text_field = bind_data.text_fields.count(col_name) > 0;
-					bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
-					if (is_text_field && !has_keyword_subfield) {
-						throw InvalidInputException(
-						    "Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
-						    "  - Add a .keyword subfield to the Elasticsearch mapping\n"
-						    "  - Use the 'query' parameter with native Elasticsearch text queries",
-						    col_name);
-					}
-				}
-
-				// Remaining children must all be constants (no NULLs).
+				// All IN values must be non-null constants.
 				vector<Value> in_values;
 				bool all_constants = true;
 				for (idx_t j = 1; j < op_expr.children.size(); j++) {
@@ -924,17 +968,19 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				// Create and push the InFilter.
-				auto in_filter = make_uniq<InFilter>(std::move(in_values));
-				get.table_filters.PushFilter(col_index, std::move(in_filter));
+				unique_ptr<TableFilter> in_filter = make_uniq<InFilter>(std::move(in_values));
+				if (!col_path_info.nested_fields.empty()) {
+					in_filter = WrapInStructFilters(std::move(in_filter), col_path_info.nested_fields);
+				}
 
+				get.table_filters.PushFilter(col_index, std::move(in_filter));
 				filters[i] = nullptr;
 				continue;
 			}
 		}
 	}
 
-	// Remove null entries from filters vector.
+	// Remove processed filters.
 	filters.erase(
 	    std::remove_if(filters.begin(), filters.end(), [](const unique_ptr<Expression> &e) { return e == nullptr; }),
 	    filters.end());
