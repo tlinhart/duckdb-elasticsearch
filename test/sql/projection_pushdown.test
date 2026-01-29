@@ -1,0 +1,450 @@
+# name: test/sql/projection_pushdown.test
+# description: Test projection pushdown and filter pruning
+# group: [sql]
+
+# This test file verifies that column projections are pushed down to Elasticsearch.
+# Projection pushdown reduces data transfer by only fetching needed fields from _source.
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test single column projection: only 'name' should be projected.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test multiple column projection: '_id', 'name' and 'amount' should be projected.
+query II
+EXPLAIN SELECT _id, name, amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*_id.*name.*amount.*
+
+# Test projection with _id only: only '_id' should be projected.
+query II
+EXPLAIN SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: _id.*
+
+# Test projection with all columns.
+query II
+EXPLAIN SELECT * FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*
+
+# Test filter on column not in SELECT: only 'name' should be projected, not 'amount'.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*amount>50.*
+
+# Test filter on multiple columns not in SELECT: only '_id' should be projected.
+query II
+EXPLAIN SELECT _id FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 50 AND deprecated = true;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: _id.*Filters:.*amount>50.*deprecated=true.*
+
+# Test filter column also in SELECT: both 'name' and 'amount' should be projected.
+query II
+EXPLAIN SELECT name, amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*amount.*name.*Filters:.*amount>50.*
+
+# Test filter on nested struct field not in SELECT: only 'name' should be projected.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE employee.salary > 80000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*employee\.salary>80000.*
+
+# Test aggregation with single column: only 'amount' should be projected.
+query II
+EXPLAIN SELECT sum(amount) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: amount.*
+
+# Test aggregation with multiple columns: only 'amount' and 'price' should be projected.
+query II
+EXPLAIN SELECT avg(amount), avg(price) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*amount.*price.*
+
+# Test count(*): minimal projection.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*
+
+# Test count(column): only 'name' should be projected.
+query II
+EXPLAIN SELECT count(name) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test min/max aggregation: only 'amount' should be projected.
+query II
+EXPLAIN SELECT min(amount), max(amount) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: amount.*
+
+# Test GROUP BY single column: only 'deprecated' should be projected.
+query II
+EXPLAIN SELECT deprecated, count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+GROUP BY deprecated;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*deprecated.*
+
+# Test GROUP BY with aggregate on different column: 'deprecated' and 'amount' should be projected.
+query II
+EXPLAIN SELECT deprecated, sum(amount) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+GROUP BY deprecated;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*deprecated.*amount.*
+
+# Test GROUP BY multiple columns: 'deprecated' and 'name' should be projected.
+query II
+EXPLAIN SELECT deprecated, name, count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+GROUP BY deprecated, name;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*deprecated.*name.*
+
+# Test GROUP BY with HAVING: 'deprecated' and 'amount' should be projected.
+query II
+EXPLAIN SELECT deprecated, sum(amount) AS total FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+GROUP BY deprecated
+HAVING sum(amount) > 100;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*deprecated.*amount.*
+
+# Test simple subquery projection: only 'name' should be projected, not 'amount'.
+query II
+EXPLAIN SELECT name FROM (
+    SELECT name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test subquery with filter in outer query: 'name' and 'amount' should be projected.
+query II
+EXPLAIN SELECT name FROM (
+    SELECT name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+)
+WHERE amount > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*name.*amount.*
+
+# Test subquery with filter in inner query: only 'name' should be projected, not 'amount'.
+query II
+EXPLAIN SELECT name FROM (
+    SELECT name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    WHERE amount > 50
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*amount>50.*
+
+# Test nested subquery: only 'name' should be projected, not 'amount'.
+query II
+EXPLAIN SELECT name FROM (
+    SELECT name FROM (
+        SELECT name, amount FROM elasticsearch_query(
+            host := 'localhost',
+            index := 'test',
+            username := 'elastic',
+            password := 'test'
+        )
+    )
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test ORDER BY same column as SELECT: only 'name' should be projected.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+ORDER BY name;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test ORDER BY different column than SELECT: 'name' and 'amount' should be projected.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+ORDER BY amount;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*name.*amount.*
+
+# Test DISTINCT on single column: only 'name' should be projected.
+query II
+EXPLAIN SELECT DISTINCT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test DISTINCT on multiple columns: 'deprecated' and 'name' should be projected.
+query II
+EXPLAIN SELECT DISTINCT deprecated, name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*deprecated.*name.*
+
+# Test projection with single nested field: only 'employee.name' should be projected.
+query II
+EXPLAIN SELECT employee.name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*employee\.name.*
+
+# Test projection with multiple nested fields from same struct.
+query II
+EXPLAIN SELECT employee.name, employee.salary FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*employee\.name.*employee\.salary.*
+
+# Test projection with deeply nested field: only 'employee.address.city' should be projected.
+query II
+EXPLAIN SELECT employee.address.city FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*employee\.address\.city.*
+
+# Test projection with mix of top-level and nested fields.
+query II
+EXPLAIN SELECT name, employee.salary FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*name.*employee\.salary.*
+
+# Test UNION of two projections: each query should project only 'name'.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE amount > 50
+UNION
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated = true;
+----
+physical_plan	<REGEX>:.*UNION.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test projection with arithmetic expression: only 'amount' should be projected.
+query II
+EXPLAIN SELECT amount * 2 AS double_amount FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: amount.*
+
+# Test projection with CASE expression: only 'amount' should be projected.
+query II
+EXPLAIN SELECT CASE WHEN amount > 50 THEN 'high' ELSE 'low' END AS level FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: amount.*
+
+# Test projection with function on column: only 'name' should be projected.
+query II
+EXPLAIN SELECT upper(name) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test simple CTE projection: only 'name' should be projected, not 'amount'.
+query II
+EXPLAIN WITH data AS (
+    SELECT name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+)
+SELECT name FROM data;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*
+
+# Test CTE with filter: only 'name' should be projected, not 'amount'.
+query II
+EXPLAIN WITH data AS (
+    SELECT name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    WHERE amount > 50
+)
+SELECT name FROM data;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*amount>50.*
+
+# Test self-join via CTE.
+query II
+EXPLAIN WITH data AS (
+    SELECT _id, name, amount FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+)
+SELECT a.name, b.amount
+FROM data a
+JOIN data b ON a._id = b._id;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*
