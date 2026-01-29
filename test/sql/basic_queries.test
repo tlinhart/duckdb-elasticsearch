@@ -172,3 +172,74 @@ SELECT min(amount), max(amount) FROM elasticsearch_query(
 );
 ----
 8	91
+
+# Test accessing struct field.
+query I
+SELECT employee.salary FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+75000.0
+
+# Test filtering on struct field.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE employee.salary > 100000;
+----
+2
+
+# Test aggregation on struct field.
+query I
+SELECT avg(employee.salary) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+75450.0
+
+# Test array length function.
+query I
+SELECT length(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '3';
+----
+3
+
+# Test list_contains on array.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE list_contains(colors, 'red');
+----
+6
+
+# Test accessing first element of nested array.
+query I
+SELECT users[1].email FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+alice@example.com
