@@ -19,6 +19,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
@@ -825,6 +826,7 @@ static unique_ptr<TableFilter> WrapInStructFilters(unique_ptr<TableFilter> inner
 // - IS NULL / IS NOT NULL: FilterCombiner doesn't convert these to TableFilters
 // - IN expressions: FilterCombiner wraps non-dense IN filters in OptionalFilter (partial pushdown)
 // - LIKE/ILIKE expressions: FilterCombiner converts prefix patterns to range filters (partial pushdown)
+// - Comparison expressions: Validates text fields have .keyword subfield (errors thrown at plan time)
 static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                                vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
@@ -833,6 +835,36 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
 		if (!filter) {
+			continue;
+		}
+
+		// Validate comparison expressions on text fields.
+		// DuckDB's FilterCombiner will convert these to ConstantFilter and push them down
+		// but TranslateConstantComparison() will throw an error at execution time.
+		// By validating here we fail early (even during EXPLAIN).
+		if (filter->GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+			auto &comp_expr = filter->Cast<BoundComparisonExpression>();
+
+			// Try to extract column path from left side, then right side.
+			ColumnPathInfo col_path_info = ExtractColumnPath(*comp_expr.left, bind_data, column_ids);
+			if (!col_path_info.IsValid()) {
+				col_path_info = ExtractColumnPath(*comp_expr.right, bind_data, column_ids);
+			}
+
+			if (col_path_info.IsValid()) {
+				const string &col_name = col_path_info.full_path;
+				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
+				bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
+
+				if (is_text_field && !has_keyword_subfield) {
+					throw InvalidInputException(
+					    "Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
+					    "  - Add a .keyword subfield to the Elasticsearch mapping\n"
+					    "  - Use the 'query' parameter with native Elasticsearch text queries",
+					    col_name);
+				}
+			}
+			// Don't consume the filter, let FilterCombiner handle it normally.
 			continue;
 		}
 
