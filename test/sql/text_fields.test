@@ -1,0 +1,325 @@
+# name: test/sql/text_fields.test
+# description: Functional tests for text fields with and without .keyword subfield
+# group: [sql]
+
+# This test file verifies the correctness of query results when filtering on text fields.
+# It tests the actual behavior (correct row counts) rather than query plans.
+# For pushdown verification (EXPLAIN tests) see filter_pushdown.test.
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test equality on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name = 'Alice Johnson';
+----
+1
+
+# Test inequality on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name != 'Alice Johnson';
+----
+9
+
+# Test range comparison on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name >= 'M';
+----
+4
+
+# Test IN clause on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name IN ('Alice Johnson', 'Emma Wilson', 'Non Existent');
+----
+2
+
+# Test LIKE prefix on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name LIKE 'Alice%';
+----
+1
+
+# Test LIKE suffix on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name LIKE '%son';
+----
+4
+
+# Test LIKE contains on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name LIKE '%a%';
+----
+9
+
+# Test LIKE prefix with lowercase (case-sensitive, should not match 'Alice').
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name LIKE 'a%';
+----
+0
+
+# Test ILIKE prefix (case-insensitive).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name ILIKE 'alice%';
+----
+1
+
+# Test ILIKE suffix (case-insensitive).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name ILIKE '%SON';
+----
+4
+
+# Test ILIKE contains (case-insensitive).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name ILIKE '%A%';
+----
+10
+
+# Test IS NOT NULL on text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE name IS NOT NULL;
+----
+10
+
+# Test equality on nested struct text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE employee.name = 'Robert Chen';
+----
+1
+
+# Test LIKE prefix on nested struct text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE employee.name LIKE 'Robert%';
+----
+1
+
+# Test range comparison on nested struct text field with .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE employee.name >= 'R';
+----
+3
+
+# Test IS NOT NULL on text field without .keyword subfield (pushed as exists query).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description IS NOT NULL;
+----
+10
+
+# Test IS NULL on text field without .keyword subfield (pushed as exists query).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description IS NULL;
+----
+0
+
+# Test term query on missing .keyword subfield for nested array text field.
+# The users.name.keyword field doesn't exist in the mapping so no documents match.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"term": {"users.name.keyword": "Alice Smith"}}'
+);
+----
+0
+
+# Test nested query on keyword field for comparison.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"nested": {"path": "users", "query": {"term": {"users.email": "alice@example.com"}}}}'
+);
+----
+1
+
+# Test LIKE prefix on array element.
+# Elasticsearch treats arrays as flat lists so specific index filtering is done by DuckDB.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE colors[1] LIKE 'red%';
+----
+5
+
+# Test LIKE suffix on array element.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE colors[1] LIKE '%ue';
+----
+2
+
+# Test LIKE contains on array element.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE colors[1] LIKE '%ee%';
+----
+3
+
+# Test ILIKE prefix on array element (case-insensitive).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE colors[1] ILIKE 'RED%';
+----
+5
+
+# Test match query for full-text search on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match": {"description": "wireless"}}'
+);
+----
+1
+
+# Test match_phrase query for phrase search on text field.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match_phrase": {"description": "noise cancellation"}}'
+);
+----
+1
+
+# Test match_phrase_prefix query for prefix phrase search on text field.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"match_phrase_prefix": {"description": "premium wire"}}'
+);
+----
+1
