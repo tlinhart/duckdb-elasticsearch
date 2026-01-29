@@ -29,6 +29,22 @@
               "keyword": { "type": "keyword" }
             }
           },
+          "address": {
+            "properties": {
+              "city": {
+                "type": "text",
+                "fields": {
+                  "keyword": { "type": "keyword" }
+                }
+              },
+              "street": {
+                "type": "text",
+                "fields": {
+                  "keyword": { "type": "keyword" }
+                }
+              }
+            }
+          },
           "salary": { "type": "double" }
         }
       },
