@@ -20,6 +20,8 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
@@ -806,6 +808,213 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 	return result;
 }
 
+// Information about a geospatial column reference found inside ST_GeomFromGeoJSON(column_ref).
+struct GeoColumnInfo {
+	ColumnPathInfo col_path;
+	// Which child index (0 or 1) of the outer spatial function contains the geo column.
+	idx_t arg_index;
+
+	bool IsValid() const {
+		return col_path.IsValid();
+	}
+};
+
+// Try to extract a geo column path from a spatial function argument.
+// Recognizes ST_GeomFromGeoJSON(column_ref) or ST_GeomFromGeoJSON(struct_extract(column_ref, ...)).
+// Returns a valid GeoColumnInfo if found, with the column path and arg_index set.
+static GeoColumnInfo ExtractGeoColumnFromArg(const Expression &expr, const ElasticsearchQueryBindData &bind_data,
+                                             const vector<ColumnIndex> &column_ids, idx_t arg_index) {
+	GeoColumnInfo result;
+	result.arg_index = arg_index;
+
+	// Must be a function expression: ST_GeomFromGeoJSON(...)
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return result;
+	}
+
+	auto &func_expr = expr.Cast<BoundFunctionExpression>();
+	if (StringUtil::Lower(func_expr.function.name) != "st_geomfromgeojson" || func_expr.children.size() < 1) {
+		return result;
+	}
+
+	// The first child should be a column reference (direct or via struct_extract).
+	ColumnPathInfo col_path = ExtractColumnPath(*func_expr.children[0], bind_data, column_ids);
+	if (!col_path.IsValid()) {
+		return result;
+	}
+
+	// Verify the column is a geo_point or geo_shape field.
+	const string &col_name = col_path.full_path;
+	auto it = bind_data.es_type_map.find(col_name);
+	if (it == bind_data.es_type_map.end()) {
+		return result;
+	}
+	if (it->second != "geo_point" && it->second != "geo_shape") {
+		return result;
+	}
+
+	result.col_path = std::move(col_path);
+	return result;
+}
+
+// Try to convert a GEOMETRY value to WKT string using ClientContext.
+// Returns the WKT string on success, empty string on failure.
+static string GeometryValueToWKT(ClientContext &context, const Value &geometry_val) {
+	Value varchar_val;
+	string error_message;
+	bool success = geometry_val.TryCastAs(context, LogicalType::VARCHAR, varchar_val, &error_message, true);
+	if (!success || varchar_val.IsNull()) {
+		return "";
+	}
+	return StringValue::Get(varchar_val);
+}
+
+// Try to extract constant GeoJSON from a spatial expression.
+// Recognizes:
+// - ST_Point(lon, lat) -> {"type":"Point","coordinates":[lon,lat]}
+// - ST_MakeEnvelope(xmin, ymin, xmax, ymax) -> special "envelope" marker
+// - ST_GeomFromGeoJSON('{"type":...}') -> pass through the GeoJSON string
+// - BoundConstantExpression with GEOMETRY type -> convert via WKT to GeoJSON
+//
+// Note: After DuckDB's constant folding, function calls like ST_Point(-74, 40.7)
+// are already evaluated to a GEOMETRY blob constant. The ClientContext is needed
+// to cast GEOMETRY values to VARCHAR (WKT) using the spatial extension's cast function.
+//
+// Returns the GeoJSON string on success, empty string on failure.
+// For ST_MakeEnvelope, sets is_envelope=true and fills bbox coordinates.
+struct ConstantGeoInfo {
+	string geojson;
+	bool is_envelope = false;
+	double xmin = 0, ymin = 0, xmax = 0, ymax = 0;
+
+	bool IsValid() const {
+		return !geojson.empty() || is_envelope;
+	}
+};
+
+static ConstantGeoInfo ExtractConstantGeo(const Expression &expr, ClientContext &context) {
+	ConstantGeoInfo result;
+
+	// Handle constant-folded GEOMETRY values.
+	// After DuckDB's optimizer constant-folds expressions like ST_Point(-74, 40.7),
+	// the result is a BoundConstantExpression with a GEOMETRY type (BLOB with alias "GEOMETRY").
+	// We convert it to WKT via ClientContext cast, then to GeoJSON.
+	// For axis-aligned rectangles (from ST_MakeEnvelope), we detect the envelope pattern
+	// and set is_envelope=true to enable the geo_bounding_box optimization.
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		auto &const_expr = expr.Cast<BoundConstantExpression>();
+		if (const_expr.value.IsNull()) {
+			return result;
+		}
+		const auto &val_type = const_expr.value.type();
+		if (val_type.HasAlias() && val_type.GetAlias() == "GEOMETRY") {
+			string wkt = GeometryValueToWKT(context, const_expr.value);
+			if (!wkt.empty()) {
+				// Check if this is an axis-aligned rectangle (envelope).
+				// ST_MakeEnvelope produces: POLYGON ((xmin ymin, xmin ymax, xmax ymax, xmax ymin, xmin ymin))
+				if (wkt.substr(0, 9) == "POLYGON (") {
+					string geojson = WKTToGeoJSON(wkt);
+					// Parse the GeoJSON to check for rectangle shape.
+					yyjson_doc *gdoc = yyjson_read(geojson.c_str(), geojson.size(), 0);
+					if (gdoc) {
+						yyjson_val *groot = yyjson_doc_get_root(gdoc);
+						yyjson_val *coords_arr = yyjson_obj_get(groot, "coordinates");
+						if (coords_arr && yyjson_is_arr(coords_arr) && yyjson_arr_size(coords_arr) == 1) {
+							yyjson_val *ring = yyjson_arr_get(coords_arr, 0);
+							if (ring && yyjson_is_arr(ring) && yyjson_arr_size(ring) == 5) {
+								// Extract corners to check for axis-aligned rectangle.
+								// 5 points = 4 corners + closing point (same as first).
+								double xs[5], ys[5];
+								bool valid = true;
+								for (int j = 0; j < 5; j++) {
+									yyjson_val *pt = yyjson_arr_get(ring, j);
+									if (!pt || !yyjson_is_arr(pt) || yyjson_arr_size(pt) < 2) {
+										valid = false;
+										break;
+									}
+									xs[j] = yyjson_get_num(yyjson_arr_get(pt, 0));
+									ys[j] = yyjson_get_num(yyjson_arr_get(pt, 1));
+								}
+								if (valid && xs[0] == xs[4] && ys[0] == ys[4]) {
+									// Find bounding box of the 4 corners.
+									double env_xmin = xs[0], env_xmax = xs[0];
+									double env_ymin = ys[0], env_ymax = ys[0];
+									for (int j = 1; j < 4; j++) {
+										env_xmin = std::min(env_xmin, xs[j]);
+										env_xmax = std::max(env_xmax, xs[j]);
+										env_ymin = std::min(env_ymin, ys[j]);
+										env_ymax = std::max(env_ymax, ys[j]);
+									}
+									// Check if all points lie on the bounding box edges (axis-aligned rectangle).
+									bool is_rect = true;
+									for (int j = 0; j < 4; j++) {
+										bool on_x_edge = (xs[j] == env_xmin || xs[j] == env_xmax);
+										bool on_y_edge = (ys[j] == env_ymin || ys[j] == env_ymax);
+										if (!on_x_edge || !on_y_edge) {
+											is_rect = false;
+											break;
+										}
+									}
+									if (is_rect) {
+										result.is_envelope = true;
+										result.xmin = env_xmin;
+										result.ymin = env_ymin;
+										result.xmax = env_xmax;
+										result.ymax = env_ymax;
+										yyjson_doc_free(gdoc);
+										return result;
+									}
+								}
+							}
+						}
+						yyjson_doc_free(gdoc);
+					}
+					result.geojson = std::move(geojson);
+				} else {
+					result.geojson = WKTToGeoJSON(wkt);
+				}
+			}
+			return result;
+		}
+		return result;
+	}
+
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return result;
+	}
+
+	auto &func_expr = expr.Cast<BoundFunctionExpression>();
+	string func_name = StringUtil::Lower(func_expr.function.name);
+
+	// ST_Point(x, y) -> GeoJSON Point
+	if (func_name == "st_point" && func_expr.children.size() == 2) {
+		double x, y;
+		if (ExtractConstantDouble(*func_expr.children[0], x) && ExtractConstantDouble(*func_expr.children[1], y)) {
+			result.geojson = "{\"type\":\"Point\",\"coordinates\":[" + to_string(x) + "," + to_string(y) + "]}";
+			return result;
+		}
+		return result;
+	}
+
+	// ST_MakeEnvelope(xmin, ymin, xmax, ymax) -> bounding box
+	if (ExtractEnvelopeCoordinates(expr, result.xmin, result.ymin, result.xmax, result.ymax)) {
+		result.is_envelope = true;
+		return result;
+	}
+
+	// ST_GeomFromGeoJSON('...') with a constant string argument
+	if (func_name == "st_geomfromgeojson" && func_expr.children.size() >= 1) {
+		string geojson_str;
+		if (ExtractConstantString(*func_expr.children[0], geojson_str)) {
+			result.geojson = std::move(geojson_str);
+			return result;
+		}
+		return result;
+	}
+
+	return result;
+}
+
 // Wrap a filter in StructFilter for each nesting level.
 // For nested_fields = ["address", "city"] wraps as StructFilter("address", StructFilter("city", inner_filter)).
 static unique_ptr<TableFilter> WrapInStructFilters(unique_ptr<TableFilter> inner_filter,
@@ -817,16 +1026,72 @@ static unique_ptr<TableFilter> WrapInStructFilters(unique_ptr<TableFilter> inner
 	return result;
 }
 
+// Try to push a simple comparison filter into table_filters.
+// This replicates the core logic of FilterCombiner::AddBoundComparisonFilter + TryPushdownConstantFilter.
+// We do this in pushdown_complex_filter because pushing any filter to table_filters causes the
+// DuckDB optimizer to skip the FilterCombiner path. By also handling comparisons here, all filter types
+// are pushed in a single pass.
+static bool TryPushComparisonFilter(ClientContext &context, const BoundComparisonExpression &comp_expr,
+                                    const ElasticsearchQueryBindData &bind_data, const vector<ColumnIndex> &column_ids,
+                                    LogicalGet &get) {
+	auto expr_type = comp_expr.GetExpressionType();
+	// Support: =, !=, >, >=, <, <=
+	if (expr_type != ExpressionType::COMPARE_EQUAL && expr_type != ExpressionType::COMPARE_NOTEQUAL &&
+	    expr_type != ExpressionType::COMPARE_GREATERTHAN && expr_type != ExpressionType::COMPARE_GREATERTHANOREQUALTO &&
+	    expr_type != ExpressionType::COMPARE_LESSTHAN && expr_type != ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+		return false;
+	}
+
+	// One side must be a column reference, the other a foldable scalar.
+	bool left_is_scalar = comp_expr.left->IsFoldable();
+	bool right_is_scalar = comp_expr.right->IsFoldable();
+	if (left_is_scalar == right_is_scalar) {
+		// Both scalars (constant expression, not a filter) or both column refs (join condition).
+		return false;
+	}
+
+	auto &col_expr = left_is_scalar ? *comp_expr.right : *comp_expr.left;
+	auto &scalar_expr = left_is_scalar ? *comp_expr.left : *comp_expr.right;
+
+	ColumnPathInfo col_path_info = ExtractColumnPath(col_expr, bind_data, column_ids);
+	if (!col_path_info.IsValid()) {
+		return false;
+	}
+
+	// Evaluate the scalar side to a constant value.
+	Value constant_value;
+	if (!ExpressionExecutor::TryEvaluateScalar(context, scalar_expr, constant_value)) {
+		return false;
+	}
+	if (constant_value.IsNull()) {
+		return false;
+	}
+
+	// If the scalar is on the left side, flip the comparison direction.
+	auto comparison_type = left_is_scalar ? FlipComparisonExpression(expr_type) : expr_type;
+
+	const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
+	unique_ptr<TableFilter> filter = make_uniq<ConstantFilter>(comparison_type, std::move(constant_value));
+	if (!col_path_info.nested_fields.empty()) {
+		filter = WrapInStructFilters(std::move(filter), col_path_info.nested_fields);
+	}
+
+	get.table_filters.PushFilter(col_index, std::move(filter));
+	return true;
+}
+
 // Pushdown complex filter callback.
-// Extracts filters from expressions that DuckDB's FilterCombiner would not (or only partially)
-// push down. By handling them here, we can fully push them to Elasticsearch and avoid a redundant
-// FILTER node in the query plan.
+// Processes all filter expressions in a single pass:
+// - Comparison filters -> ConstantFilter
+// - IS NULL / IS NOT NULL -> IsNullFilter / IsNotNullFilter
+// - IN expressions -> InFilter
+// - LIKE/ILIKE patterns, prefix/suffix/contains -> ExpressionFilter
+// - Geospatial functions (ST_Within etc.) -> ExpressionFilter (with GEOMETRY -> GeoJSON conversion)
 //
-// Handles:
-// - IS NULL / IS NOT NULL: FilterCombiner doesn't convert these to TableFilters
-// - IN expressions: FilterCombiner wraps non-dense IN filters in OptionalFilter (partial pushdown)
-// - LIKE/ILIKE expressions: FilterCombiner converts prefix patterns to range filters (partial pushdown)
-// - Comparison expressions: Validates text fields have .keyword subfield (errors thrown at plan time)
+// All recognized filters are pushed into get.table_filters and consumed from the filters vector.
+// This approach handles everything in one pass, avoiding the issue where pushing to table_filters
+// in pushdown_complex_filter causes DuckDB's optimizer to skip the FilterCombiner path,
+// which would prevent standard comparison filters from being pushed down.
 static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                                vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
@@ -838,14 +1103,11 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 			continue;
 		}
 
-		// Validate comparison expressions on text fields.
-		// DuckDB's FilterCombiner will convert these to ConstantFilter and push them down
-		// but TranslateConstantComparison() will throw an error at execution time.
-		// By validating here we fail early (even during EXPLAIN).
+		// Handle comparison expressions.
 		if (filter->GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
 			auto &comp_expr = filter->Cast<BoundComparisonExpression>();
 
-			// Try to extract column path from left side, then right side.
+			// Validate comparison expressions on text fields. By validating here we fail early (even during EXPLAIN).
 			ColumnPathInfo col_path_info = ExtractColumnPath(*comp_expr.left, bind_data, column_ids);
 			if (!col_path_info.IsValid()) {
 				col_path_info = ExtractColumnPath(*comp_expr.right, bind_data, column_ids);
@@ -864,19 +1126,24 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					    col_name);
 				}
 			}
-			// Don't consume the filter, let FilterCombiner handle it normally.
+
+			// Push comparison as ConstantFilter.
+			if (TryPushComparisonFilter(context, comp_expr, bind_data, column_ids, get)) {
+				filters[i] = nullptr;
+			}
 			continue;
 		}
 
-		// Handle LIKE/ILIKE patterns and optimized string functions (prefix, suffix, contains).
-		// DuckDB's optimizer transforms LIKE patterns before filter pushdown:
-		// - LikeOptimizationRule: LIKE 'prefix%' -> prefix(), LIKE '%suffix' -> suffix() etc.
-		// - FilterCombiner: converts prefix() to range filters and returns PUSHED_DOWN_PARTIALLY
-		// By intercepting here, we can use Elasticsearch's native prefix/wildcard queries.
+		// Handle LIKE/ILIKE patterns, string functions and geospatial functions.
 		if (filter->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 			auto &func_expr = filter->Cast<BoundFunctionExpression>();
 			const auto &func_name = func_expr.function.name;
 
+			// Handle LIKE/ILIKE patterns and optimized string functions (prefix, suffix, contains).
+			// DuckDB's optimizer transforms LIKE patterns before filter pushdown:
+			// - LikeOptimizationRule: LIKE 'prefix%' -> prefix(), LIKE '%suffix' -> suffix() etc.
+			// - FilterCombiner: converts prefix() to range filters and returns PUSHED_DOWN_PARTIALLY
+			// By intercepting here, we can use Elasticsearch's native prefix/wildcard queries.
 			if (func_name == "~~" || func_name == "like_escape" || func_name == "~~*" || func_name == "ilike_escape" ||
 			    func_name == "prefix" || func_name == "suffix" || func_name == "contains") {
 				if (func_expr.children.size() < 2) {
@@ -914,6 +1181,58 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(filter->Copy());
 				if (!col_path_info.nested_fields.empty()) {
 					expr_filter = WrapInStructFilters(std::move(expr_filter), col_path_info.nested_fields);
+				}
+
+				get.table_filters.PushFilter(col_index, std::move(expr_filter));
+				filters[i] = nullptr;
+				continue;
+			}
+
+			// Handle geospatial functions from the spatial extension.
+			string func_name_lower = StringUtil::Lower(func_name);
+			if (func_name_lower == "st_within" || func_name_lower == "st_intersects" ||
+			    func_name_lower == "st_contains" || func_name_lower == "st_disjoint") {
+
+				if (func_expr.children.size() < 2) {
+					continue;
+				}
+
+				// Try to find the geo column in either argument position.
+				GeoColumnInfo geo_col = ExtractGeoColumnFromArg(*func_expr.children[0], bind_data, column_ids, 0);
+				if (!geo_col.IsValid()) {
+					geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data, column_ids, 1);
+				}
+				if (!geo_col.IsValid()) {
+					continue;
+				}
+
+				// The other argument must be a constant geometry expression.
+				idx_t const_arg_idx = (geo_col.arg_index == 0) ? 1 : 0;
+				ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx], context);
+				if (!const_geo.IsValid()) {
+					continue;
+				}
+
+				// Build a modified expression copy where the constant GEOMETRY argument
+				// is replaced with a VARCHAR GeoJSON string.
+				auto modified_expr = filter->Copy();
+				auto &mod_func = modified_expr->Cast<BoundFunctionExpression>();
+
+				if (const_geo.geojson.empty() && const_geo.is_envelope) {
+					string envelope_geojson = "{\"type\":\"envelope\",\"coordinates\":[[" + to_string(const_geo.xmin) +
+					                          "," + to_string(const_geo.ymax) + "],[" + to_string(const_geo.xmax) +
+					                          "," + to_string(const_geo.ymin) + "]]}";
+					mod_func.children[const_arg_idx] =
+					    make_uniq<BoundConstantExpression>(Value(std::move(envelope_geojson)));
+				} else if (!const_geo.geojson.empty()) {
+					mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
+				}
+
+				const ColumnIndex &col_index = column_ids[geo_col.col_path.output_col_idx];
+
+				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
+				if (!geo_col.col_path.nested_fields.empty()) {
+					expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
 				}
 
 				get.table_filters.PushFilter(col_index, std::move(expr_filter));

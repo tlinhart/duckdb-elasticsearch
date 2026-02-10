@@ -1,7 +1,10 @@
 #include "elasticsearch_common.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -1534,6 +1537,139 @@ yyjson_mut_val *DuckDBValueToJSON(yyjson_mut_doc *doc, const Value &value) {
 		// For other types, convert to string.
 		return yyjson_mut_strcpy(doc, value.ToString().c_str());
 	}
+}
+
+bool ExtractConstantDouble(const Expression &expr, double &value) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &const_expr = expr.Cast<BoundConstantExpression>();
+	if (const_expr.value.IsNull()) {
+		return false;
+	}
+	auto type_id = const_expr.value.type().id();
+	if (type_id == LogicalTypeId::DOUBLE) {
+		value = DoubleValue::Get(const_expr.value);
+		return true;
+	}
+	if (type_id == LogicalTypeId::FLOAT) {
+		value = static_cast<double>(FloatValue::Get(const_expr.value));
+		return true;
+	}
+	if (type_id == LogicalTypeId::INTEGER) {
+		value = static_cast<double>(IntegerValue::Get(const_expr.value));
+		return true;
+	}
+	if (type_id == LogicalTypeId::BIGINT) {
+		value = static_cast<double>(BigIntValue::Get(const_expr.value));
+		return true;
+	}
+	if (type_id == LogicalTypeId::SMALLINT) {
+		value = static_cast<double>(SmallIntValue::Get(const_expr.value));
+		return true;
+	}
+	if (type_id == LogicalTypeId::TINYINT) {
+		value = static_cast<double>(TinyIntValue::Get(const_expr.value));
+		return true;
+	}
+	if (type_id == LogicalTypeId::HUGEINT) {
+		value = Hugeint::Cast<double>(HugeIntValue::Get(const_expr.value));
+		return true;
+	}
+	return false;
+}
+
+bool ExtractConstantString(const Expression &expr, std::string &value) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &const_expr = expr.Cast<BoundConstantExpression>();
+	if (const_expr.value.IsNull()) {
+		return false;
+	}
+	if (const_expr.value.type().id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	value = StringValue::Get(const_expr.value);
+	return true;
+}
+
+bool ExtractEnvelopeCoordinates(const Expression &expr, double &xmin, double &ymin, double &xmax, double &ymax) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+
+	auto &func_expr = expr.Cast<BoundFunctionExpression>();
+	if (StringUtil::Lower(func_expr.function.name) != "st_makeenvelope" || func_expr.children.size() != 4) {
+		return false;
+	}
+
+	return ExtractConstantDouble(*func_expr.children[0], xmin) && ExtractConstantDouble(*func_expr.children[1], ymin) &&
+	       ExtractConstantDouble(*func_expr.children[2], xmax) && ExtractConstantDouble(*func_expr.children[3], ymax);
+}
+
+bool ExtractPointCoordinates(const std::string &geojson, double &lon, double &lat) {
+	yyjson_doc *doc = yyjson_read(geojson.c_str(), geojson.size(), 0);
+	if (!doc) {
+		return false;
+	}
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	yyjson_val *type_val = yyjson_obj_get(root, "type");
+	if (!type_val || std::string(yyjson_get_str(type_val)) != "Point") {
+		yyjson_doc_free(doc);
+		return false;
+	}
+
+	yyjson_val *coords = yyjson_obj_get(root, "coordinates");
+	if (!coords || !yyjson_is_arr(coords) || yyjson_arr_size(coords) < 2) {
+		yyjson_doc_free(doc);
+		return false;
+	}
+
+	yyjson_val *lon_val = yyjson_arr_get(coords, 0);
+	yyjson_val *lat_val = yyjson_arr_get(coords, 1);
+	if (!yyjson_is_num(lon_val) || !yyjson_is_num(lat_val)) {
+		yyjson_doc_free(doc);
+		return false;
+	}
+
+	lon = yyjson_get_real(lon_val);
+	lat = yyjson_get_real(lat_val);
+
+	// yyjson_get_real returns 0 for integers, need to check for int type.
+	if (yyjson_is_int(lon_val)) {
+		lon = static_cast<double>(yyjson_get_int(lon_val));
+	}
+	if (yyjson_is_int(lat_val)) {
+		lat = static_cast<double>(yyjson_get_int(lat_val));
+	}
+
+	yyjson_doc_free(doc);
+	return true;
+}
+
+bool IsGeoColumnRef(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &func_expr = expr.Cast<BoundFunctionExpression>();
+	if (StringUtil::Lower(func_expr.function.name) != "st_geomfromgeojson" || func_expr.children.empty()) {
+		return false;
+	}
+	// If the child is a column ref (or struct_extract chain), it's a geo field reference.
+	// If it's a constant, it's a constant geometry.
+	auto child_class = func_expr.children[0]->GetExpressionClass();
+	if (child_class == ExpressionClass::BOUND_COLUMN_REF) {
+		return true;
+	}
+	if (child_class == ExpressionClass::BOUND_FUNCTION) {
+		auto &child_func = func_expr.children[0]->Cast<BoundFunctionExpression>();
+		if (StringUtil::Lower(child_func.function.name) == "struct_extract") {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace duckdb

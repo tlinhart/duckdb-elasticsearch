@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/expression.hpp"
 #include "elasticsearch_client.hpp"
 #include "yyjson.hpp"
 
@@ -104,5 +105,23 @@ yyjson_mut_val *DuckDBValueToJSON(yyjson_mut_doc *doc, const Value &value);
 // Get Elasticsearch field name, adding .keyword suffix for text fields that have a .keyword subfield.
 // For text fields without .keyword subfield, returns the base field name (caller should handle appropriately).
 std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field, bool has_keyword_subfield);
+
+// Extract constant double value from a BoundConstantExpression.
+// Handles DOUBLE, FLOAT, INTEGER, BIGINT, SMALLINT, TINYINT and HUGEINT types.
+bool ExtractConstantDouble(const Expression &expr, double &value);
+
+// Extract constant string value from a BoundConstantExpression with VARCHAR type.
+bool ExtractConstantString(const Expression &expr, std::string &value);
+
+// Check if expression is ST_MakeEnvelope(xmin, ymin, xmax, ymax) and extract the coordinates.
+bool ExtractEnvelopeCoordinates(const Expression &expr, double &xmin, double &ymin, double &xmax, double &ymax);
+
+// Extract lat/lon from a GeoJSON Point string.
+// Returns true if the GeoJSON is a Point and coordinates were extracted.
+bool ExtractPointCoordinates(const std::string &geojson, double &lon, double &lat);
+
+// Check if expression is ST_GeomFromGeoJSON(column_ref) i.e. references an Elasticsearch geo field.
+// Detects the pattern ST_GeomFromGeoJSON(BOUND_COLUMN_REF) or ST_GeomFromGeoJSON(struct_extract(...)).
+bool IsGeoColumnRef(const Expression &expr);
 
 } // namespace duckdb
