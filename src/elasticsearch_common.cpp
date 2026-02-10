@@ -39,7 +39,7 @@ std::string TrimString(const std::string &s) {
 }
 
 // Helper to parse a coordinate pair "lon lat" from WKT.
-static bool ParseWktCoordinate(const std::string &s, double &lon, double &lat) {
+static bool ParseWKTCoordinate(const std::string &s, double &lon, double &lat) {
 	std::string trimmed = TrimString(s);
 	size_t space_pos = trimmed.find(' ');
 	if (space_pos == std::string::npos)
@@ -55,7 +55,7 @@ static bool ParseWktCoordinate(const std::string &s, double &lon, double &lat) {
 }
 
 // Helper to parse a coordinate sequence "lon1 lat1, lon2 lat2, ..." into JSON array string.
-static std::string ParseWktCoordinateSequence(const std::string &s) {
+static std::string ParseWKTCoordinateSequence(const std::string &s) {
 	std::string result = "[";
 	std::string remaining = s;
 	bool first = true;
@@ -72,7 +72,7 @@ static std::string ParseWktCoordinateSequence(const std::string &s) {
 		}
 
 		double lon, lat;
-		if (!ParseWktCoordinate(coord_str, lon, lat)) {
+		if (!ParseWKTCoordinate(coord_str, lon, lat)) {
 			return "";
 		}
 
@@ -102,7 +102,7 @@ static size_t FindMatchingParenthesis(const std::string &s, size_t open_pos) {
 }
 
 // Parse WKT POINT to GeoJSON.
-static std::string WktPointToGeoJSON(const std::string &wkt) {
+static std::string WKTPointToGeoJSON(const std::string &wkt) {
 	size_t paren_start = wkt.find('(');
 	size_t paren_end = wkt.rfind(')');
 	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
@@ -111,7 +111,7 @@ static std::string WktPointToGeoJSON(const std::string &wkt) {
 
 	std::string coords = wkt.substr(paren_start + 1, paren_end - paren_start - 1);
 	double lon, lat;
-	if (!ParseWktCoordinate(coords, lon, lat)) {
+	if (!ParseWKTCoordinate(coords, lon, lat)) {
 		return "";
 	}
 
@@ -119,7 +119,7 @@ static std::string WktPointToGeoJSON(const std::string &wkt) {
 }
 
 // Parse WKT LINESTRING to GeoJSON.
-static std::string WktLineStringToGeoJSON(const std::string &wkt) {
+static std::string WKTLineStringToGeoJSON(const std::string &wkt) {
 	size_t paren_start = wkt.find('(');
 	size_t paren_end = wkt.rfind(')');
 	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
@@ -127,7 +127,7 @@ static std::string WktLineStringToGeoJSON(const std::string &wkt) {
 	}
 
 	std::string coords = wkt.substr(paren_start + 1, paren_end - paren_start - 1);
-	std::string coord_array = ParseWktCoordinateSequence(coords);
+	std::string coord_array = ParseWKTCoordinateSequence(coords);
 	if (coord_array.empty()) {
 		return "";
 	}
@@ -136,7 +136,7 @@ static std::string WktLineStringToGeoJSON(const std::string &wkt) {
 }
 
 // Parse WKT POLYGON to GeoJSON.
-static std::string WktPolygonToGeoJSON(const std::string &wkt) {
+static std::string WKTPolygonToGeoJSON(const std::string &wkt) {
 	size_t paren_start = wkt.find('(');
 	if (paren_start == std::string::npos) {
 		return "";
@@ -164,7 +164,7 @@ static std::string WktPolygonToGeoJSON(const std::string &wkt) {
 		}
 
 		std::string ring_coords = rings_str.substr(ring_start + 1, ring_end - ring_start - 1);
-		std::string coord_array = ParseWktCoordinateSequence(ring_coords);
+		std::string coord_array = ParseWKTCoordinateSequence(ring_coords);
 		if (coord_array.empty()) {
 			return "";
 		}
@@ -182,7 +182,7 @@ static std::string WktPolygonToGeoJSON(const std::string &wkt) {
 }
 
 // Parse WKT MULTIPOINT to GeoJSON.
-static std::string WktMultiPointToGeoJSON(const std::string &wkt) {
+static std::string WKTMultiPointToGeoJSON(const std::string &wkt) {
 	size_t paren_start = wkt.find('(');
 	size_t paren_end = wkt.rfind(')');
 	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
@@ -210,7 +210,7 @@ static std::string WktMultiPointToGeoJSON(const std::string &wkt) {
 
 			std::string point_coords = content.substr(point_start + 1, point_end - point_start - 1);
 			double lon, lat;
-			if (!ParseWktCoordinate(point_coords, lon, lat)) {
+			if (!ParseWKTCoordinate(point_coords, lon, lat)) {
 				return "";
 			}
 
@@ -223,7 +223,7 @@ static std::string WktMultiPointToGeoJSON(const std::string &wkt) {
 		}
 	} else {
 		// It's (lon1 lat1, lon2 lat2) format (simple coordinate list).
-		std::string coord_array = ParseWktCoordinateSequence(content);
+		std::string coord_array = ParseWKTCoordinateSequence(content);
 		if (coord_array.empty()) {
 			return "";
 		}
@@ -237,7 +237,7 @@ static std::string WktMultiPointToGeoJSON(const std::string &wkt) {
 }
 
 // Parse WKT MULTILINESTRING to GeoJSON.
-static std::string WktMultiLineStringToGeoJSON(const std::string &wkt) {
+static std::string WKTMultiLineStringToGeoJSON(const std::string &wkt) {
 	size_t paren_start = wkt.find('(');
 	if (paren_start == std::string::npos) {
 		return "";
@@ -263,7 +263,7 @@ static std::string WktMultiLineStringToGeoJSON(const std::string &wkt) {
 		}
 
 		std::string line_coords = lines_str.substr(line_start + 1, line_end - line_start - 1);
-		std::string coord_array = ParseWktCoordinateSequence(line_coords);
+		std::string coord_array = ParseWKTCoordinateSequence(line_coords);
 		if (coord_array.empty()) {
 			return "";
 		}
@@ -281,7 +281,7 @@ static std::string WktMultiLineStringToGeoJSON(const std::string &wkt) {
 }
 
 // Parse WKT MULTIPOLYGON to GeoJSON.
-static std::string WktMultiPolygonToGeoJSON(const std::string &wkt) {
+static std::string WKTMultiPolygonToGeoJSON(const std::string &wkt) {
 	size_t paren_start = wkt.find('(');
 	if (paren_start == std::string::npos) {
 		return "";
@@ -325,7 +325,7 @@ static std::string WktMultiPolygonToGeoJSON(const std::string &wkt) {
 			}
 
 			std::string ring_coords = rings_str.substr(ring_start + 1, ring_end - ring_start - 1);
-			std::string coord_array = ParseWktCoordinateSequence(ring_coords);
+			std::string coord_array = ParseWKTCoordinateSequence(ring_coords);
 			if (coord_array.empty()) {
 				return "";
 			}
@@ -353,7 +353,7 @@ static std::string WktMultiPolygonToGeoJSON(const std::string &wkt) {
 }
 
 // Parse WKT GEOMETRYCOLLECTION to GeoJSON.
-static std::string WktGeometryCollectionToGeoJSON(const std::string &wkt) {
+static std::string WKTGeometryCollectionToGeoJSON(const std::string &wkt) {
 	size_t paren_start = wkt.find('(');
 	size_t paren_end = wkt.rfind(')');
 	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
@@ -391,7 +391,7 @@ static std::string WktGeometryCollectionToGeoJSON(const std::string &wkt) {
 		}
 
 		std::string sub_wkt = content.substr(geom_start, geom_end - geom_start + 1);
-		std::string sub_geojson = WktToGeoJSON(sub_wkt);
+		std::string sub_geojson = WKTToGeoJSON(sub_wkt);
 		if (sub_geojson.empty()) {
 			return "";
 		}
@@ -409,7 +409,7 @@ static std::string WktGeometryCollectionToGeoJSON(const std::string &wkt) {
 }
 
 // Convert WKT string to GeoJSON.
-std::string WktToGeoJSON(const std::string &wkt) {
+std::string WKTToGeoJSON(const std::string &wkt) {
 	std::string trimmed = TrimString(wkt);
 	if (trimmed.empty()) {
 		return "";
@@ -417,19 +417,19 @@ std::string WktToGeoJSON(const std::string &wkt) {
 
 	// Check for WKT type keywords (uppercase only).
 	if (trimmed.find("GEOMETRYCOLLECTION") == 0) {
-		return WktGeometryCollectionToGeoJSON(trimmed);
+		return WKTGeometryCollectionToGeoJSON(trimmed);
 	} else if (trimmed.find("MULTIPOLYGON") == 0) {
-		return WktMultiPolygonToGeoJSON(trimmed);
+		return WKTMultiPolygonToGeoJSON(trimmed);
 	} else if (trimmed.find("MULTILINESTRING") == 0) {
-		return WktMultiLineStringToGeoJSON(trimmed);
+		return WKTMultiLineStringToGeoJSON(trimmed);
 	} else if (trimmed.find("MULTIPOINT") == 0) {
-		return WktMultiPointToGeoJSON(trimmed);
+		return WKTMultiPointToGeoJSON(trimmed);
 	} else if (trimmed.find("POLYGON") == 0) {
-		return WktPolygonToGeoJSON(trimmed);
+		return WKTPolygonToGeoJSON(trimmed);
 	} else if (trimmed.find("LINESTRING") == 0) {
-		return WktLineStringToGeoJSON(trimmed);
+		return WKTLineStringToGeoJSON(trimmed);
 	} else if (trimmed.find("POINT") == 0) {
-		return WktPointToGeoJSON(trimmed);
+		return WKTPointToGeoJSON(trimmed);
 	}
 
 	// Unknown WKT type.
@@ -470,7 +470,7 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 
 		// Check for WKT POINT format.
 		if (s.find("POINT") == 0) {
-			return WktPointToGeoJSON(s);
+			return WKTPointToGeoJSON(s);
 		}
 
 		// Check if it's "lat,lon" format.
@@ -500,7 +500,7 @@ std::string GeoShapeToGeoJSON(yyjson_val *val) {
 		// WKT format, parse and convert to GeoJSON.
 		const char *str = yyjson_get_str(val);
 		std::string wkt(str);
-		return WktToGeoJSON(wkt);
+		return WKTToGeoJSON(wkt);
 	}
 
 	// Object format (already GeoJSON), serialize it.
@@ -1243,7 +1243,7 @@ std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string
 	return result;
 }
 
-void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type) {
+void SetStructValueFromJSON(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type) {
 	if (!val || yyjson_is_null(val)) {
 		FlatVector::SetNull(result, row_idx, true);
 		return;
@@ -1263,11 +1263,11 @@ void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, cons
 		const auto &child_type = child_types[i].second;
 
 		yyjson_val *child_val = yyjson_obj_get(val, child_name.c_str());
-		SetValueFromJson(child_val, *child_entries[i], row_idx, child_type, "");
+		SetValueFromJSON(child_val, *child_entries[i], row_idx, child_type, "");
 	}
 }
 
-void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+void SetListValueFromJSON(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
                           const std::string &es_type) {
 	auto list_data = FlatVector::GetData<list_entry_t>(result);
 
@@ -1289,7 +1289,7 @@ void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const 
 		ListVector::Reserve(result, current_size + 1);
 
 		auto &child_type = ListType::GetChildType(type);
-		SetValueFromJson(val, child_vector, current_size, child_type, es_type);
+		SetValueFromJSON(val, child_vector, current_size, child_type, es_type);
 		return;
 	}
 
@@ -1314,12 +1314,12 @@ void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const 
 	yyjson_val *elem;
 	idx_t elem_idx = 0;
 	yyjson_arr_foreach(val, idx, max, elem) {
-		SetValueFromJson(elem, child_vector, current_size + elem_idx, child_type, es_type);
+		SetValueFromJSON(elem, child_vector, current_size + elem_idx, child_type, es_type);
 		elem_idx++;
 	}
 }
 
-void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+void SetValueFromJSON(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
                       const std::string &es_type) {
 	if (!val || yyjson_is_null(val)) {
 		FlatVector::SetNull(result, row_idx, true);
@@ -1330,7 +1330,7 @@ void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const Logi
 	// or it is a single value that should be wrapped in a single-element list.
 	// This must be checked BEFORE any es_type-specific handling.
 	if (type.id() == LogicalTypeId::LIST) {
-		SetListValueFromJson(val, result, row_idx, type, es_type);
+		SetListValueFromJSON(val, result, row_idx, type, es_type);
 		return;
 	}
 
@@ -1446,7 +1446,7 @@ void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const Logi
 		break;
 	}
 	case LogicalTypeId::STRUCT:
-		SetStructValueFromJson(val, result, row_idx, type);
+		SetStructValueFromJSON(val, result, row_idx, type);
 		break;
 	default:
 		FlatVector::SetNull(result, row_idx, true);
@@ -1464,7 +1464,7 @@ std::string GetElasticsearchFieldName(const std::string &column_name, bool is_te
 	return column_name;
 }
 
-yyjson_mut_val *DuckDBValueToJson(yyjson_mut_doc *doc, const Value &value) {
+yyjson_mut_val *DuckDBValueToJSON(yyjson_mut_doc *doc, const Value &value) {
 	if (value.IsNull()) {
 		return yyjson_mut_null(doc);
 	}

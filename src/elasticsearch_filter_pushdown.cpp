@@ -177,7 +177,7 @@ static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const Co
 	}
 
 	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
-	yyjson_mut_val *value = DuckDBValueToJson(doc, filter.constant);
+	yyjson_mut_val *value = DuckDBValueToJSON(doc, filter.constant);
 
 	switch (filter.comparison_type) {
 	case ExpressionType::COMPARE_EQUAL: {
@@ -379,7 +379,7 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 
 	yyjson_mut_val *values_arr = yyjson_mut_arr(doc);
 	for (auto &value : filter.values) {
-		yyjson_mut_val *json_val = DuckDBValueToJson(doc, value);
+		yyjson_mut_val *json_val = DuckDBValueToJSON(doc, value);
 		yyjson_mut_arr_append(values_arr, json_val);
 	}
 

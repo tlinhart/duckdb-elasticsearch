@@ -36,7 +36,7 @@ static std::string FormatHeaders(const duckdb_httplib_openssl::Headers &headers)
 }
 
 // Construct HTTP log message in the same format as DuckDB's HTTPLogType.
-static std::string ConstructHttpLogMessage(const duckdb_httplib_openssl::Request &request,
+static std::string ConstructHTTPLogMessage(const duckdb_httplib_openssl::Request &request,
                                            const duckdb_httplib_openssl::Response &response,
                                            std::chrono::system_clock::time_point start_time,
                                            std::chrono::system_clock::time_point end_time) {
@@ -175,7 +175,7 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 	// Log the request after successful completion using details captured by httplib logger.
 	if (should_log && response.status_code > 0) {
 		auto end_time = std::chrono::system_clock::now();
-		std::string log_msg = ConstructHttpLogMessage(logged_request, logged_response, start_time, end_time);
+		std::string log_msg = ConstructHTTPLogMessage(logged_request, logged_response, start_time, end_time);
 		logger_->WriteLog(HTTPLogType::NAME, HTTPLogType::LEVEL, log_msg);
 	}
 

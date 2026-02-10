@@ -709,7 +709,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 				} else {
 					val = GetValueByPath(source, field_path);
 				}
-				SetValueFromJson(val, output.data[out_col], output_idx, col_type, es_type);
+				SetValueFromJSON(val, output.data[out_col], output_idx, col_type, es_type);
 			}
 		}
 

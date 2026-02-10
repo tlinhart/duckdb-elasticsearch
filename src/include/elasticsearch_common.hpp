@@ -72,15 +72,15 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path);
 
 // Extract value from yyjson_val and set it in the result vector.
-void SetValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+void SetValueFromJSON(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
                       const std::string &es_type);
 
 // Set LIST value from JSON array.
-void SetListValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
+void SetListValueFromJSON(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
                           const std::string &es_type);
 
 // Set STRUCT value from JSON object.
-void SetStructValueFromJson(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type);
+void SetStructValueFromJSON(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type);
 
 // Collect unmapped fields from _source that are not in the schema's field_paths.
 std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string> &mapped_paths,
@@ -93,13 +93,13 @@ std::string GeoPointToGeoJSON(yyjson_val *val);
 std::string GeoShapeToGeoJSON(yyjson_val *val);
 
 // Convert WKT string to GeoJSON.
-std::string WktToGeoJSON(const std::string &wkt);
+std::string WKTToGeoJSON(const std::string &wkt);
 
 // Helper to trim whitespace from string.
 std::string TrimString(const std::string &s);
 
 // Convert DuckDB value to yyjson mutable value for query building.
-yyjson_mut_val *DuckDBValueToJson(yyjson_mut_doc *doc, const Value &value);
+yyjson_mut_val *DuckDBValueToJSON(yyjson_mut_doc *doc, const Value &value);
 
 // Get Elasticsearch field name, adding .keyword suffix for text fields that have a .keyword subfield.
 // For text fields without .keyword subfield, returns the base field name (caller should handle appropriately).
