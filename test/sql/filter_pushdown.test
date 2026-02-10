@@ -1,23 +1,41 @@
 # name: test/sql/filter_pushdown.test
-# description: Test SQL filter translation to Elasticsearch Query DSL
+# description: Test SQL filter and spatial predicate translation to Elasticsearch Query DSL
 # group: [sql]
 
 # This test file verifies which filters are pushed down to Elasticsearch and which
-# are handled by DuckDB. It covers all field types and operators.
+# are handled by DuckDB. It covers all field types, operators and spatial predicates.
 #
 # Pushdown behavior summary:
-# +-------------------+--------+--------------+--------+-------------+----------------------+
-# | Field type        | =, !=  | <, >, <=, >= | IN     | LIKE, ILIKE | IS NULL, IS NOT NULL |
-# +-------------------+--------+--------------+--------+-------------+----------------------+
-# | numeric           | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
-# | date              | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
-# | boolean           | PUSHED | N/A          | PUSHED | N/A         | PUSHED               |
-# | keyword           | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
-# | text w/ .keyword  | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
-# | text w/o .keyword | ERROR  | ERROR        | ERROR  | ERROR       | PUSHED               |
-# | nested object     | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
-# | array element     | FILTER | FILTER       | FILTER | FILTER      | FILTER               |
-# +-------------------+--------+--------------+--------+-------------+----------------------+
+# +---------------------+--------+--------------+--------+-------------+----------------------+
+# | Field type          | =, !=  | <, >, <=, >= | IN     | LIKE, ILIKE | IS NULL, IS NOT NULL |
+# +---------------------+--------+--------------+--------+-------------+----------------------+
+# | numeric             | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
+# | date                | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
+# | boolean             | PUSHED | N/A          | PUSHED | N/A         | PUSHED               |
+# | keyword             | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
+# | text w/ .keyword    | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
+# | text w/o .keyword   | ERROR  | ERROR        | ERROR  | ERROR       | PUSHED               |
+# | nested object       | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
+# | array element       | FILTER | FILTER       | FILTER | FILTER      | FILTER               |
+# | geo_shape/geo_point | N/A*   | N/A*         | N/A*   | N/A*        | N/A*                 |
+# +---------------------+--------+--------------+--------+-------------+----------------------+
+#
+# * geo_shape/geo_point fields use spatial function predicates instead of standard SQL operators.
+#   See geospatial pushdown table below.
+#
+# Geospatial pushdown (requires the DuckDB spatial extension):
+# +---------------+--------+------------------+-------------------------------------+-----------+
+# | Predicate     | Status | Spatial relation | Optimization                        | Symmetric |
+# +---------------+--------+------------------+-------------------------------------+-----------+
+# | ST_Within     | PUSHED | within/contains  | ST_MakeEnvelope -> geo_bounding_box | No        |
+# | ST_Contains   | PUSHED | contains/within  | ST_MakeEnvelope -> geo_bounding_box | No        |
+# | ST_Intersects | PUSHED | intersects       | -                                   | Yes       |
+# | ST_Disjoint   | PUSHED | disjoint         | -                                   | Yes       |
+# +---------------+--------+------------------+-------------------------------------+-----------+
+#
+# Notes on geospatial pushdown:
+# - The Elasticsearch field must be wrapped in ST_GeomFromGeoJSON(field)
+# - ST_MakeEnvelope is optimized to a geo_bounding_box query in Elasticsearch
 #
 # Legend:
 # - PUSHED: Filter is translated to Elasticsearch Query DSL
@@ -1181,3 +1199,132 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 WHERE CASE WHEN deprecated THEN amount ELSE 0 END > 50;
 ----
 physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+statement ok
+INSTALL spatial;
+
+statement ok
+LOAD spatial;
+
+# ST_Within with geo_shape field: point within a geo_shape field.
+# Translates to geo_shape query with relation=contains.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_Within with geo_shape field: geo_shape field within a shape.
+# Translates to geo_shape query with relation=within.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_GeomFromGeoJSON(geometry), ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-130,30],[-110,30],[-110,45],[-130,45],[-130,30]]]}'));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_Within with ST_MakeEnvelope: optimized to geo_bounding_box query.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_GeomFromGeoJSON(location), ST_MakeEnvelope(-74.1, 40.01, -71.12, 40.73));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_Contains with geo_shape field: geo_shape field contains a point.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Contains(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_Contains with reversed arguments (shape contains a field means field is within a shape).
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Contains(ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-130,30],[-110,30],[-110,45],[-130,45],[-130,30]]]}'), ST_GeomFromGeoJSON(geometry));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_Contains with ST_MakeEnvelope: optimized to geo_bounding_box query.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Contains(ST_MakeEnvelope(-74.1, 40.01, -71.12, 40.73), ST_GeomFromGeoJSON(location));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_Intersects with geo_shape field (symmetric).
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Intersects(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_Intersects with geo_shape field: field on second argument position (symmetric).
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Intersects(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_Disjoint with geo_shape field (symmetric).
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Disjoint(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# Geospatial filter combined with regular filter: both are pushed.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry)) AND
+      amount > 10;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*amount>10.*

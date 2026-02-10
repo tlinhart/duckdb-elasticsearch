@@ -1,5 +1,5 @@
 # name: test/sql/geospatial.test
-# description: Test geo_point and geo_shape type handling and GeoJSON conversion
+# description: Test geo types handling, GeoJSON conversion and geospatial queries
 # group: [sql]
 
 require elasticsearch
@@ -131,3 +131,120 @@ SELECT ST_GeomFromGeoJSON(geometry) FROM elasticsearch_query(
 WHERE _id = '4';
 ----
 MULTIPOINT (2.3522 48.8566, 2.3488 48.8534, 2.3555 48.8601)
+
+# Test geo_bounding_box query via ST_Within on geo_point field.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_GeomFromGeoJSON(location), ST_MakeEnvelope(-1, 33, 0, 52));
+----
+Michael Brown
+
+# Test geo_bounding_box query via ST_Contains on geo_point field (reversed arguments).
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Contains(ST_MakeEnvelope(-1, 33, 0, 52), ST_GeomFromGeoJSON(location));
+----
+Michael Brown
+
+# Test geo_shape intersects query with geo_shape field.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Intersects(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+----
+Alice Johnson
+
+# Test geo_shape intersects query with geo_shape field on second argument position (symmetric).
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Intersects(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry));
+----
+Alice Johnson
+
+# Test geo_shape contains query: geo_shape field contains a point.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Contains(ST_GeomFromGeoJSON(geometry), ST_Point(-0.13, 51.51));
+----
+Emma Wilson
+
+# Test geo_shape within query: point within a geo_shape field (reversed arguments).
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_Point(-0.13, 51.51), ST_GeomFromGeoJSON(geometry));
+----
+Emma Wilson
+
+# Test geo_shape within query: geo_shape field within a large bounding polygon.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_GeomFromGeoJSON(geometry), ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-123,37],[-122,37],[-122,38],[-123,38],[-123,37]]]}'));
+----
+Alice Johnson
+
+# Test geo_shape disjoint query.
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Disjoint(ST_GeomFromGeoJSON(geometry), ST_Point(12.4964, 41.9028));
+----
+Alice Johnson
+Benjamin Lee
+Charlotte Anderson
+Daniel Taylor
+Emma Wilson
+James Garcia
+Michael Brown
+Olivia Davis
+William Thompson
+
+# Test combination of geospatial and regular filter.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Within(ST_GeomFromGeoJSON(location), ST_MakeEnvelope(-10, 30, 10, 55)) AND
+      amount < 90;
+----
+Michael Brown
