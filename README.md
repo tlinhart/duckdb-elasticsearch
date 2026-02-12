@@ -23,6 +23,9 @@ objects, geo types, and multi-index queries.
 
 - Filter pushdown – `WHERE` clauses are automatically translated to
   Elasticsearch Query DSL and executed server-side, reducing data transfer.
+  This includes spatial predicates from the DuckDB
+  [spatial](https://duckdb.org/docs/stable/core_extensions/spatial/overview)
+  extension.
 - Projection pushdown – only requested columns are fetched via `_source`
   filtering.
 - Limit pushdown – `LIMIT` and `OFFSET` clauses are pushed to Elasticsearch via
@@ -290,25 +293,57 @@ The base query and SQL filters are merged using `bool.must`:
 }
 ```
 
+Query with geospatial filter pushdown (requires the DuckDB spatial extension):
+
+```sql
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Intersects(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+```
+
+The extension translates this to the following Elasticsearch query:
+
+```json
+{
+  "query": {
+    "geo_shape": {
+      "geometry": {
+        "shape": { "type": "Point", "coordinates": [-122.4194, 37.7749] },
+        "relation": "intersects"
+      }
+    }
+  },
+  "_source": ["name"]
+}
+```
+
 ## Filter pushdown
 
 The following SQL expressions are translated to Elasticsearch Query DSL:
 
-| SQL expression            | Elasticsearch query                                       |
-| ------------------------- | --------------------------------------------------------- |
-| `column = value`          | `{"term": {"column": value}}`                             |
-| `column != value`         | `{"bool": {"must_not": {"term": {"column": value}}}}`     |
-| `column < value`          | `{"range": {"column": {"lt": value}}}`                    |
-| `column > value`          | `{"range": {"column": {"gt": value}}}`                    |
-| `column <= value`         | `{"range": {"column": {"lte": value}}}`                   |
-| `column >= value`         | `{"range": {"column": {"gte": value}}}`                   |
-| `column IN (a, b, c)`     | `{"terms": {"column": [a, b, c]}}`                        |
-| `column LIKE 'prefix%'`   | `{"prefix": {"column": "prefix"}}`                        |
-| `column LIKE '%suffix'`   | `{"wildcard": {"column": {"value": "*suffix"}}}`          |
-| `column LIKE '%pattern%'` | `{"wildcard": {"column": {"value": "*pattern*"}}}`        |
-| `column ILIKE 'pattern'`  | Case-insensitive wildcard query                           |
-| `column IS NULL`          | `{"bool": {"must_not": {"exists": {"field": "column"}}}}` |
-| `column IS NOT NULL`      | `{"exists": {"field": "column"}}`                         |
+| SQL expression                 | Elasticsearch query                                                   |
+| ------------------------------ | --------------------------------------------------------------------- |
+| `column = value`               | `{"term": {"column": value}}`                                         |
+| `column != value`              | `{"bool": {"must_not": {"term": {"column": value}}}}`                 |
+| `column < value`               | `{"range": {"column": {"lt": value}}}`                                |
+| `column > value`               | `{"range": {"column": {"gt": value}}}`                                |
+| `column <= value`              | `{"range": {"column": {"lte": value}}}`                               |
+| `column >= value`              | `{"range": {"column": {"gte": value}}}`                               |
+| `column IN (a, b, c)`          | `{"terms": {"column": [a, b, c]}}`                                    |
+| `column LIKE 'prefix%'`        | `{"prefix": {"column": "prefix"}}`                                    |
+| `column LIKE '%suffix'`        | `{"wildcard": {"column": {"value": "*suffix"}}}`                      |
+| `column LIKE '%pattern%'`      | `{"wildcard": {"column": {"value": "*pattern*"}}}`                    |
+| `column ILIKE 'pattern'`       | Case-insensitive wildcard query                                       |
+| `column IS NULL`               | `{"bool": {"must_not": {"exists": {"field": "column"}}}}`             |
+| `column IS NOT NULL`           | `{"exists": {"field": "column"}}`                                     |
+| `ST_Within(column, shape)`     | `{"geo_shape": {"column": {"shape": ..., "relation": "within"}}}`     |
+| `ST_Contains(column, shape)`   | `{"geo_shape": {"column": {"shape": ..., "relation": "contains"}}}`   |
+| `ST_Intersects(column, shape)` | `{"geo_shape": {"column": {"shape": ..., "relation": "intersects"}}}` |
+| `ST_Disjoint(column, shape)`   | `{"geo_shape": {"column": {"shape": ..., "relation": "disjoint"}}}`   |
 
 The following table summarizes the pushdown behavior:
 
@@ -322,12 +357,16 @@ The following table summarizes the pushdown behavior:
 | text without `.keyword` | ERROR     | ERROR                | ERROR  | ERROR           | PUSHED                   |
 | nested object fields    | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
 | array element access    | FILTER    | FILTER               | FILTER | FILTER          | FILTER                   |
+| geo fields              | N/A       | N/A                  | N/A    | N/A             | N/A                      |
 
 PUSHED – filter is translated to Elasticsearch Query DSL.  
 ERROR – throws an error.  
 FILTER – filter cannot be pushed down; handled by DuckDB's `FILTER` operator
 after the scan.  
-N/A – not applicable for this field type.
+N/A – not applicable for this field type; geo fields use spatial predicates
+instead (see below).
+
+### Text fields
 
 Elasticsearch `text` fields are analyzed (tokenized) and don't support exact
 match queries like `term`. For fields with a `.keyword` subfield, filters are
@@ -343,6 +382,41 @@ SELECT * FROM elasticsearch_query(
     query := '{"match": {"description": "wireless headphones"}}'
 );
 ```
+
+### Geo fields
+
+`geo_point` and `geo_shape` fields use spatial function predicates instead of
+standard SQL operators. Pushdown requires the DuckDB
+[spatial](https://duckdb.org/docs/stable/core_extensions/spatial/overview)
+extension to be installed and loaded:
+
+```sql
+INSTALL spatial;
+LOAD spatial;
+```
+
+The Elasticsearch geo field must be wrapped in `ST_GeomFromGeoJSON()` and the
+other argument must be a constant geometry expression (e.g. `ST_Point()`,
+`ST_GeomFromGeoJSON()`, `ST_MakeEnvelope()`).
+
+The following spatial predicates are pushed down:
+
+| Predicate       | Spatial relation    | `ST_MakeEnvelope` optimization | Symmetric |
+| --------------- | ------------------- | ------------------------------ | --------- |
+| `ST_Within`     | `within`/`contains` | `geo_bounding_box`             | No        |
+| `ST_Contains`   | `contains`/`within` | `geo_bounding_box`             | No        |
+| `ST_Intersects` | `intersects`        | –                              | Yes       |
+| `ST_Disjoint`   | `disjoint`          | –                              | Yes       |
+
+`ST_Within` and `ST_Contains` are asymmetric – the Elasticsearch relation
+depends on which argument is the field and which is the constant shape. For
+example, `ST_Within(column, shape)` means field is within shape (relation
+`within`), while `ST_Within(shape, column)` means shape is within field
+(relation `contains`). `ST_Intersects` and `ST_Disjoint` are symmetric and
+produce the same relation regardless of argument order.
+
+When `ST_MakeEnvelope` is used as the constant geometry, the query is optimized
+to a more efficient `geo_bounding_box` query instead of `geo_shape`.
 
 ## Projection pushdown and filter pruning
 
