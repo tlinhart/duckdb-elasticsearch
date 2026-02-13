@@ -10,6 +10,7 @@
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 
 namespace duckdb {
 
@@ -53,6 +54,12 @@ static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &fie
 static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
                                                  const string &column_name,
                                                  const unordered_map<string, string> &es_types);
+
+static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const BoundComparisonExpression &comp_expr,
+                                                      const string &column_name);
+
+static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
+                                                   const string &column_name);
 
 // Public API implementation.
 FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterSet &filters,
@@ -405,7 +412,8 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 	// ExpressionFilter contains arbitrary expressions. We handle:
 	// - LIKE/ILIKE patterns (~~, ~~~, like_escape, ilike_escape)
 	// - Optimized string functions from LikeOptimizationRule (prefix, suffix, contains)
-	// - Geospatial functions from spatial extension (ST_Within, ST_Intersects, ST_Contains, ST_Disjoint)
+	// - ST_Distance comparisons
+	// - Spatial extension functions ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint
 	//
 	// Note: For text fields without .keyword subfield an error is thrown early in TranslateLikePattern.
 	// Only text fields with .keyword or non-text fields (keyword, etc.) reach the pattern translation.
@@ -478,6 +486,20 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 		if (func_name_lower == "st_within" || func_name_lower == "st_intersects" || func_name_lower == "st_contains" ||
 		    func_name_lower == "st_disjoint") {
 			return TranslateGeospatialFilter(doc, func_expr, column_name, es_types);
+		}
+		if (func_name_lower == "st_dwithin") {
+			return TranslateGeoDistanceDWithin(doc, func_expr, column_name);
+		}
+	}
+
+	// Handle comparison expressions containing ST_Distance.
+	// Pattern: ST_Distance(ST_GeomFromGeoJSON(col), point) </<=/>/>=  distance
+	if (expr.type == ExpressionType::COMPARE_LESSTHAN || expr.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
+	    expr.type == ExpressionType::COMPARE_GREATERTHAN || expr.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
+		auto result = TranslateGeoDistanceComparison(doc, comp_expr, column_name);
+		if (result) {
+			return result;
 		}
 	}
 
@@ -750,6 +772,140 @@ static yyjson_mut_val *BuildGeoBoundingBoxQuery(yyjson_mut_doc *doc, const strin
 	yyjson_mut_val *result = yyjson_mut_obj(doc);
 	yyjson_mut_obj_add_val(doc, result, "geo_bounding_box", bbox_inner);
 	return result;
+}
+
+// Translate a ST_Distance comparison to an Elasticsearch geo_distance query.
+// Handles ST_Distance(ST_GeomFromGeoJSON(col), point) </<=/>/>=  distance.
+// The pushdown stage has already replaced the GEOMETRY constant with a GeoJSON VARCHAR string.
+// For < and <= produce a direct geo_distance query (points within distance).
+// For > and >= produce a bool.must_not wrapper around geo_distance (points farther than distance).
+static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const BoundComparisonExpression &comp_expr,
+                                                      const string &column_name) {
+	// Identify which side is the ST_Distance function call and which is the distance constant.
+	const BoundFunctionExpression *func_expr = nullptr;
+	const Expression *dist_expr = nullptr;
+	bool func_on_left = false;
+
+	if (comp_expr.left->type == ExpressionType::BOUND_FUNCTION) {
+		auto &func = comp_expr.left->Cast<BoundFunctionExpression>();
+		if (StringUtil::Lower(func.function.name) == "st_distance" && func.children.size() == 2) {
+			func_expr = &func;
+			dist_expr = comp_expr.right.get();
+			func_on_left = true;
+		}
+	}
+	if (!func_expr && comp_expr.right->type == ExpressionType::BOUND_FUNCTION) {
+		auto &func = comp_expr.right->Cast<BoundFunctionExpression>();
+		if (StringUtil::Lower(func.function.name) == "st_distance" && func.children.size() == 2) {
+			func_expr = &func;
+			dist_expr = comp_expr.left.get();
+			func_on_left = false;
+		}
+	}
+	if (!func_expr) {
+		return nullptr;
+	}
+
+	// Extract the distance constant.
+	double distance_meters;
+	if (!ExtractConstantDouble(*dist_expr, distance_meters)) {
+		return nullptr;
+	}
+	if (distance_meters < 0) {
+		return nullptr;
+	}
+
+	// From ST_Distance's children, find the constant GeoJSON point (the one that's not the column ref).
+	// One child is ST_GeomFromGeoJSON(col) (the column), the other is the constant point as GeoJSON VARCHAR.
+	idx_t const_child_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < 2; i++) {
+		if (!IsGeoColumnRef(*func_expr->children[i])) {
+			const_child_idx = i;
+		}
+	}
+	if (const_child_idx == DConstants::INVALID_INDEX) {
+		return nullptr;
+	}
+
+	// Extract the GeoJSON string and parse out lat/lon coordinates.
+	string point_geojson = ExtractConstantGeoJSON(*func_expr->children[const_child_idx]);
+	if (point_geojson.empty()) {
+		return nullptr;
+	}
+
+	double lon, lat;
+	if (!ExtractPointCoordinates(point_geojson, lon, lat)) {
+		return nullptr;
+	}
+
+	// Normalize operator direction: we want "ST_Distance(...) <operator> distance".
+	auto expr_type = comp_expr.GetExpressionType();
+	auto comparison_type = func_on_left ? expr_type : FlipComparisonExpression(expr_type);
+
+	// Build the geo_distance query.
+	yyjson_mut_val *geo_dist_query = BuildGeoDistanceQuery(doc, column_name, lat, lon, distance_meters);
+	if (!geo_dist_query) {
+		return nullptr;
+	}
+
+	// For < and <= return the geo_distance query directly (points within distance).
+	// For > and >= wrap in bool.must_not (points farther than distance).
+	if (comparison_type == ExpressionType::COMPARE_LESSTHAN ||
+	    comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+		return geo_dist_query;
+	} else {
+		yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
+		yyjson_mut_val *must_not_arr = yyjson_mut_arr(doc);
+		yyjson_mut_arr_add_val(must_not_arr, geo_dist_query);
+		yyjson_mut_obj_add_val(doc, bool_obj, "must_not", must_not_arr);
+		yyjson_mut_val *result_query = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, result_query, "bool", bool_obj);
+		return result_query;
+	}
+}
+
+// Translate a ST_DWithin function to an Elasticsearch geo_distance query.
+// ST_DWithin(geom1, geom2, distance) -> geo_distance query.
+// One of geom1/geom2 must be ST_GeomFromGeoJSON(col), the other a constant point.
+// The pushdown stage has already replaced the GEOMETRY constant with a GeoJSON VARCHAR string.
+static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
+                                                   const string &column_name) {
+	if (func_expr.children.size() < 3) {
+		return nullptr;
+	}
+
+	// Find the constant geometry child (the one that's not the column ref) among the first two args.
+	idx_t const_child_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < 2; i++) {
+		if (!IsGeoColumnRef(*func_expr.children[i])) {
+			const_child_idx = i;
+		}
+	}
+	if (const_child_idx == DConstants::INVALID_INDEX) {
+		return nullptr;
+	}
+
+	// Extract the GeoJSON string and parse out lat/lon coordinates.
+	string point_geojson = ExtractConstantGeoJSON(*func_expr.children[const_child_idx]);
+	if (point_geojson.empty()) {
+		return nullptr;
+	}
+
+	double lon, lat;
+	if (!ExtractPointCoordinates(point_geojson, lon, lat)) {
+		return nullptr;
+	}
+
+	// Extract the distance from the third argument.
+	double distance_meters;
+	if (!ExtractConstantDouble(*func_expr.children[2], distance_meters)) {
+		return nullptr;
+	}
+	if (distance_meters < 0) {
+		return nullptr;
+	}
+
+	return BuildGeoDistanceQuery(doc, column_name, lat, lon, distance_meters);
 }
 
 // Translate a geospatial function expression to an Elasticsearch geo query.

@@ -808,6 +808,22 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 	return result;
 }
 
+// Layout-compatible struct for the spatial extension's ST_DWithin bind data.
+// When the distance argument of ST_DWithin is a constant, the spatial extension's Bind function
+// erases the third child (distance) from the BoundFunctionExpression and stores the distance value
+// in bind_info. This struct mirrors that layout so we can extract the distance.
+struct SpatialDWithinBindData : public FunctionData {
+	double distance;
+	bool is_constant;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return nullptr;
+	}
+	bool Equals(const FunctionData &other) const override {
+		return false;
+	}
+};
+
 // Information about a geospatial column reference found inside ST_GeomFromGeoJSON(column_ref).
 struct GeoColumnInfo {
 	ColumnPathInfo col_path;
@@ -1080,13 +1096,116 @@ static bool TryPushComparisonFilter(ClientContext &context, const BoundCompariso
 	return true;
 }
 
+// Try to push a geo_distance filter from a comparison involving ST_Distance.
+// Recognizes patterns like ST_Distance(ST_GeomFromGeoJSON(col), ST_Point(...)) < 1000.
+// The comparison must have ST_Distance on one side and a numeric constant on the other.
+// Only <, <=, >, >= are supported (not = or !=).
+static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparisonExpression &comp_expr,
+                                     const ElasticsearchQueryBindData &bind_data, const vector<ColumnIndex> &column_ids,
+                                     LogicalGet &get) {
+	auto expr_type = comp_expr.GetExpressionType();
+	if (expr_type != ExpressionType::COMPARE_LESSTHAN && expr_type != ExpressionType::COMPARE_LESSTHANOREQUALTO &&
+	    expr_type != ExpressionType::COMPARE_GREATERTHAN && expr_type != ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+		return false;
+	}
+
+	// Identify which side is the ST_Distance function and which is the distance constant.
+	const Expression *dist_func_expr = nullptr;
+	const Expression *dist_value_expr = nullptr;
+	bool func_on_left = false;
+
+	if (comp_expr.left->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &func = comp_expr.left->Cast<BoundFunctionExpression>();
+		if (StringUtil::Lower(func.function.name) == "st_distance" && func.children.size() == 2) {
+			dist_func_expr = comp_expr.left.get();
+			dist_value_expr = comp_expr.right.get();
+			func_on_left = true;
+		}
+	}
+	if (!dist_func_expr && comp_expr.right->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &func = comp_expr.right->Cast<BoundFunctionExpression>();
+		if (StringUtil::Lower(func.function.name) == "st_distance" && func.children.size() == 2) {
+			dist_func_expr = comp_expr.right.get();
+			dist_value_expr = comp_expr.left.get();
+			func_on_left = false;
+		}
+	}
+	if (!dist_func_expr) {
+		return false;
+	}
+
+	// Extract the distance constant.
+	if (!dist_value_expr->IsFoldable()) {
+		return false;
+	}
+	Value distance_val;
+	if (!ExpressionExecutor::TryEvaluateScalar(context, *dist_value_expr, distance_val)) {
+		return false;
+	}
+	if (distance_val.IsNull()) {
+		return false;
+	}
+	double distance_meters;
+	if (!distance_val.DefaultTryCastAs(LogicalType::DOUBLE)) {
+		return false;
+	}
+	distance_meters = DoubleValue::Get(distance_val);
+	if (distance_meters < 0) {
+		return false;
+	}
+
+	// Normalize the comparison operator so it reads as "ST_Distance(...) <operator> distance".
+	// If the function is on the right, flip the operator.
+	auto comparison_type = func_on_left ? expr_type : FlipComparisonExpression(expr_type);
+
+	// From ST_Distance's children, extract the geo column and the constant point.
+	auto &func_expr = dist_func_expr->Cast<BoundFunctionExpression>();
+
+	GeoColumnInfo geo_col = ExtractGeoColumnFromArg(*func_expr.children[0], bind_data, column_ids, 0);
+	if (!geo_col.IsValid()) {
+		geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data, column_ids, 1);
+	}
+	if (!geo_col.IsValid()) {
+		return false;
+	}
+
+	// Extract the constant geometry (must be a point for geo_distance).
+	idx_t const_arg_idx = (geo_col.arg_index == 0) ? 1 : 0;
+	ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx], context);
+	if (!const_geo.IsValid() || const_geo.is_envelope) {
+		return false;
+	}
+
+	// Build a modified comparison expression for the ExpressionFilter.
+	// Replace the constant GEOMETRY argument of ST_Distance with a VARCHAR GeoJSON string,
+	// so the filter translator can reconstruct lat/lon and distance.
+	auto modified_expr = comp_expr.Copy();
+	auto &mod_comp = modified_expr->Cast<BoundComparisonExpression>();
+
+	// Get the ST_Distance function expression in the modified copy.
+	auto &mod_func_ref = func_on_left ? mod_comp.left : mod_comp.right;
+	auto &mod_func = mod_func_ref->Cast<BoundFunctionExpression>();
+	mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
+
+	const ColumnIndex &col_index = column_ids[geo_col.col_path.output_col_idx];
+
+	unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
+	if (!geo_col.col_path.nested_fields.empty()) {
+		expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
+	}
+
+	get.table_filters.PushFilter(col_index, std::move(expr_filter));
+	return true;
+}
+
 // Pushdown complex filter callback.
 // Processes all filter expressions in a single pass:
 // - Comparison filters -> ConstantFilter
 // - IS NULL / IS NOT NULL -> IsNullFilter / IsNotNullFilter
 // - IN expressions -> InFilter
 // - LIKE/ILIKE patterns, prefix/suffix/contains -> ExpressionFilter
-// - Geospatial functions (ST_Within etc.) -> ExpressionFilter (with GEOMETRY -> GeoJSON conversion)
+// - ST_Distance comparisons -> ExpressionFilter
+// - ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint -> ExpressionFilter
 //
 // All recognized filters are pushed into get.table_filters and consumed from the filters vector.
 // This approach handles everything in one pass, avoiding the issue where pushing to table_filters
@@ -1125,6 +1244,12 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					    "  - Use the 'query' parameter with native Elasticsearch text queries",
 					    col_name);
 				}
+			}
+
+			// Try geo_distance pushdown first: ST_Distance(...) < N or N > ST_Distance(...).
+			if (TryPushGeoDistanceFilter(context, comp_expr, bind_data, column_ids, get)) {
+				filters[i] = nullptr;
+				continue;
 			}
 
 			// Push comparison as ConstantFilter.
@@ -1226,6 +1351,84 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					    make_uniq<BoundConstantExpression>(Value(std::move(envelope_geojson)));
 				} else if (!const_geo.geojson.empty()) {
 					mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
+				}
+
+				const ColumnIndex &col_index = column_ids[geo_col.col_path.output_col_idx];
+
+				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
+				if (!geo_col.col_path.nested_fields.empty()) {
+					expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
+				}
+
+				get.table_filters.PushFilter(col_index, std::move(expr_filter));
+				filters[i] = nullptr;
+				continue;
+			}
+
+			// Handle ST_DWithin(geom1, geom2, distance) -> geo_distance query.
+			// ST_DWithin is a 3-args function: two geometry arguments and a numeric distance.
+			// However, the spatial extension's Bind function constant-folds the distance argument.
+			// When the distance is a foldable constant (which is the common case), it erases
+			// children[2] and stores the distance in bind_info. So the expression may arrive
+			// with either 2 or 3 children.
+			if (func_name_lower == "st_dwithin") {
+				// Try to find the geo column in arg 0 or arg 1.
+				GeoColumnInfo geo_col = ExtractGeoColumnFromArg(*func_expr.children[0], bind_data, column_ids, 0);
+				if (!geo_col.IsValid()) {
+					geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data, column_ids, 1);
+				}
+				if (!geo_col.IsValid()) {
+					continue;
+				}
+
+				// The other geometry argument must be a constant (the reference point).
+				idx_t const_arg_idx = (geo_col.arg_index == 0) ? 1 : 0;
+				ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx], context);
+				if (!const_geo.IsValid() || const_geo.is_envelope) {
+					continue;
+				}
+
+				// Extract the distance. Two cases:
+				// - 3 children: distance is in children[2] (spatial extension didn't constant-fold it)
+				// - 2 children: distance was erased by the spatial extension's Bind and stored in bind_info
+				double distance_meters = 0;
+				bool distance_found = false;
+
+				if (func_expr.children.size() == 3) {
+					// Case 1: distance is still in the expression as children[2].
+					if (!func_expr.children[2]->IsFoldable()) {
+						continue;
+					}
+					Value dist_val;
+					if (!ExpressionExecutor::TryEvaluateScalar(context, *func_expr.children[2], dist_val)) {
+						continue;
+					}
+					if (dist_val.IsNull() || !dist_val.DefaultTryCastAs(LogicalType::DOUBLE)) {
+						continue;
+					}
+					distance_meters = DoubleValue::Get(dist_val);
+					distance_found = true;
+				} else if (func_expr.bind_info) {
+					// Case 2: the spatial extension erased the distance argument at bind time.
+					// The distance is stored in bind_info with a layout compatible with
+					// SpatialDWithinBindData (double distance as the first data member).
+					auto *dwithin_bind = reinterpret_cast<const SpatialDWithinBindData *>(func_expr.bind_info.get());
+					distance_meters = dwithin_bind->distance;
+					distance_found = true;
+				}
+
+				if (!distance_found || distance_meters < 0) {
+					continue;
+				}
+
+				// Build a modified expression with the GEOMETRY constant replaced by a GeoJSON string.
+				// If the distance was erased from children, re-add it so that the filter translator
+				// (TranslateGeoDistanceDWithin) always sees 3 children.
+				auto modified_expr = filter->Copy();
+				auto &mod_func = modified_expr->Cast<BoundFunctionExpression>();
+				mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
+				if (mod_func.children.size() < 3) {
+					mod_func.children.push_back(make_uniq<BoundConstantExpression>(Value::DOUBLE(distance_meters)));
 				}
 
 				const ColumnIndex &col_index = column_ids[geo_col.col_path.output_col_idx];

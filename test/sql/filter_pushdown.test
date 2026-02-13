@@ -24,18 +24,21 @@
 #   See geospatial pushdown table below.
 #
 # Geospatial pushdown (requires the DuckDB spatial extension):
-# +---------------+--------+------------------+-------------------------------------+-----------+
-# | Predicate     | Status | Spatial relation | Optimization                        | Symmetric |
-# +---------------+--------+------------------+-------------------------------------+-----------+
-# | ST_Within     | PUSHED | within/contains  | ST_MakeEnvelope -> geo_bounding_box | No        |
-# | ST_Contains   | PUSHED | contains/within  | ST_MakeEnvelope -> geo_bounding_box | No        |
-# | ST_Intersects | PUSHED | intersects       | -                                   | Yes       |
-# | ST_Disjoint   | PUSHED | disjoint         | -                                   | Yes       |
-# +---------------+--------+------------------+-------------------------------------+-----------+
+# +---------------+--------+----------------+-------------------------------------+-----------+
+# | Predicate     | Status | Query          | Optimization                        | Symmetric |
+# +---------------+--------+----------------+-------------------------------------+-----------+
+# | ST_Within     | PUSHED | geo_shape/bbox | ST_MakeEnvelope -> geo_bounding_box | No        |
+# | ST_Contains   | PUSHED | geo_shape/bbox | ST_MakeEnvelope -> geo_bounding_box | No        |
+# | ST_Intersects | PUSHED | geo_shape      | –                                   | Yes       |
+# | ST_Disjoint   | PUSHED | geo_shape      | –                                   | Yes       |
+# | ST_DWithin    | PUSHED | geo_distance   | –                                   | Yes       |
+# | ST_Distance   | PUSHED | geo_distance   | –                                   | Yes       |
+# +---------------+--------+----------------+-------------------------------------+-----------+
 #
 # Notes on geospatial pushdown:
 # - The Elasticsearch field must be wrapped in ST_GeomFromGeoJSON(field)
 # - ST_MakeEnvelope is optimized to a geo_bounding_box query in Elasticsearch
+# - ST_DWithin(a, b, distance) is equivalent to ST_Distance(a, b) <= distance
 #
 # Legend:
 # - PUSHED: Filter is translated to Elasticsearch Query DSL
@@ -1328,3 +1331,125 @@ WHERE ST_Within(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry)) AND
       amount > 10;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*amount>10.*
+
+# ST_Distance with < operator: geo_distance pushdown on geo_point field.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_Distance with > operator: geo_distance pushdown with must_not.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) > 10000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_Distance with reversed argument order: constant point first.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location)) < 10000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_Distance with reversed operand order: constant on left.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE 10000 > ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128));
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_Distance on geo_shape field.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749)) < 500000;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_Distance combined with regular filter: both are pushed.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000 AND
+      amount > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*amount>50.*
+
+# ST_DWithin on geo_point field: geo_distance pushdown.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_DWithin on geo_point field with reversed argument order: geo_distance pushdown.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location), 10000);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
+
+# ST_DWithin on geo_shape field: geo_distance pushdown.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749), 500000);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
+
+# ST_DWithin combined with regular filter: both are pushed.
+query II
+EXPLAIN SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000) AND
+      amount > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*amount>50.*

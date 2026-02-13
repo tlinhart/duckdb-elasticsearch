@@ -248,3 +248,150 @@ WHERE ST_Within(ST_GeomFromGeoJSON(location), ST_MakeEnvelope(-10, 30, 10, 55)) 
       amount < 90;
 ----
 Michael Brown
+
+# Test geo_distance query via ST_Distance comparison on geo_point field.
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000;
+----
+Alice Johnson
+Benjamin Lee
+
+# Test geo_distance query via ST_Distance with <= operator.
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) <= 10000;
+----
+Alice Johnson
+Benjamin Lee
+
+# Test geo_distance query via ST_Distance with reversed argument order (constant point first).
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location)) < 10000;
+----
+Alice Johnson
+Benjamin Lee
+
+# Test geo_distance query via ST_Distance with reversed operand order (constant on left).
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE 10000 > ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128));
+----
+Alice Johnson
+Benjamin Lee
+
+# Test geo_distance query via ST_Distance with > operator.
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) > 10000;
+----
+Charlotte Anderson
+Daniel Taylor
+Emma Wilson
+James Garcia
+Michael Brown
+Olivia Davis
+Sophia Martinez
+William Thompson
+
+# Test geo_distance query via ST_Distance on geo_shape field.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749)) < 500000;
+----
+Alice Johnson
+
+# Test geo_distance combined with a regular filter.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000 AND
+      amount > 50;
+----
+Benjamin Lee
+
+# Test geo_distance query via ST_DWithin on geo_point field.
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000);
+----
+Alice Johnson
+Benjamin Lee
+
+# Test geo_distance query via ST_DWithin with reversed argument order (constant point first).
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location), 10000);
+----
+Alice Johnson
+Benjamin Lee
+
+# Test geo_distance query via ST_DWithin on geo_shape field.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749), 500000);
+----
+Alice Johnson
+
+# Test geo_distance via ST_DWithin combined with a regular filter.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000) AND
+      amount > 50;
+----
+Benjamin Lee
