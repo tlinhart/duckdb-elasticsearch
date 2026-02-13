@@ -325,25 +325,27 @@ The extension translates this to the following Elasticsearch query:
 
 The following SQL expressions are translated to Elasticsearch Query DSL:
 
-| SQL expression                 | Elasticsearch query                                                   |
-| ------------------------------ | --------------------------------------------------------------------- |
-| `column = value`               | `{"term": {"column": value}}`                                         |
-| `column != value`              | `{"bool": {"must_not": {"term": {"column": value}}}}`                 |
-| `column < value`               | `{"range": {"column": {"lt": value}}}`                                |
-| `column > value`               | `{"range": {"column": {"gt": value}}}`                                |
-| `column <= value`              | `{"range": {"column": {"lte": value}}}`                               |
-| `column >= value`              | `{"range": {"column": {"gte": value}}}`                               |
-| `column IN (a, b, c)`          | `{"terms": {"column": [a, b, c]}}`                                    |
-| `column LIKE 'prefix%'`        | `{"prefix": {"column": "prefix"}}`                                    |
-| `column LIKE '%suffix'`        | `{"wildcard": {"column": {"value": "*suffix"}}}`                      |
-| `column LIKE '%pattern%'`      | `{"wildcard": {"column": {"value": "*pattern*"}}}`                    |
-| `column ILIKE 'pattern'`       | Case-insensitive wildcard query                                       |
-| `column IS NULL`               | `{"bool": {"must_not": {"exists": {"field": "column"}}}}`             |
-| `column IS NOT NULL`           | `{"exists": {"field": "column"}}`                                     |
-| `ST_Within(column, shape)`     | `{"geo_shape": {"column": {"shape": ..., "relation": "within"}}}`     |
-| `ST_Contains(column, shape)`   | `{"geo_shape": {"column": {"shape": ..., "relation": "contains"}}}`   |
-| `ST_Intersects(column, shape)` | `{"geo_shape": {"column": {"shape": ..., "relation": "intersects"}}}` |
-| `ST_Disjoint(column, shape)`   | `{"geo_shape": {"column": {"shape": ..., "relation": "disjoint"}}}`   |
+| SQL expression                   | Elasticsearch query                                                   |
+| -------------------------------- | --------------------------------------------------------------------- |
+| `column = value`                 | `{"term": {"column": value}}`                                         |
+| `column != value`                | `{"bool": {"must_not": {"term": {"column": value}}}}`                 |
+| `column < value`                 | `{"range": {"column": {"lt": value}}}`                                |
+| `column > value`                 | `{"range": {"column": {"gt": value}}}`                                |
+| `column <= value`                | `{"range": {"column": {"lte": value}}}`                               |
+| `column >= value`                | `{"range": {"column": {"gte": value}}}`                               |
+| `column IN (a, b, c)`            | `{"terms": {"column": [a, b, c]}}`                                    |
+| `column LIKE 'prefix%'`          | `{"prefix": {"column": "prefix"}}`                                    |
+| `column LIKE '%suffix'`          | `{"wildcard": {"column": {"value": "*suffix"}}}`                      |
+| `column LIKE '%pattern%'`        | `{"wildcard": {"column": {"value": "*pattern*"}}}`                    |
+| `column ILIKE 'pattern'`         | Case-insensitive wildcard query                                       |
+| `column IS NULL`                 | `{"bool": {"must_not": {"exists": {"field": "column"}}}}`             |
+| `column IS NOT NULL`             | `{"exists": {"field": "column"}}`                                     |
+| `ST_Within(column, shape)`       | `{"geo_shape": {"column": {"shape": ..., "relation": "within"}}}`     |
+| `ST_Contains(column, shape)`     | `{"geo_shape": {"column": {"shape": ..., "relation": "contains"}}}`   |
+| `ST_Intersects(column, shape)`   | `{"geo_shape": {"column": {"shape": ..., "relation": "intersects"}}}` |
+| `ST_Disjoint(column, shape)`     | `{"geo_shape": {"column": {"shape": ..., "relation": "disjoint"}}}`   |
+| `ST_DWithin(column, point, N)`   | `{"geo_distance": {"distance": "Nm", "column": [lon, lat]}}`          |
+| `ST_Distance(column, point) < N` | `{"geo_distance": {"distance": "Nm", "column": [lon, lat]}}`          |
 
 The following table summarizes the pushdown behavior:
 
@@ -401,22 +403,33 @@ other argument must be a constant geometry expression (e.g. `ST_Point()`,
 
 The following spatial predicates are pushed down:
 
-| Predicate       | Spatial relation    | `ST_MakeEnvelope` optimization | Symmetric |
+| Predicate       | Elasticsearch query | `ST_MakeEnvelope` optimization | Symmetric |
 | --------------- | ------------------- | ------------------------------ | --------- |
-| `ST_Within`     | `within`/`contains` | `geo_bounding_box`             | No        |
-| `ST_Contains`   | `contains`/`within` | `geo_bounding_box`             | No        |
-| `ST_Intersects` | `intersects`        | –                              | Yes       |
-| `ST_Disjoint`   | `disjoint`          | –                              | Yes       |
+| `ST_Within`     | `geo_shape`         | `geo_bounding_box`             | No        |
+| `ST_Contains`   | `geo_shape`         | `geo_bounding_box`             | No        |
+| `ST_Intersects` | `geo_shape`         | –                              | Yes       |
+| `ST_Disjoint`   | `geo_shape`         | –                              | Yes       |
+| `ST_DWithin`    | `geo_distance`      | –                              | Yes       |
+| `ST_Distance`   | `geo_distance`      | –                              | Yes       |
 
 `ST_Within` and `ST_Contains` are asymmetric – the Elasticsearch relation
 depends on which argument is the field and which is the constant shape. For
 example, `ST_Within(column, shape)` means field is within shape (relation
 `within`), while `ST_Within(shape, column)` means shape is within field
 (relation `contains`). `ST_Intersects` and `ST_Disjoint` are symmetric and
-produce the same relation regardless of argument order.
+produce the same relation regardless of argument order. When `ST_MakeEnvelope`
+is used as the constant geometry, the query is optimized to a more efficient
+`geo_bounding_box` query instead of `geo_shape`.
 
-When `ST_MakeEnvelope` is used as the constant geometry, the query is optimized
-to a more efficient `geo_bounding_box` query instead of `geo_shape`.
+`ST_DWithin` and `ST_Distance` comparisons are translated to Elasticsearch
+`geo_distance` queries. `ST_DWithin(column, point, distance)` is equivalent to
+`ST_Distance(column, point) <= distance`. For `ST_Distance`, the operators `<`,
+`<=`, `>` and `>=` are supported. `<` and `<=` produce a `geo_distance` query
+matching points within the given distance, while `>` and `>=` are wrapped in
+`bool.must_not` to match points farther than the given distance. The distance
+is specified in meters. Both argument orders are supported (e.g.
+`ST_Distance(column, point)` and `ST_Distance(point, column)`) as well as
+reversed operand order (e.g. `10000 > ST_Distance(column, point)`).
 
 ## Projection pushdown and filter pruning
 
