@@ -335,90 +335,20 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 		throw InvalidInputException("elasticsearch_query requires 'index' parameter");
 	}
 
-	// Create client to fetch mapping.
-	ElasticsearchClient client(bind_data->config, bind_data->logger);
-	auto mapping_response = client.GetMapping(bind_data->index);
+	// Resolve schema from Elasticsearch (mapping + document sampling), with caching.
+	// On cache hit, no HTTP requests are made. On cache miss, the mapping is fetched and
+	// documents are sampled to detect arrays and unmapped fields.
+	auto schema = ResolveElasticsearchSchema(bind_data->config, bind_data->index, bind_data->base_query,
+	                                         bind_data->sample_size, bind_data->logger);
 
-	if (!mapping_response.success) {
-		throw IOException("Failed to get Elasticsearch mapping: " + mapping_response.error_message);
-	}
-
-	// Parse the mapping response.
-	yyjson_doc *doc = yyjson_read(mapping_response.body.c_str(), mapping_response.body.size(), 0);
-	if (!doc) {
-		throw IOException("Failed to parse Elasticsearch mapping response");
-	}
-
-	yyjson_val *root = yyjson_doc_get_root(doc);
-
-	// Merge mappings from all matching indices.
-	MergeMappingsFromIndices(root, bind_data->all_column_names, bind_data->all_column_types, bind_data->field_paths,
-	                         bind_data->es_types, bind_data->all_mapped_paths);
-
-	// Collect all path types including nested paths.
-	// This is needed for proper filter pushdown on nested struct fields.
-	// Also collect text fields that have a .keyword subfield.
-	std::unordered_map<std::string, std::string> all_path_types;
-	yyjson_obj_iter idx_iter;
-	yyjson_obj_iter_init(root, &idx_iter);
-	yyjson_val *idx_key;
-	while ((idx_key = yyjson_obj_iter_next(&idx_iter))) {
-		yyjson_val *idx_obj = yyjson_obj_iter_get_val(idx_key);
-		yyjson_val *mappings = yyjson_obj_get(idx_obj, "mappings");
-		if (mappings) {
-			yyjson_val *properties = yyjson_obj_get(mappings, "properties");
-			if (properties) {
-				CollectAllPathTypes(properties, "", all_path_types);
-				CollectTextFieldsWithKeyword(properties, "", bind_data->text_fields_with_keyword);
-			}
-		}
-	}
-
-	yyjson_doc_free(doc);
-
-	// Build Elasticsearch type map and identify text fields.
-	// Include both top-level columns and all nested paths.
-	for (size_t i = 0; i < bind_data->all_column_names.size(); i++) {
-		const string &col_name = bind_data->all_column_names[i];
-		const string &es_type = bind_data->es_types[i];
-		bind_data->es_type_map[col_name] = es_type;
-		if (es_type == "text") {
-			bind_data->text_fields.insert(col_name);
-		}
-	}
-
-	// Add all nested paths to es_type_map and text_fields.
-	for (const auto &entry : all_path_types) {
-		bind_data->es_type_map[entry.first] = entry.second;
-		if (entry.second == "text") {
-			bind_data->text_fields.insert(entry.first);
-		}
-	}
-
-	// Sample documents to detect arrays and unmapped fields.
-	// Sampling uses the user-provided query parameter (base_query) if specified, otherwise match_all.
-	// This is the best approximation of the actual query because filter pushdown (WHERE clauses)
-	// happens after bind time, so the final query with pushed-down filters is not known when
-	// sampling occurs. The actual query sent to Elasticsearch might include additional pushed-down
-	// filters that are not reflected in the sampling query.
-	std::string sampling_query = R"({"query": {"match_all": {}}})";
-	if (!bind_data->base_query.empty()) {
-		sampling_query = R"({"query": )" + bind_data->base_query + "}";
-	}
-	if (bind_data->sample_size > 0 && !bind_data->field_paths.empty()) {
-		SampleResult sample_result =
-		    SampleDocuments(client, bind_data->index, sampling_query, bind_data->field_paths, bind_data->es_types,
-		                    bind_data->all_mapped_paths, bind_data->sample_size);
-
-		// Wrap types in LIST for fields detected as arrays.
-		for (size_t i = 0; i < bind_data->field_paths.size(); i++) {
-			if (sample_result.array_fields.count(bind_data->field_paths[i])) {
-				if (bind_data->all_column_types[i].id() != LogicalTypeId::LIST) {
-					bind_data->all_column_types[i] = LogicalType::LIST(bind_data->all_column_types[i]);
-				}
-			}
-		}
-	}
+	bind_data->all_column_names = std::move(schema.all_column_names);
+	bind_data->all_column_types = std::move(schema.all_column_types);
+	bind_data->field_paths = std::move(schema.field_paths);
+	bind_data->es_types = std::move(schema.es_types);
+	bind_data->all_mapped_paths = std::move(schema.all_mapped_paths);
+	bind_data->es_type_map = std::move(schema.es_type_map);
+	bind_data->text_fields = std::move(schema.text_fields);
+	bind_data->text_fields_with_keyword = std::move(schema.text_fields_with_keyword);
 
 	// If no columns found, add a default _source column.
 	if (bind_data->all_column_names.empty()) {

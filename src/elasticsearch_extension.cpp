@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "elasticsearch_extension.hpp"
+#include "elasticsearch_cache.hpp"
 #include "elasticsearch_query.hpp"
 #include "elasticsearch_optimizer.hpp"
 #include "duckdb.hpp"
@@ -21,6 +22,9 @@ namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register table functions.
 	RegisterElasticsearchQueryFunction(loader);
+
+	// Register scalar functions.
+	RegisterElasticsearchClearCacheFunction(loader);
 
 	// Register optimizer extension for LIMIT/OFFSET pushdown.
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());

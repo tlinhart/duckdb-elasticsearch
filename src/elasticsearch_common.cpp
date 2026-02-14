@@ -1,4 +1,5 @@
 #include "elasticsearch_common.hpp"
+#include "elasticsearch_cache.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/date.hpp"
@@ -1670,6 +1671,124 @@ bool IsGeoColumnRef(const Expression &expr) {
 		}
 	}
 	return false;
+}
+
+ElasticsearchSchemaResult ResolveElasticsearchSchema(const ElasticsearchConfig &config, const string &index,
+                                                     const string &base_query, int64_t sample_size,
+                                                     shared_ptr<Logger> logger) {
+	// Check cache first.
+	string cache_key = BuildBindCacheKey(config, index, base_query, sample_size);
+	auto &cache = ElasticsearchBindCache::Instance();
+	const auto *cached = cache.Get(cache_key);
+	if (cached) {
+		// Return a copy of the cached entry.
+		ElasticsearchSchemaResult result;
+		result.all_column_names = cached->all_column_names;
+		result.all_column_types = cached->all_column_types;
+		result.field_paths = cached->field_paths;
+		result.es_types = cached->es_types;
+		result.all_mapped_paths = cached->all_mapped_paths;
+		result.es_type_map = cached->es_type_map;
+		result.text_fields = cached->text_fields;
+		result.text_fields_with_keyword = cached->text_fields_with_keyword;
+		return result;
+	}
+
+	// Cache miss: fetch mapping and sample documents from Elasticsearch.
+	ElasticsearchSchemaResult result;
+
+	ElasticsearchClient client(config, logger);
+	auto mapping_response = client.GetMapping(index);
+
+	if (!mapping_response.success) {
+		throw IOException("Failed to get Elasticsearch mapping: " + mapping_response.error_message);
+	}
+
+	// Parse the mapping response.
+	yyjson_doc *doc = yyjson_read(mapping_response.body.c_str(), mapping_response.body.size(), 0);
+	if (!doc) {
+		throw IOException("Failed to parse Elasticsearch mapping response");
+	}
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+
+	// Merge mappings from all matching indices.
+	MergeMappingsFromIndices(root, result.all_column_names, result.all_column_types, result.field_paths,
+	                         result.es_types, result.all_mapped_paths);
+
+	// Collect all path types including nested paths (needed for filter pushdown on nested struct fields).
+	// Also collect text fields that have a .keyword subfield (needed for filter pushdown on text fields).
+	std::unordered_map<std::string, std::string> all_path_types;
+	yyjson_obj_iter idx_iter;
+	yyjson_obj_iter_init(root, &idx_iter);
+	yyjson_val *idx_key;
+	while ((idx_key = yyjson_obj_iter_next(&idx_iter))) {
+		yyjson_val *idx_obj = yyjson_obj_iter_get_val(idx_key);
+		yyjson_val *mappings = yyjson_obj_get(idx_obj, "mappings");
+		if (mappings) {
+			yyjson_val *properties = yyjson_obj_get(mappings, "properties");
+			if (properties) {
+				CollectAllPathTypes(properties, "", all_path_types);
+				CollectTextFieldsWithKeyword(properties, "", result.text_fields_with_keyword);
+			}
+		}
+	}
+
+	yyjson_doc_free(doc);
+
+	// Build Elasticsearch type map and identify text fields from top-level columns.
+	for (size_t i = 0; i < result.all_column_names.size(); i++) {
+		const string &col_name = result.all_column_names[i];
+		const string &es_type = result.es_types[i];
+		result.es_type_map[col_name] = es_type;
+		if (es_type == "text") {
+			result.text_fields.insert(col_name);
+		}
+	}
+
+	// Add all nested paths to es_type_map and text_fields.
+	for (const auto &entry : all_path_types) {
+		result.es_type_map[entry.first] = entry.second;
+		if (entry.second == "text") {
+			result.text_fields.insert(entry.first);
+		}
+	}
+
+	// Sample documents to detect arrays and unmapped fields.
+	// Uses the user-provided query (base_query) if specified, otherwise match_all.
+	// This is the best approximation of the actual query because filter pushdown (WHERE clauses)
+	// happens after bind time, so the final query with pushed-down filters is not yet known.
+	std::string sampling_query = R"({"query": {"match_all": {}}})";
+	if (!base_query.empty()) {
+		sampling_query = R"({"query": )" + base_query + "}";
+	}
+	if (sample_size > 0 && !result.field_paths.empty()) {
+		SampleResult sample_result = SampleDocuments(client, index, sampling_query, result.field_paths, result.es_types,
+		                                             result.all_mapped_paths, sample_size);
+
+		// Wrap types in LIST for fields detected as arrays.
+		for (size_t i = 0; i < result.field_paths.size(); i++) {
+			if (sample_result.array_fields.count(result.field_paths[i])) {
+				if (result.all_column_types[i].id() != LogicalTypeId::LIST) {
+					result.all_column_types[i] = LogicalType::LIST(result.all_column_types[i]);
+				}
+			}
+		}
+	}
+
+	// Store in cache for subsequent bind calls with the same parameters.
+	ElasticsearchBindCacheEntry cache_entry;
+	cache_entry.all_column_names = result.all_column_names;
+	cache_entry.all_column_types = result.all_column_types;
+	cache_entry.field_paths = result.field_paths;
+	cache_entry.es_types = result.es_types;
+	cache_entry.all_mapped_paths = result.all_mapped_paths;
+	cache_entry.es_type_map = result.es_type_map;
+	cache_entry.text_fields = result.text_fields;
+	cache_entry.text_fields_with_keyword = result.text_fields_with_keyword;
+	cache.Put(cache_key, std::move(cache_entry));
+
+	return result;
 }
 
 } // namespace duckdb

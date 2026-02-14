@@ -64,6 +64,25 @@ struct SampleResult {
 	bool has_unmapped_fields;           // whether any unmapped fields were found in the sample
 };
 
+// Result of resolving the full schema for an Elasticsearch index.
+// Contains all mapping and sampling information needed by the bind function.
+struct ElasticsearchSchemaResult {
+	vector<string> all_column_names;
+	vector<LogicalType> all_column_types; // final types (after array wrapping from sampling)
+	vector<string> field_paths;
+	vector<string> es_types;
+	std::set<string> all_mapped_paths;
+	std::unordered_map<string, string> es_type_map;
+	std::unordered_set<string> text_fields;
+	std::unordered_set<string> text_fields_with_keyword;
+};
+
+// Resolve schema for an Elasticsearch index, with caching.
+// Fetches the index mapping and samples documents on cache miss; returns cached data on cache hit.
+ElasticsearchSchemaResult ResolveElasticsearchSchema(const ElasticsearchConfig &config, const string &index,
+                                                     const string &base_query, int64_t sample_size,
+                                                     shared_ptr<Logger> logger = nullptr);
+
 // Sample documents to detect arrays and unmapped fields.
 SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &index, const std::string &query,
                              const vector<string> &field_paths, const vector<string> &es_types,
