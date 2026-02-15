@@ -4,15 +4,22 @@
 
 # Verify the extension isn't loaded by default.
 query I
-SELECT COUNT(*) FROM duckdb_extensions()
+SELECT count(*) FROM duckdb_extensions()
 WHERE extension_name = 'elasticsearch' AND loaded = true;
 ----
 0
 
 # Verify the elasticsearch_query function doesn't exist before loading the extension.
 query I
-SELECT COUNT(*) FROM duckdb_functions()
+SELECT count(*) FROM duckdb_functions()
 WHERE function_name = 'elasticsearch_query';
+----
+0
+
+# Verify the elasticsearch_clear_cache function doesn't exist before loading the extension.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_clear_cache';
 ----
 0
 
@@ -20,21 +27,56 @@ require elasticsearch
 
 # Verify the extension is loaded.
 query I
-SELECT COUNT(*) FROM duckdb_extensions()
+SELECT count(*) FROM duckdb_extensions()
 WHERE extension_name = 'elasticsearch' AND loaded = true;
 ----
 1
 
 # Verify the elasticsearch_query function is registered.
-query I
-SELECT COUNT(*) FROM duckdb_functions()
+query II
+SELECT function_type, return_type
+FROM duckdb_functions()
 WHERE function_name = 'elasticsearch_query';
 ----
-1
+table	NULL
 
-# Verify it is registered as a table function.
-query I
-SELECT function_type FROM duckdb_functions()
-WHERE function_name = 'elasticsearch_query';
+# Verify parameter names and types.
+query II
+SELECT unnest(list_zip(parameters, parameter_types), recursive := true)
+FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_query'
+ORDER BY 1;
 ----
-table
+host						VARCHAR
+index						VARCHAR
+max_retries					INTEGER
+password					VARCHAR
+port						INTEGER
+query						VARCHAR
+retry_backoff_factor		DOUBLE
+retry_interval				INTEGER
+sample_size					INTEGER
+timeout						INTEGER
+use_ssl						BOOLEAN
+username					VARCHAR
+verify_ssl					BOOLEAN
+
+# The index parameter is required.
+statement error
+SELECT * FROM elasticsearch_query();
+----
+requires 'index' parameter
+
+# Unknown parameters should be rejected.
+statement error
+SELECT * FROM elasticsearch_query(index := 'test', unknown_param := 'value');
+----
+Invalid named parameter
+
+# Verify the elasticsearch_clear_cache function is registered.
+query III
+SELECT function_type, parameters, return_type
+FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_clear_cache';
+----
+scalar	[]	BOOLEAN
