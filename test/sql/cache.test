@@ -1,0 +1,213 @@
+# name: test/sql/cache.test
+# description: Test bind cache
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+require noforcestorage
+
+# Enable HTTP logging so every test case can verify cache hits/misses by checking requests
+# to the _mapping endpoint in DuckDB's HTTP log. The _mapping endpoint is only called during
+# bind (never during scan), making it an unambiguous indicator of a cache miss.
+statement ok
+CALL enable_logging('HTTP');
+
+# Test simple query: cache miss -> cache hit -> clear cache -> cache miss.
+
+# Start with a clean cache and empty logs.
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First query.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Verify exactly one _mapping request was logged (cache miss).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Truncate logs before the next query.
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second identical query: should not make any _mapping request.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Verify no _mapping request was logged (cache hit).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+0
+
+# Truncate logs and clear cache.
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+# Third query after cache clear.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Verify _mapping request was logged again (cache miss).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Test CTE referenced multiple times: multiple bind calls, single cache miss.
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# CTE referenced in two subqueries triggers multiple bind calls with the same parameters.
+# The cache ensures only one _mapping request is made.
+query II
+WITH data AS (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+)
+SELECT
+    (SELECT count(*) FROM data),
+    (SELECT avg(amount) FROM data);
+----
+10	49.8
+
+# Verify only one _mapping request despite multiple bind calls.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Test CTE self-join: multiple bind calls, single cache miss.
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# CTE referenced in a self-join triggers multiple bind calls with the same parameters.
+# The cache ensures only one _mapping request is made.
+query I
+WITH data AS (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+)
+SELECT count(*) FROM data d1
+INNER JOIN data d2 ON d1._id = d2._id;
+----
+10
+
+# Verify only one _mapping request despite multiple bind calls.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Test different sample_size: different cache key, separate cache miss.
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# With default sample_size (sampling enabled), colors is detected as an array.
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+VARCHAR[]
+
+# Verify one _mapping request (cache miss).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Truncate logs before the next query.
+statement ok
+CALL truncate_duckdb_logs();
+
+# With sample_size=0 (disabled sampling), colors is not detected as an array.
+# This uses a different cache key due to the different sample_size parameter.
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    sample_size := 0
+)
+WHERE _id = '1';
+----
+VARCHAR
+
+# Verify one _mapping request (cache miss).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Clear cache and disable logging to avoid polluting other tests.
+query I
+SELECT elasticsearch_clear_cache();
+----
+true
+
+statement ok
+CALL disable_logging();
