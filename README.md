@@ -37,7 +37,7 @@ objects, geo types, and multi-index queries.
 - Supports multi-index queries (e.g. `logs-*`) with automatic mapping merging.
 - Array fields are detected by sampling documents.
 - Schema resolution results (index mappings and document sampling) are cached.
-- Unmapped/dynamic fields are collected into a JSON column.
+- Unmapped/dynamic fields are collected into a `JSON` column.
 
 ### Type support
 
@@ -181,17 +181,17 @@ RESET elasticsearch_sample_size;
 
 The following table lists all available settings:
 
-| Setting name                                | Type    | Default value | Description                                                                        |
-| ------------------------------------------- | ------- | ------------- | ---------------------------------------------------------------------------------- |
-| `elasticsearch_verify_ssl`                  | BOOLEAN | `true`        | Whether to verify SSL certificates                                                 |
-| `elasticsearch_timeout`                     | INTEGER | `30000`       | Request timeout in milliseconds                                                    |
-| `elasticsearch_max_retries`                 | INTEGER | `3`           | Maximum retry attempts for transient errors                                        |
-| `elasticsearch_retry_interval`              | INTEGER | `100`         | Initial retry wait time in milliseconds                                            |
-| `elasticsearch_retry_backoff_factor`        | DOUBLE  | `2.0`         | Exponential backoff multiplier                                                     |
-| `elasticsearch_sample_size`                 | INTEGER | `100`         | Documents to sample for array detection (`0` to disable)                           |
-| `elasticsearch_batch_size`                  | INTEGER | `1000`        | Documents fetched per scroll batch                                                 |
-| `elasticsearch_batch_size_threshold_factor` | INTEGER | `5`           | For small `LIMIT`s, fetch all rows in one request if total <= batch size \* factor |
-| `elasticsearch_scroll_time`                 | VARCHAR | `5m`          | Scroll context keep-alive duration (e.g. `5m`, `1h`)                               |
+| Setting name                                | Type      | Default value | Description                                                                        |
+| ------------------------------------------- | --------- | ------------- | ---------------------------------------------------------------------------------- |
+| `elasticsearch_verify_ssl`                  | `BOOLEAN` | `true`        | Whether to verify SSL certificates                                                 |
+| `elasticsearch_timeout`                     | `INTEGER` | `30000`       | Request timeout in milliseconds                                                    |
+| `elasticsearch_max_retries`                 | `INTEGER` | `3`           | Maximum retry attempts for transient errors                                        |
+| `elasticsearch_retry_interval`              | `INTEGER` | `100`         | Initial retry wait time in milliseconds                                            |
+| `elasticsearch_retry_backoff_factor`        | `DOUBLE`  | `2.0`         | Exponential backoff multiplier                                                     |
+| `elasticsearch_sample_size`                 | `INTEGER` | `100`         | Documents to sample for array detection (`0` to disable)                           |
+| `elasticsearch_batch_size`                  | `INTEGER` | `1000`        | Documents fetched per scroll batch                                                 |
+| `elasticsearch_batch_size_threshold_factor` | `INTEGER` | `5`           | For small `LIMIT`s, fetch all rows in one request if total <= batch size \* factor |
+| `elasticsearch_scroll_time`                 | `VARCHAR` | `5m`          | Scroll context keep-alive duration (e.g. `5m`, `1h`)                               |
 
 Changing `elasticsearch_sample_size` automatically clears the
 [bind cache](#bind-cache).
@@ -206,21 +206,21 @@ The `elasticsearch_query` table function allows querying Elasticsearch indices.
 
 The following table lists the parameters that the function supports:
 
-| Parameter name           | Type    | Default value          | Description                                 |
-| ------------------------ | ------- | ---------------------- | ------------------------------------------- |
-| `host`                   | VARCHAR | `localhost` (required) | Elasticsearch hostname or IP address        |
-| `port`                   | INTEGER | `9200`                 | Elasticsearch HTTP port                     |
-| `index`                  | VARCHAR | – (required)           | Index name or pattern (e.g. `logs-*`)       |
-| `query`                  | VARCHAR | –                      | Optional Elasticsearch query clause         |
-| `username`               | VARCHAR | –                      | Username for HTTP basic authentication      |
-| `password`               | VARCHAR | –                      | Password for HTTP basic authentication      |
-| `use_ssl`                | BOOLEAN | `false`                | Use HTTPS instead of HTTP                   |
-| `verify_ssl`\*           | BOOLEAN | `true`                 | Verify SSL certificates                     |
-| `timeout`\*              | INTEGER | `30000`                | Request timeout in milliseconds             |
-| `max_retries`\*          | INTEGER | `3`                    | Maximum retry attempts for transient errors |
-| `retry_interval`\*       | INTEGER | `100`                  | Initial retry wait time in milliseconds     |
-| `retry_backoff_factor`\* | DOUBLE  | `2.0`                  | Exponential backoff multiplier              |
-| `sample_size`\*          | INTEGER | `100`                  | Documents to sample for array detection     |
+| Parameter name           | Type      | Default value          | Description                                 |
+| ------------------------ | --------- | ---------------------- | ------------------------------------------- |
+| `host`                   | `VARCHAR` | `localhost` (required) | Elasticsearch hostname or IP address        |
+| `port`                   | `INTEGER` | `9200`                 | Elasticsearch HTTP port                     |
+| `index`                  | `VARCHAR` | – (required)           | Index name or pattern (e.g. `logs-*`)       |
+| `query`                  | `VARCHAR` | –                      | Optional Elasticsearch query clause         |
+| `username`               | `VARCHAR` | –                      | Username for HTTP basic authentication      |
+| `password`               | `VARCHAR` | –                      | Password for HTTP basic authentication      |
+| `use_ssl`                | `BOOLEAN` | `false`                | Use HTTPS instead of HTTP                   |
+| `verify_ssl`\*           | `BOOLEAN` | `true`                 | Verify SSL certificates                     |
+| `timeout`\*              | `INTEGER` | `30000`                | Request timeout in milliseconds             |
+| `max_retries`\*          | `INTEGER` | `3`                    | Maximum retry attempts for transient errors |
+| `retry_interval`\*       | `INTEGER` | `100`                  | Initial retry wait time in milliseconds     |
+| `retry_backoff_factor`\* | `DOUBLE`  | `2.0`                  | Exponential backoff multiplier              |
+| `sample_size`\*          | `INTEGER` | `100`                  | Documents to sample for array detection     |
 
 \* Default value inherited from the corresponding
 [extension setting](#configuration). When specified, the named parameter
