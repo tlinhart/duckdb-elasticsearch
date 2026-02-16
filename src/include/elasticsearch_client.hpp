@@ -33,6 +33,9 @@ public:
 	explicit ElasticsearchClient(const ElasticsearchConfig &config, shared_ptr<Logger> logger = nullptr);
 	~ElasticsearchClient();
 
+	// Plain search (no scroll context). Suitable for bounded result sets (e.g. sampling).
+	ElasticsearchResponse Search(const std::string &index, const std::string &query, int64_t size);
+
 	// Scroll API for large result sets.
 	ElasticsearchResponse ScrollSearch(const std::string &index, const std::string &query,
 	                                   const std::string &scroll_time = "1m", int64_t size = 1000);

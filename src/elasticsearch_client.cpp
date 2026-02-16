@@ -225,6 +225,11 @@ ElasticsearchResponse ElasticsearchClient::PerformRequestWithRetry(const std::st
 	return response;
 }
 
+ElasticsearchResponse ElasticsearchClient::Search(const std::string &index, const std::string &query, int64_t size) {
+	std::string path = "/" + index + "/_search?size=" + std::to_string(size);
+	return PerformRequestWithRetry("POST", path, query);
+}
+
 ElasticsearchResponse ElasticsearchClient::ScrollSearch(const std::string &index, const std::string &query,
                                                         const std::string &scroll_time, int64_t size) {
 	std::string path = "/" + index + "/_search?scroll=" + scroll_time + "&size=" + std::to_string(size);

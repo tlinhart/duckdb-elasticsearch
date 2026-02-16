@@ -1001,27 +1001,31 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 		return check_recursive(obj, prefix);
 	};
 
-	// Helper lambda to check if we have found everything we're looking for.
-	auto all_detected = [&]() -> bool {
-		bool all_arrays_found = (result.array_fields.size() + skip_fields.size() >= field_paths.size());
-		return all_arrays_found && result.has_unmapped_fields;
-	};
+	// Fetch sample documents using a plain search (no scroll context needed).
+	// The size parameter limits the result to sample_size documents in a single request.
+	auto response = client.Search(index, query, sample_size);
+	if (!response.success) {
+		// If sampling fails, return empty result (conservative: no arrays/unmapped detected).
+		return result;
+	}
 
-	// Helper lambda to process documents from a batch and check for arrays and unmapped fields.
-	auto process_batch = [&](yyjson_val *hits_array, int64_t &docs_remaining) -> void {
+	yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
+	if (!doc) {
+		return result;
+	}
+
+	yyjson_val *root = yyjson_doc_get_root(doc);
+	yyjson_val *hits_obj = yyjson_obj_get(root, "hits");
+	yyjson_val *hits_array = hits_obj ? yyjson_obj_get(hits_obj, "hits") : nullptr;
+
+	if (hits_array && yyjson_is_arr(hits_array)) {
 		size_t idx, max;
 		yyjson_val *hit;
 		yyjson_arr_foreach(hits_array, idx, max, hit) {
-			if (docs_remaining <= 0 || all_detected()) {
-				break;
-			}
-
 			yyjson_val *source = yyjson_obj_get(hit, "_source");
 			if (!source) {
 				continue;
 			}
-
-			docs_remaining--;
 
 			// Check for unmapped fields (only if not already detected).
 			if (!result.has_unmapped_fields) {
@@ -1045,62 +1049,16 @@ SampleResult SampleDocuments(ElasticsearchClient &client, const std::string &ind
 					result.array_fields.insert(field_path);
 				}
 			}
-		}
-	};
 
-	// Use scroll API to fetch documents in batches until we have sampled enough or exhausted results.
-	// The batch size is controlled by the URL parameter in ScrollSearch().
-	int64_t docs_remaining = sample_size;
-	std::string scroll_id;
-
-	// Initial search request.
-	auto response = client.ScrollSearch(index, query, "1m", sample_size);
-	if (!response.success) {
-		// If sampling fails, return empty result (conservative: no arrays/unmapped detected).
-		return result;
-	}
-
-	// Process batches until we have sampled enough documents or exhausted results.
-	while (docs_remaining > 0 && !all_detected()) {
-		yyjson_doc *doc = yyjson_read(response.body.c_str(), response.body.size(), 0);
-		if (!doc) {
-			break;
-		}
-
-		yyjson_val *root = yyjson_doc_get_root(doc);
-		yyjson_val *hits_obj = yyjson_obj_get(root, "hits");
-		yyjson_val *hits_array = hits_obj ? yyjson_obj_get(hits_obj, "hits") : nullptr;
-
-		// Extract scroll_id for cleanup and subsequent requests.
-		yyjson_val *scroll_id_val = yyjson_obj_get(root, "_scroll_id");
-		if (scroll_id_val && yyjson_is_str(scroll_id_val)) {
-			scroll_id = yyjson_get_str(scroll_id_val);
-		}
-
-		if (!hits_array || !yyjson_is_arr(hits_array) || yyjson_arr_size(hits_array) == 0) {
-			// No more documents to process.
-			yyjson_doc_free(doc);
-			break;
-		}
-
-		process_batch(hits_array, docs_remaining);
-		yyjson_doc_free(doc);
-
-		// Check if we need more documents.
-		if (docs_remaining > 0 && !all_detected() && !scroll_id.empty()) {
-			response = client.ScrollNext(scroll_id, "1m");
-			if (!response.success) {
+			// Early exit if all arrays and unmapped fields have been detected.
+			bool all_arrays_found = (result.array_fields.size() + skip_fields.size() >= field_paths.size());
+			if (all_arrays_found && result.has_unmapped_fields) {
 				break;
 			}
-		} else {
-			break;
 		}
 	}
 
-	// Clean up the scroll context.
-	if (!scroll_id.empty()) {
-		client.ClearScroll(scroll_id);
-	}
+	yyjson_doc_free(doc);
 
 	return result;
 }
