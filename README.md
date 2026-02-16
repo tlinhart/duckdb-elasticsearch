@@ -36,6 +36,7 @@ objects, geo types, and multi-index queries.
 - Schema is inferred from Elasticsearch index mappings at query time.
 - Supports multi-index queries (e.g. `logs-*`) with automatic mapping merging.
 - Array fields are detected by sampling documents.
+- Schema resolution results (index mappings and document sampling) are cached.
 - Unmapped/dynamic fields are collected into a JSON column.
 
 ### Type support
@@ -210,8 +211,8 @@ The `elasticsearch_query` function returns a table with:
 
 #### How it works
 
-1. Bind phase – fetches index mapping from Elasticsearch, infers DuckDB schema
-   and optionally samples documents to detect array fields.
+1. Bind phase – resolves DuckDB schema from Elasticsearch index mapping and
+   optional document sampling and caches the results.
 1. Filter pushdown – DuckDB's optimizer pushes `WHERE` clauses to the extension
    which translates them to Elasticsearch Query DSL.
 1. Projection pushdown – only requested columns are included in the `_source`
@@ -319,6 +320,19 @@ The extension translates this to the following Elasticsearch query:
   },
   "_source": ["name"]
 }
+```
+
+## Scalar functions
+
+### `elasticsearch_clear_cache`
+
+The `elasticsearch_clear_cache` scalar function clears the in-process bind
+cache and returns `true` on success. Use this when the Elasticsearch index
+mapping might have changed and you want to force a fresh schema resolution on
+the next query.
+
+```sql
+SELECT elasticsearch_clear_cache();
 ```
 
 ## Filter pushdown
@@ -534,6 +548,20 @@ The following query shows how to extract values from the `_unmapped_` column:
 SELECT _unmapped_->>'$.extra.note' FROM elasticsearch_query(...)
 WHERE _unmapped_ IS NOT NULL;
 ```
+
+## Bind cache
+
+Schema resolution results (index mappings and document sampling) are cached
+in-process. Repeated queries with the same parameters skip HTTP requests to
+Elasticsearch, which is useful for CTEs referenced multiple times, self-joins,
+`UNPIVOT ... ON COLUMNS(*)` and similar patterns where DuckDB calls bind
+multiple times.
+
+The cache key includes `host`, `port`, `index`, credentials, SSL settings,
+`query` and `sample_size`. Transport-level settings (`timeout`, `max_retries`
+etc.) are excluded since they don't affect the schema.
+
+Call `elasticsearch_clear_cache()` to invalidate all cached entries.
 
 ## HTTP logging
 
