@@ -43,14 +43,6 @@ string BuildBindCacheKey(const ElasticsearchConfig &config, const string &index,
 	key += '\0';
 	key += base_query;
 	key += '\0';
-	key += config.username;
-	key += '\0';
-	key += config.password;
-	key += '\0';
-	key += config.use_ssl ? "1" : "0";
-	key += '\0';
-	key += config.verify_ssl ? "1" : "0";
-	key += '\0';
 	key += to_string(sample_size);
 	return key;
 }

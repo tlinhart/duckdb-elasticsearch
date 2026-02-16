@@ -50,9 +50,9 @@ private:
 };
 
 // Build a cache key from the resolved Elasticsearch configuration and query parameters.
-// Includes all parameters that affect the bind result (host, port, index, credentials, SSL settings,
-// base query, sample size). Transport-level settings (timeout, retries) are excluded since they
-// don't affect the schema.
+// Includes parameters that affect the bind result: host, port, index, base query and sample size.
+// Connection settings (credentials, SSL) and transport settings (timeout, retries) are excluded
+// since they don't affect the schema.
 string BuildBindCacheKey(const ElasticsearchConfig &config, const string &index, const string &base_query,
                          int64_t sample_size);
 

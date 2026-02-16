@@ -591,9 +591,9 @@ Elasticsearch, which is useful for CTEs referenced multiple times, self-joins,
 `UNPIVOT ... ON COLUMNS(*)` and similar patterns where DuckDB calls bind
 multiple times.
 
-The cache key includes `host`, `port`, `index`, credentials, SSL settings,
-`query` and `sample_size`. Transport-level settings (`timeout`, `max_retries`
-etc.) are excluded since they don't affect the schema.
+The cache key includes `host`, `port`, `index`, `query` and `sample_size`.
+Connection settings (credentials, SSL) and transport settings (`timeout`,
+`max_retries` etc.) are excluded since they don't affect the schema.
 
 Changing `elasticsearch_sample_size` via `SET` automatically clears the cache.
 To manually invalidate all cached entries, call `elasticsearch_clear_cache()`.
