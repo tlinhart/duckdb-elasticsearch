@@ -56,6 +56,10 @@ private:
 string BuildBindCacheKey(const ElasticsearchConfig &config, const string &index, const string &base_query,
                          int64_t sample_size);
 
+// Callback for extension settings that affect the bind cache (e.g. elasticsearch_sample_size).
+// Clears the bind cache when the setting is changed so that stale schema results are not reused.
+void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter);
+
 // Register the elasticsearch_clear_cache() scalar function.
 void RegisterElasticsearchClearCacheFunction(ExtensionLoader &loader);
 

@@ -168,6 +168,34 @@ extension manually:
 LOAD 'build/release/extension/elasticsearch/elasticsearch.duckdb_extension';
 ```
 
+## Configuration
+
+The extension provides settings that control connection behavior, scan
+parameters and schema inference. Settings are session-scoped and can be changed
+with `SET` and reverted with `RESET`:
+
+```sql
+SET elasticsearch_sample_size = 200;
+RESET elasticsearch_sample_size;
+```
+
+The following table lists all available settings:
+
+| Setting name                                | Type    | Default value | Description                                                                        |
+| ------------------------------------------- | ------- | ------------- | ---------------------------------------------------------------------------------- |
+| `elasticsearch_verify_ssl`                  | BOOLEAN | `true`        | Whether to verify SSL certificates                                                 |
+| `elasticsearch_timeout`                     | INTEGER | `30000`       | Request timeout in milliseconds                                                    |
+| `elasticsearch_max_retries`                 | INTEGER | `3`           | Maximum retry attempts for transient errors                                        |
+| `elasticsearch_retry_interval`              | INTEGER | `100`         | Initial retry wait time in milliseconds                                            |
+| `elasticsearch_retry_backoff_factor`        | DOUBLE  | `2.0`         | Exponential backoff multiplier                                                     |
+| `elasticsearch_sample_size`                 | INTEGER | `100`         | Documents to sample for array detection (`0` to disable)                           |
+| `elasticsearch_batch_size`                  | INTEGER | `1000`        | Documents fetched per scroll batch                                                 |
+| `elasticsearch_batch_size_threshold_factor` | INTEGER | `5`           | For small `LIMIT`s, fetch all rows in one request if total <= batch size \* factor |
+| `elasticsearch_scroll_time`                 | VARCHAR | `5m`          | Scroll context keep-alive duration (e.g. `5m`, `1h`)                               |
+
+Changing `elasticsearch_sample_size` automatically clears the
+[bind cache](#bind-cache).
+
 ## Table functions
 
 ### `elasticsearch_query`
@@ -178,21 +206,25 @@ The `elasticsearch_query` table function allows querying Elasticsearch indices.
 
 The following table lists the parameters that the function supports:
 
-| Parameter name         | Type    | Default value          | Description                                 |
-| ---------------------- | ------- | ---------------------- | ------------------------------------------- |
-| `host`                 | VARCHAR | `localhost` (required) | Elasticsearch hostname or IP address        |
-| `port`                 | INTEGER | `9200`                 | Elasticsearch HTTP port                     |
-| `index`                | VARCHAR | – (required)           | Index name or pattern (e.g. `logs-*`)       |
-| `query`                | VARCHAR | –                      | Optional Elasticsearch query clause         |
-| `username`             | VARCHAR | –                      | Username for HTTP basic authentication      |
-| `password`             | VARCHAR | –                      | Password for HTTP basic authentication      |
-| `use_ssl`              | BOOLEAN | `false`                | Use HTTPS instead of HTTP                   |
-| `verify_ssl`           | BOOLEAN | `true`                 | Verify SSL certificates                     |
-| `timeout`              | INTEGER | `30000`                | Request timeout in milliseconds             |
-| `max_retries`          | INTEGER | `3`                    | Maximum retry attempts for transient errors |
-| `retry_interval`       | INTEGER | `100`                  | Initial retry wait time in milliseconds     |
-| `retry_backoff_factor` | DOUBLE  | `2.0`                  | Exponential backoff multiplier              |
-| `sample_size`          | INTEGER | `100`                  | Documents to sample for array detection     |
+| Parameter name           | Type    | Default value          | Description                                 |
+| ------------------------ | ------- | ---------------------- | ------------------------------------------- |
+| `host`                   | VARCHAR | `localhost` (required) | Elasticsearch hostname or IP address        |
+| `port`                   | INTEGER | `9200`                 | Elasticsearch HTTP port                     |
+| `index`                  | VARCHAR | – (required)           | Index name or pattern (e.g. `logs-*`)       |
+| `query`                  | VARCHAR | –                      | Optional Elasticsearch query clause         |
+| `username`               | VARCHAR | –                      | Username for HTTP basic authentication      |
+| `password`               | VARCHAR | –                      | Password for HTTP basic authentication      |
+| `use_ssl`                | BOOLEAN | `false`                | Use HTTPS instead of HTTP                   |
+| `verify_ssl`\*           | BOOLEAN | `true`                 | Verify SSL certificates                     |
+| `timeout`\*              | INTEGER | `30000`                | Request timeout in milliseconds             |
+| `max_retries`\*          | INTEGER | `3`                    | Maximum retry attempts for transient errors |
+| `retry_interval`\*       | INTEGER | `100`                  | Initial retry wait time in milliseconds     |
+| `retry_backoff_factor`\* | DOUBLE  | `2.0`                  | Exponential backoff multiplier              |
+| `sample_size`\*          | INTEGER | `100`                  | Documents to sample for array detection     |
+
+\* Default value inherited from the corresponding
+[extension setting](#configuration). When specified, the named parameter
+overrides the setting value for that query.
 
 The `query` parameter accepts an Elasticsearch query clause (e.g.
 `{"match": {"name": "alice"}}`), not a full request body. If provided, the
@@ -510,10 +542,12 @@ The following table summarizes Elasticsearch to DuckDB type mapping:
 Elasticsearch mappings don't distinguish between scalar fields and arrays. The
 extension detects arrays by sampling documents:
 
-- Sample `sample_size` documents.
-- If any document has an array value for a field, wrap the type in `LIST(...)`.
-- Set `sample_size := 0` to disable array detection (all fields will be treated
-  as scalars).
+- Sample documents from the index (controlled by `elasticsearch_sample_size`,
+  default `100`).
+- If any sampled document has an array value for a field, wrap the type in
+  `LIST(...)`.
+- Set `elasticsearch_sample_size` to `0` (or pass `sample_size := 0` to the
+  function) to disable array detection. All fields will be treated as scalars.
 
 ### Geospatial types
 
@@ -561,7 +595,8 @@ The cache key includes `host`, `port`, `index`, credentials, SSL settings,
 `query` and `sample_size`. Transport-level settings (`timeout`, `max_retries`
 etc.) are excluded since they don't affect the schema.
 
-Call `elasticsearch_clear_cache()` to invalidate all cached entries.
+Changing `elasticsearch_sample_size` via `SET` automatically clears the cache.
+To manually invalidate all cached entries, call `elasticsearch_clear_cache()`.
 
 ## HTTP logging
 

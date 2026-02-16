@@ -64,8 +64,15 @@ struct ElasticsearchQueryBindData : public TableFunctionData {
 	// Set of text fields that have a .keyword subfield (enables filter pushdown).
 	unordered_set<string> text_fields_with_keyword;
 
-	// Sample size for array detection (0 = disabled, default = 100).
-	int64_t sample_size = 100;
+	// Sample size for array detection (0 = disabled).
+	// Populated from elasticsearch_sample_size setting, overridable by named parameter.
+	int64_t sample_size;
+
+	// Scroll and batch settings.
+	// Populated from extension settings, not overridable by named parameters.
+	int64_t batch_size;                  // from elasticsearch_batch_size
+	int64_t batch_size_threshold_factor; // from elasticsearch_batch_size_threshold_factor
+	std::string scroll_time;             // from elasticsearch_scroll_time
 
 	// Limit pushdown values (set by optimizer extension).
 	// -1 means no limit, 0 means no offset.
@@ -296,7 +303,43 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 		bind_data->logger = context.logger;
 	}
 
-	// Parse arguments.
+	// Initialize defaults for parameters that are not backed by extension settings.
+	bind_data->config.host = "localhost";
+	bind_data->config.port = 9200;
+	bind_data->config.use_ssl = false;
+
+	// Initialize defaults from extension settings.
+	// These are the single source of truth for default values (registered in LoadInternal).
+	Value setting_val;
+	if (context.TryGetCurrentSetting("elasticsearch_verify_ssl", setting_val)) {
+		bind_data->config.verify_ssl = BooleanValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_timeout", setting_val)) {
+		bind_data->config.timeout = IntegerValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_max_retries", setting_val)) {
+		bind_data->config.max_retries = IntegerValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_retry_interval", setting_val)) {
+		bind_data->config.retry_interval = IntegerValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_retry_backoff_factor", setting_val)) {
+		bind_data->config.retry_backoff_factor = DoubleValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_sample_size", setting_val)) {
+		bind_data->sample_size = IntegerValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_batch_size", setting_val)) {
+		bind_data->batch_size = IntegerValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_batch_size_threshold_factor", setting_val)) {
+		bind_data->batch_size_threshold_factor = IntegerValue::Get(setting_val);
+	}
+	if (context.TryGetCurrentSetting("elasticsearch_scroll_time", setting_val)) {
+		bind_data->scroll_time = StringValue::Get(setting_val);
+	}
+
+	// Parse named parameters (override settings when explicitly specified).
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "host") {
 			bind_data->config.host = StringValue::Get(kv.second);
@@ -462,18 +505,17 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	// Create client.
 	state->client = make_uniq<ElasticsearchClient>(bind_data.config, bind_data.logger);
 
-	// Determine batch size. For small query limits (up to 5000), fetch all needed rows in one request.
-	// For larger limits, keep the default batch size to avoid memory issues with large single requests.
-	// Note: When query_limit > 5000, the last batch may overfetch documents. For example, if we need
-	// 5010 documents total, we fetch 5 batches of 1000 and one batch of 1000 (instead of 10). This is
-	// acceptable given the expected usage pattern of small limits and rare large offsets.
-	int64_t batch_size = 1000;
-	if (query_limit > 0 && query_limit <= 5000) {
+	// Determine batch size. For small query limits, fetch all needed rows in one request
+	// when the total is within the threshold (batch_size * threshold_factor).
+	// For larger limits, keep the configured batch size to avoid memory issues.
+	int64_t batch_size = bind_data.batch_size;
+	int64_t batch_threshold = bind_data.batch_size * bind_data.batch_size_threshold_factor;
+	if (query_limit > 0 && query_limit <= batch_threshold) {
 		batch_size = query_limit;
 	}
 
 	// Start scroll search.
-	auto response = state->client->ScrollSearch(bind_data.index, state->final_query, "5m", batch_size);
+	auto response = state->client->ScrollSearch(bind_data.index, state->final_query, bind_data.scroll_time, batch_size);
 
 	if (!response.success) {
 		throw IOException("Elasticsearch search failed: " + response.error_message);
@@ -556,7 +598,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 				break;
 			}
 
-			auto response = state.client->ScrollNext(state.scroll_id, "5m");
+			auto response = state.client->ScrollNext(state.scroll_id, bind_data.scroll_time);
 			if (!response.success) {
 				throw IOException("Elasticsearch scroll failed: " + response.error_message);
 			}

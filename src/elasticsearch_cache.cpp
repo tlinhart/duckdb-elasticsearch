@@ -1,6 +1,7 @@
 #include "elasticsearch_cache.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
@@ -52,6 +53,10 @@ string BuildBindCacheKey(const ElasticsearchConfig &config, const string &index,
 	key += '\0';
 	key += to_string(sample_size);
 	return key;
+}
+
+void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter) {
+	ElasticsearchBindCache::Instance().Clear();
 }
 
 // Scalar function that clears the per-process bind cache and returns true on success.

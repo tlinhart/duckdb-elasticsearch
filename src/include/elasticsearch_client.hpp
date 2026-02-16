@@ -9,16 +9,16 @@
 namespace duckdb {
 
 struct ElasticsearchConfig {
-	std::string host = "localhost";    // Elasticsearch host (hostname or IP)
-	int32_t port = 9200;               // Elasticsearch port
-	std::string username;              // optional username for HTTP basic authentication
-	std::string password;              // optional password for HTTP basic authentication
-	bool use_ssl = false;              // whether to use HTTPS instead of HTTP
-	bool verify_ssl = true;            // whether to verify SSL certificates
-	int32_t timeout = 30000;           // request timeout in milliseconds
-	int32_t max_retries = 3;           // maximum number of retries for transient errors
-	int32_t retry_interval = 100;      // initial wait time between retries in milliseconds
-	double retry_backoff_factor = 2.0; // exponential backoff factor applied between retries
+	std::string host;            // Elasticsearch host (hostname or IP)
+	int32_t port;                // Elasticsearch port
+	std::string username;        // optional username for HTTP basic authentication
+	std::string password;        // optional password for HTTP basic authentication
+	bool use_ssl;                // whether to use HTTPS instead of HTTP
+	bool verify_ssl;             // whether to verify SSL certificates
+	int32_t timeout;             // request timeout in milliseconds
+	int32_t max_retries;         // maximum number of retries for transient errors
+	int32_t retry_interval;      // initial wait time between retries in milliseconds
+	double retry_backoff_factor; // exponential backoff factor applied between retries
 };
 
 struct ElasticsearchResponse {
@@ -38,8 +38,8 @@ public:
 
 	// Scroll API for large result sets.
 	ElasticsearchResponse ScrollSearch(const std::string &index, const std::string &query,
-	                                   const std::string &scroll_time = "1m", int64_t size = 1000);
-	ElasticsearchResponse ScrollNext(const std::string &scroll_id, const std::string &scroll_time = "1m");
+	                                   const std::string &scroll_time, int64_t size);
+	ElasticsearchResponse ScrollNext(const std::string &scroll_id, const std::string &scroll_time);
 	ElasticsearchResponse ClearScroll(const std::string &scroll_id);
 
 	// Get index mapping.
