@@ -1,0 +1,121 @@
+# name: test/sql/settings.test
+# description: Test extension settings (defaults, SET/RESET, named parameter override)
+# group: [sql]
+
+require elasticsearch
+
+# Verify default values of all extension settings.
+query I
+SELECT current_setting('elasticsearch_verify_ssl');
+----
+true
+
+query I
+SELECT current_setting('elasticsearch_timeout');
+----
+30000
+
+query I
+SELECT current_setting('elasticsearch_max_retries');
+----
+3
+
+query I
+SELECT current_setting('elasticsearch_retry_interval');
+----
+100
+
+query I
+SELECT current_setting('elasticsearch_retry_backoff_factor');
+----
+2.0
+
+query I
+SELECT current_setting('elasticsearch_sample_size');
+----
+100
+
+query I
+SELECT current_setting('elasticsearch_batch_size');
+----
+1000
+
+query I
+SELECT current_setting('elasticsearch_batch_size_threshold_factor');
+----
+5
+
+query I
+SELECT current_setting('elasticsearch_scroll_time');
+----
+5m
+
+# Verify settings can be changed.
+statement ok
+SET elasticsearch_verify_ssl = false;
+
+query I
+SELECT current_setting('elasticsearch_verify_ssl');
+----
+false
+
+# Reset for subsequent tests.
+statement ok
+RESET elasticsearch_verify_ssl;
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+require noforcestorage
+
+# Test that named parameter overrides the elasticsearch_sample_size setting.
+# Setting disables sampling, but the named parameter re-enables it.
+
+statement ok
+SET elasticsearch_sample_size = 0;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    sample_size := 100
+)
+WHERE _id = '1';
+----
+VARCHAR[]
+
+statement ok
+RESET elasticsearch_sample_size;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+# Test that named parameter overrides the elasticsearch_timeout setting.
+# Setting uses a very short timeout, but the named parameter restores a usable one.
+
+# Clear the default ignore_error_messages list so HTTP errors are not skipped.
+set ignore_error_messages
+
+statement ok
+SET elasticsearch_timeout = 1;
+
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    timeout := 30000
+);
+----
+10
+
+statement ok
+RESET elasticsearch_timeout;
+
+statement ok
+SELECT elasticsearch_clear_cache();

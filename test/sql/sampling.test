@@ -61,3 +61,42 @@ SELECT typeof(colors) FROM elasticsearch_query(
 WHERE _id = '1';
 ----
 VARCHAR
+
+# Test that elasticsearch_sample_size setting affects array detection.
+# Default sample_size=100 detects the colors field as an array.
+statement ok
+SELECT elasticsearch_clear_cache();
+
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+VARCHAR[]
+
+# Disable sampling via setting. Cache is automatically cleared by the setting callback.
+statement ok
+SET elasticsearch_sample_size = 0;
+
+# Without sampling, the colors field is not detected as an array.
+query I
+SELECT typeof(colors) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+VARCHAR
+
+# Reset sample_size setting.
+statement ok
+RESET elasticsearch_sample_size;
+
+statement ok
+SELECT elasticsearch_clear_cache();

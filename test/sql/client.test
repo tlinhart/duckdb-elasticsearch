@@ -61,3 +61,169 @@ SELECT * FROM elasticsearch_query(
 );
 ----
 unable to authenticate
+
+# Very short timeout should cause a connection error.
+statement ok
+SET elasticsearch_timeout = 1;
+
+statement error
+SELECT * FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+connection
+
+statement ok
+RESET elasticsearch_timeout;
+
+# Test elasticsearch_batch_size: verify it controls the scroll batch size via HTTP log.
+# The scroll search URL includes size=N which we can inspect.
+
+statement ok
+CALL enable_logging('HTTP');
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Set batch size to 2 (very small) so multiple scroll batches are needed for 10 rows.
+statement ok
+SET elasticsearch_batch_size = 2;
+
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Verify the initial scroll search used size=2.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_search?scroll=%&size=2%';
+----
+1
+
+# Reset batch size.
+statement ok
+RESET elasticsearch_batch_size;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+# Test elasticsearch_batch_size_threshold_factor: controls single-batch optimization for small LIMITs.
+
+# Set batch_size=3 and factor=2, so threshold is 6.
+# A LIMIT 5 query (5 <= 6) should fetch all 5 rows in one request (size=5).
+statement ok
+SET elasticsearch_batch_size = 3;
+
+statement ok
+SET elasticsearch_batch_size_threshold_factor = 2;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 5
+);
+----
+5
+
+# Verify batch size was bumped to 5 (within threshold, single-batch optimization).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_search?scroll=%&size=5%';
+----
+1
+
+# Now set factor=1, so threshold is 3.
+# A LIMIT 5 query (5 > 3) should fall back to the configured batch_size of 3.
+statement ok
+SET elasticsearch_batch_size_threshold_factor = 1;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_query(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test'
+    )
+    LIMIT 5
+);
+----
+5
+
+# Verify batch size stayed at 3 (exceeded threshold, no optimization).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_search?scroll=%&size=3%';
+----
+1
+
+# Reset batch size settings.
+statement ok
+RESET elasticsearch_batch_size;
+
+statement ok
+RESET elasticsearch_batch_size_threshold_factor;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+# Test elasticsearch_scroll_time: verify it controls the scroll keep-alive in data queries.
+
+statement ok
+SET elasticsearch_scroll_time = '10m';
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Verify the scroll search used scroll=10m.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_search?scroll=10m%';
+----
+1
+
+# Reset and clean up.
+statement ok
+RESET elasticsearch_scroll_time;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL disable_logging();

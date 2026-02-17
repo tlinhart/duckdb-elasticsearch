@@ -203,6 +203,79 @@ WHERE type = 'HTTP' AND message LIKE '%_mapping%';
 ----
 1
 
+# Test that changing elasticsearch_sample_size via SET automatically clears the bind cache.
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First query: cache miss, _mapping request is made.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second identical query: cache hit, no _mapping request.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Change sample_size setting: cache is automatically cleared.
+statement ok
+SET elasticsearch_sample_size = 0;
+
+# Third query: cache miss (cache was cleared by setting change), _mapping request is made.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Reset sample_size setting.
+statement ok
+RESET elasticsearch_sample_size;
+
 # Clear cache and disable logging to avoid polluting other tests.
 query I
 SELECT elasticsearch_clear_cache();
