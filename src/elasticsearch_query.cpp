@@ -5,6 +5,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -377,6 +378,12 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	if (bind_data->index.empty()) {
 		throw InvalidInputException("elasticsearch_query requires 'index' parameter");
 	}
+
+	// Read proxy configuration from DuckDB's core settings.
+	auto &db_config = DBConfig::GetConfig(context);
+	bind_data->config.proxy_host = db_config.options.http_proxy;
+	bind_data->config.proxy_username = db_config.options.http_proxy_username;
+	bind_data->config.proxy_password = db_config.options.http_proxy_password;
 
 	// Resolve schema from Elasticsearch (mapping + document sampling), with caching.
 	// On cache hit, no HTTP requests are made. On cache miss, the mapping is fetched and

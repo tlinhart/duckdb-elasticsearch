@@ -9,6 +9,8 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/config.hpp"
 
+#include <curl/curl.h>
+
 // Detect DuckDB v1.5+ by checking for the new extension_callback_manager header
 // introduced in PR #20599. If __has_include is unsupported or the header is
 // missing, we fall back to the old API (safe for older DuckDB versions).
@@ -21,6 +23,10 @@
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Initialize libcurl globally. This must be called before any CURL handles are created.
+	// It is safe to call multiple times (curl tracks init count internally).
+	curl_global_init(CURL_GLOBAL_DEFAULT);
+
 	// Register table functions.
 	RegisterElasticsearchQueryFunction(loader);
 

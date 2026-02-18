@@ -15,13 +15,13 @@ SELECT * FROM elasticsearch_query(
     timeout := 1000
 );
 ----
-connection
+resolve
 
 # Connection should be retried before failing.
 statement error
 SELECT * FROM elasticsearch_query(
     host := 'nonexistent.invalid',
-    port := 99999,
+    port := 19876,
     index := 'test',
     timeout := 1000,
     max_retries := 5
@@ -35,12 +35,12 @@ require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
 statement error
 SELECT * FROM elasticsearch_query(
     host := 'localhost',
-    port := 99999,
+    port := 19876,
     index := 'test',
     timeout := 1000
 );
 ----
-connection
+connect
 
 # Request should fail if authentication credentials are not provided.
 statement error
@@ -74,7 +74,7 @@ SELECT * FROM elasticsearch_query(
     password := 'test'
 );
 ----
-connection
+Timeout
 
 statement ok
 RESET elasticsearch_timeout;

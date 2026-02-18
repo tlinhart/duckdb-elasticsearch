@@ -6,6 +6,9 @@
 #include <vector>
 #include <memory>
 
+typedef void CURL;
+struct curl_slist;
+
 namespace duckdb {
 
 struct ElasticsearchConfig {
@@ -19,6 +22,9 @@ struct ElasticsearchConfig {
 	int32_t max_retries;         // maximum number of retries for transient errors
 	int32_t retry_interval;      // initial wait time between retries in milliseconds
 	double retry_backoff_factor; // exponential backoff factor applied between retries
+	std::string proxy_host;      // HTTP proxy host
+	std::string proxy_username;  // username for HTTP proxy
+	std::string proxy_password;  // password for HTTP proxy
 };
 
 struct ElasticsearchResponse {
@@ -32,6 +38,10 @@ class ElasticsearchClient {
 public:
 	explicit ElasticsearchClient(const ElasticsearchConfig &config, shared_ptr<Logger> logger = nullptr);
 	~ElasticsearchClient();
+
+	// Disable copy (CURL handle is not copyable).
+	ElasticsearchClient(const ElasticsearchClient &) = delete;
+	ElasticsearchClient &operator=(const ElasticsearchClient &) = delete;
 
 	// Plain search (no scroll context). Suitable for bounded result sets (e.g. sampling).
 	ElasticsearchResponse Search(const std::string &index, const std::string &query, int64_t size);
@@ -48,14 +58,19 @@ public:
 private:
 	ElasticsearchConfig config_;
 	shared_ptr<Logger> logger_;
+	CURL *curl_handle_;
+	std::string base_url_;
 
-	// Perform HTTP request using httplib with OpenSSL.
+	// Perform HTTP request using libcurl.
 	ElasticsearchResponse PerformRequest(const std::string &method, const std::string &path,
 	                                     const std::string &body = "");
 
 	// Perform request with retry logic for transient errors.
 	ElasticsearchResponse PerformRequestWithRetry(const std::string &method, const std::string &path,
 	                                              const std::string &body = "");
+
+	// Configure the CURL handle with common options (timeouts, SSL, auth, proxy).
+	void ConfigureCurlHandle();
 };
 
 } // namespace duckdb
