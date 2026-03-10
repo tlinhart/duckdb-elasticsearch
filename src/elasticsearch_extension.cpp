@@ -9,15 +9,6 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/config.hpp"
 
-// Detect DuckDB v1.5+ by checking for the new extension_callback_manager header
-// introduced in PR #20599. If __has_include is unsupported or the header is
-// missing, we fall back to the old API (safe for older DuckDB versions).
-#if defined(__has_include)
-#if __has_include(<duckdb/main/extension_callback_manager.hpp>)
-#define DUCKDB_V1_5_OR_LATER true
-#endif
-#endif
-
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
@@ -29,11 +20,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register optimizer extension for LIMIT/OFFSET pushdown.
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-#ifdef DUCKDB_V1_5_OR_LATER
 	OptimizerExtension::Register(config, ElasticsearchOptimizerExtension());
-#else
-	config.optimizer_extensions.push_back(ElasticsearchOptimizerExtension());
-#endif
 
 	// Register extension settings.
 	// These provide configurable defaults for elasticsearch_query() parameters.
