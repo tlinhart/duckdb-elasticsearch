@@ -1289,7 +1289,6 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 			string func_name_lower = StringUtil::Lower(func_name);
 			if (func_name_lower == "st_within" || func_name_lower == "st_intersects" ||
 			    func_name_lower == "st_contains" || func_name_lower == "st_disjoint") {
-
 				if (func_expr.children.size() < 2) {
 					continue;
 				}
