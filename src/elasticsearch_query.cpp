@@ -865,8 +865,8 @@ static string GeometryValueToWKT(ClientContext &context, const Value &geometry_v
 // - BoundConstantExpression with GEOMETRY type -> convert via WKT to GeoJSON
 //
 // Note: After DuckDB's constant folding, function calls like ST_Point(-74, 40.7)
-// are already evaluated to a GEOMETRY blob constant. The ClientContext is needed
-// to cast GEOMETRY values to VARCHAR (WKT) using the spatial extension's cast function.
+// are already evaluated to a GEOMETRY constant. The ClientContext is needed
+// to cast GEOMETRY values to VARCHAR (WKT) using DuckDB's built-in GEOMETRY to VARCHAR cast.
 //
 // Returns the GeoJSON string on success, empty string on failure.
 // For ST_MakeEnvelope, sets is_envelope=true and fills bbox coordinates.
@@ -885,7 +885,7 @@ static ConstantGeoInfo ExtractConstantGeo(const Expression &expr, ClientContext 
 
 	// Handle constant-folded GEOMETRY values.
 	// After DuckDB's optimizer constant-folds expressions like ST_Point(-74, 40.7),
-	// the result is a BoundConstantExpression with a GEOMETRY type (BLOB with alias "GEOMETRY").
+	// the result is a BoundConstantExpression with a native GEOMETRY type.
 	// We convert it to WKT via ClientContext cast, then to GeoJSON.
 	// For axis-aligned rectangles (from ST_MakeEnvelope), we detect the envelope pattern
 	// and set is_envelope=true to enable the geo_bounding_box optimization.
@@ -895,7 +895,7 @@ static ConstantGeoInfo ExtractConstantGeo(const Expression &expr, ClientContext 
 			return result;
 		}
 		const auto &val_type = const_expr.value.type();
-		if (val_type.HasAlias() && val_type.GetAlias() == "GEOMETRY") {
+		if (val_type.id() == LogicalTypeId::GEOMETRY) {
 			string wkt = GeometryValueToWKT(context, const_expr.value);
 			if (!wkt.empty()) {
 				// Check if this is an axis-aligned rectangle (envelope).

@@ -646,13 +646,13 @@ static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &f
 // Try to extract a constant GeoJSON string from a spatial expression.
 // Recognizes:
 // - BoundConstantExpression with VARCHAR type -> treat as GeoJSON string directly
-//   (produced by the pushdown stage which pre-converts GEOMETRY blobs to GeoJSON)
+//   (produced by the pushdown stage which pre-converts GEOMETRY constants to GeoJSON)
 // - ST_Point(lon, lat) -> {"type":"Point","coordinates":[lon,lat]}
 // - ST_GeomFromGeoJSON('...') -> pass through the GeoJSON string
 // Returns the GeoJSON string on success, empty string on failure.
 static string ExtractConstantGeoJSON(const Expression &expr) {
 	// Handle pre-converted GeoJSON string constants.
-	// The pushdown stage (ElasticsearchPushdownComplexFilter) replaces GEOMETRY blob constants
+	// The pushdown stage (ElasticsearchPushdownComplexFilter) replaces GEOMETRY constants
 	// with VARCHAR GeoJSON strings before creating the ExpressionFilter.
 	string str_val;
 	if (ExtractConstantString(expr, str_val)) {
