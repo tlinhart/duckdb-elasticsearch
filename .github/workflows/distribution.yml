@@ -30,4 +30,5 @@ jobs:
       duckdb_version: v1.5.0
       ci_tools_version: v1.5.0
       extension_name: elasticsearch
-      format_checks: "format;tidy"
+      # Remove tidy check until duckdb/extension-ci-tools#223 is resolved.
+      format_checks: "format"
