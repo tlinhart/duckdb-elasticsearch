@@ -2,16 +2,13 @@
 #include "elasticsearch_common.hpp"
 #include "elasticsearch_filter_pushdown.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
-#include "duckdb/main/database.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_config.hpp"
-#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -377,6 +374,11 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	if (bind_data->index.empty()) {
 		throw InvalidInputException("elasticsearch_query requires 'index' parameter");
 	}
+
+	// Read proxy configuration from DuckDB's core settings.
+	bind_data->config.proxy_host = Settings::Get<HTTPProxySetting>(context);
+	bind_data->config.proxy_username = Settings::Get<HTTPProxyUsernameSetting>(context);
+	bind_data->config.proxy_password = Settings::Get<HTTPProxyPasswordSetting>(context);
 
 	// Resolve schema from Elasticsearch (mapping + document sampling), with caching.
 	// On cache hit, no HTTP requests are made. On cache miss, the mapping is fetched and

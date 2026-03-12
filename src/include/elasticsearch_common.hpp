@@ -2,7 +2,6 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
-#include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "elasticsearch_client.hpp"
 #include "yyjson.hpp"

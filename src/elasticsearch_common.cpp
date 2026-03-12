@@ -1,13 +1,11 @@
 #include "elasticsearch_common.hpp"
 #include "elasticsearch_cache.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
-#include <algorithm>
 #include <functional>
 #include <iomanip>
 #include <sstream>

@@ -5,13 +5,18 @@
 #include "elasticsearch_query.hpp"
 #include "elasticsearch_optimizer.hpp"
 #include "duckdb.hpp"
-#include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/config.hpp"
+
+#include <curl/curl.h>
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Initialize libcurl globally. This must be called before any libcurl handles are created.
+	// It is safe to call multiple times (curl tracks init count internally).
+	curl_global_init(CURL_GLOBAL_DEFAULT);
+
 	// Register table functions.
 	RegisterElasticsearchQueryFunction(loader);
 
