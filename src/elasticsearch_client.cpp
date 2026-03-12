@@ -189,6 +189,11 @@ void ElasticsearchClient::ConfigureCurlHandle() {
 
 	// Enable TCP keep-alive for connection reuse.
 	curl_easy_setopt(curl_handle_, CURLOPT_TCP_KEEPALIVE, 1L);
+
+	// Enable HTTP response compression. Passing an empty string makes libcurl advertise
+	// all supported encodings (gzip, deflate, br, zstd depending on build). Decompression
+	// is handled transparently by libcurl before data reaches WriteCallback.
+	curl_easy_setopt(curl_handle_, CURLOPT_ACCEPT_ENCODING, "");
 }
 
 ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &method, const std::string &path,
@@ -346,13 +351,17 @@ ElasticsearchResponse ElasticsearchClient::Search(const std::string &index, cons
 
 ElasticsearchResponse ElasticsearchClient::ScrollSearch(const std::string &index, const std::string &query,
                                                         const std::string &scroll_time, int64_t size) {
-	std::string path = "/" + index + "/_search?scroll=" + scroll_time + "&size=" + std::to_string(size);
+	// Use filter_path to strip unnecessary metadata from the response. Only _scroll_id, hit _id and _source are needed
+	// by the scan.
+	std::string path = "/" + index + "/_search?scroll=" + scroll_time + "&size=" + std::to_string(size) +
+	                   "&filter_path=_scroll_id,hits.hits._id,hits.hits._source";
 	return PerformRequestWithRetry("POST", path, query);
 }
 
 ElasticsearchResponse ElasticsearchClient::ScrollNext(const std::string &scroll_id, const std::string &scroll_time) {
 	std::string body = R"({"scroll":")" + scroll_time + R"(","scroll_id":")" + scroll_id + R"("})";
-	return PerformRequestWithRetry("POST", "/_search/scroll", body);
+	return PerformRequestWithRetry("POST", "/_search/scroll?filter_path=_scroll_id,hits.hits._id,hits.hits._source",
+	                               body);
 }
 
 ElasticsearchResponse ElasticsearchClient::ClearScroll(const std::string &scroll_id) {
