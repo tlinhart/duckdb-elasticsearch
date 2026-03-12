@@ -28,47 +28,83 @@ static size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata
 	return total_size;
 }
 
-// Callback for libcurl to capture response headers.
-struct ResponseHeaders {
-	int32_t status_code = 0;
+// Debug callback data for capturing actual request and response headers from libcurl.
+// Used with CURLOPT_DEBUGFUNCTION to log the real headers sent/received on the wire,
+// including headers added internally by libcurl (e.g. Accept-Encoding, Host, User-Agent).
+struct DebugData {
+	case_insensitive_map_t<std::string> request_headers;
+	case_insensitive_map_t<std::string> response_headers;
 	std::string reason;
-	case_insensitive_map_t<std::string> headers;
 };
 
-static size_t HeaderCallback(char *buffer, size_t size, size_t nitems, void *userdata) {
-	auto *resp_headers = static_cast<ResponseHeaders *>(userdata);
-	size_t total_size = size * nitems;
-	std::string header_line(buffer, total_size);
+// Parse HTTP header lines from a block of text into a header map.
+// Handles both request headers (CURLINFO_HEADER_OUT) and response headers (CURLINFO_HEADER_IN).
+// CURLINFO_HEADER_OUT delivers all request headers in a single block, while CURLINFO_HEADER_IN
+// delivers one header per callback invocation. The parsing logic handles both cases.
+static void ParseHeaderBlock(const std::string &block, case_insensitive_map_t<std::string> &headers,
+                             std::string *reason) {
+	size_t pos = 0;
+	while (pos < block.size()) {
+		auto eol = block.find("\r\n", pos);
+		if (eol == std::string::npos) {
+			eol = block.size();
+		}
+		std::string line = block.substr(pos, eol - pos);
+		pos = eol + 2;
 
-	// Parse HTTP status line (e.g. "HTTP/1.1 200 OK\r\n").
-	if (header_line.substr(0, 5) == "HTTP/") {
-		auto space1 = header_line.find(' ');
-		if (space1 != std::string::npos) {
-			auto space2 = header_line.find(' ', space1 + 1);
-			if (space2 != std::string::npos) {
-				resp_headers->status_code = std::stoi(header_line.substr(space1 + 1, space2 - space1 - 1));
-				auto end = header_line.find_first_of("\r\n", space2 + 1);
-				resp_headers->reason = header_line.substr(space2 + 1, end - space2 - 1);
+		if (line.empty()) {
+			continue;
+		}
+
+		// Parse HTTP status line (e.g. "HTTP/1.1 200 OK" or "HTTP/2 200").
+		if (line.size() >= 5 && line.substr(0, 5) == "HTTP/") {
+			if (reason) {
+				auto space1 = line.find(' ');
+				if (space1 != std::string::npos) {
+					auto space2 = line.find(' ', space1 + 1);
+					if (space2 != std::string::npos) {
+						*reason = line.substr(space2 + 1);
+					} else {
+						reason->clear();
+					}
+				}
 			}
+			continue;
 		}
-		return total_size;
-	}
 
-	// Parse regular header (e.g. "Content-Type: application/json\r\n").
-	auto colon = header_line.find(':');
-	if (colon != std::string::npos) {
-		std::string key = header_line.substr(0, colon);
-		std::string value = header_line.substr(colon + 1);
-		// Trim leading/trailing whitespace and CRLF.
-		auto start = value.find_first_not_of(" \t");
-		auto end = value.find_last_not_of(" \t\r\n");
-		if (start != std::string::npos && end != std::string::npos) {
-			value = value.substr(start, end - start + 1);
+		// Skip request line (e.g. "GET /path HTTP/1.1").
+		if (line.size() >= 4 && line.find("HTTP/") != std::string::npos &&
+		    (line.substr(0, 4) == "GET " || line.substr(0, 5) == "POST " || line.substr(0, 4) == "PUT " ||
+		     line.substr(0, 7) == "DELETE " || line.substr(0, 5) == "HEAD ")) {
+			continue;
 		}
-		resp_headers->headers[key] = value;
-	}
 
-	return total_size;
+		// Parse regular header (e.g. "Content-Type: application/json").
+		auto colon = line.find(':');
+		if (colon != std::string::npos) {
+			std::string key = line.substr(0, colon);
+			std::string value = line.substr(colon + 1);
+			auto start = value.find_first_not_of(" \t");
+			auto end = value.find_last_not_of(" \t\r\n");
+			if (start != std::string::npos && end != std::string::npos) {
+				value = value.substr(start, end - start + 1);
+			}
+			headers[key] = value;
+		}
+	}
+}
+
+// Debug callback for libcurl that captures actual request and response headers.
+static int DebugCallback(CURL *handle, curl_infotype type, char *data, size_t size, void *userdata) {
+	auto *debug_data = static_cast<DebugData *>(userdata);
+	if (type == CURLINFO_HEADER_OUT) {
+		std::string block(data, size);
+		ParseHeaderBlock(block, debug_data->request_headers, nullptr);
+	} else if (type == CURLINFO_HEADER_IN) {
+		std::string block(data, size);
+		ParseHeaderBlock(block, debug_data->response_headers, &debug_data->reason);
+	}
+	return 0;
 }
 
 // Construct HTTP log message using DuckDB's Value::STRUCT format for native integration
@@ -185,7 +221,7 @@ void ElasticsearchClient::ConfigureCurlHandle() {
 
 	// Set callbacks.
 	curl_easy_setopt(curl_handle_, CURLOPT_WRITEFUNCTION, WriteCallback);
-	curl_easy_setopt(curl_handle_, CURLOPT_HEADERFUNCTION, HeaderCallback);
+	curl_easy_setopt(curl_handle_, CURLOPT_DEBUGFUNCTION, DebugCallback);
 
 	// Enable TCP keep-alive for connection reuse.
 	curl_easy_setopt(curl_handle_, CURLOPT_TCP_KEEPALIVE, 1L);
@@ -206,19 +242,23 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 	auto start_time = std::chrono::system_clock::now();
 	bool should_log = logger_ && logger_->ShouldLog(HTTPLogType::NAME, HTTPLogType::LEVEL);
 
-	// Track request headers for logging.
-	case_insensitive_map_t<std::string> request_headers;
-	request_headers["Accept"] = "application/json";
+	// Enable debug callback to capture actual request/response headers only when logging.
+	// CURLOPT_VERBOSE must be enabled for CURLOPT_DEBUGFUNCTION to fire.
+	DebugData debug_data;
+	if (should_log) {
+		curl_easy_setopt(curl_handle_, CURLOPT_VERBOSE, 1L);
+		curl_easy_setopt(curl_handle_, CURLOPT_DEBUGDATA, &debug_data);
+	} else {
+		curl_easy_setopt(curl_handle_, CURLOPT_VERBOSE, 0L);
+	}
 
 	try {
 		std::string url = base_url_ + path;
 		std::string response_body;
-		ResponseHeaders resp_headers;
 
 		// Reset handle state for this request (keeps connection alive).
 		curl_easy_setopt(curl_handle_, CURLOPT_URL, url.c_str());
 		curl_easy_setopt(curl_handle_, CURLOPT_WRITEDATA, &response_body);
-		curl_easy_setopt(curl_handle_, CURLOPT_HEADERDATA, &resp_headers);
 
 		// Build request headers.
 		struct curl_slist *headers = nullptr;
@@ -234,20 +274,17 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 			curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDS, body.c_str());
 			curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
 			headers = curl_slist_append(headers, "Content-Type: application/json");
-			request_headers["Content-Type"] = "application/json";
 		} else if (method == "PUT") {
 			curl_easy_setopt(curl_handle_, CURLOPT_CUSTOMREQUEST, "PUT");
 			curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDS, body.c_str());
 			curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
 			headers = curl_slist_append(headers, "Content-Type: application/json");
-			request_headers["Content-Type"] = "application/json";
 		} else if (method == "DELETE") {
 			curl_easy_setopt(curl_handle_, CURLOPT_CUSTOMREQUEST, "DELETE");
 			if (!body.empty()) {
 				curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDS, body.c_str());
 				curl_easy_setopt(curl_handle_, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
 				headers = curl_slist_append(headers, "Content-Type: application/json");
-				request_headers["Content-Type"] = "application/json";
 			}
 		} else {
 			response.error_message = "Unsupported HTTP method: " + method;
@@ -280,8 +317,8 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 		if (should_log) {
 			auto end_time = std::chrono::system_clock::now();
 			std::string log_msg =
-			    ConstructHTTPLogMessage(method, path, request_headers, body, start_time, end_time, response.status_code,
-			                            resp_headers.reason, resp_headers.headers);
+			    ConstructHTTPLogMessage(method, path, debug_data.request_headers, body, start_time, end_time,
+			                            response.status_code, debug_data.reason, debug_data.response_headers);
 			logger_->WriteLog(HTTPLogType::NAME, HTTPLogType::LEVEL, log_msg);
 		}
 
@@ -291,9 +328,8 @@ ElasticsearchResponse ElasticsearchClient::PerformRequest(const std::string &met
 		// Log even on exception.
 		if (should_log) {
 			auto end_time = std::chrono::system_clock::now();
-			case_insensitive_map_t<std::string> empty_headers;
-			std::string log_msg = ConstructHTTPLogMessage(method, path, request_headers, body, start_time, end_time, 0,
-			                                              "", empty_headers);
+			std::string log_msg = ConstructHTTPLogMessage(method, path, debug_data.request_headers, body, start_time,
+			                                              end_time, 0, "", debug_data.response_headers);
 			logger_->WriteLog(HTTPLogType::NAME, HTTPLogType::LEVEL, log_msg);
 		}
 	}
