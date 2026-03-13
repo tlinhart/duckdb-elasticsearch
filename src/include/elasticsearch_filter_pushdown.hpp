@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "yyjson.hpp"
 
 #include <string>

@@ -70,7 +70,7 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 	FilterTranslationResult result;
 	result.es_query = nullptr;
 
-	if (filters.filters.empty()) {
+	if (!filters.HasFilters()) {
 		return result;
 	}
 
@@ -78,9 +78,9 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 	yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
 	yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
 
-	for (auto &entry : filters.filters) {
-		idx_t col_idx = entry.first;
-		auto &filter = entry.second;
+	for (auto &entry : filters) {
+		idx_t col_idx = entry.ColumnIndex();
+		auto &filter = entry.Filter();
 
 		if (col_idx >= column_names.size()) {
 			continue;
@@ -89,7 +89,7 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 		const string &column_name = column_names[col_idx];
 
 		yyjson_mut_val *translated =
-		    TranslateFilter(doc, *filter, column_name, es_types, text_fields, text_fields_with_keyword);
+		    TranslateFilter(doc, filter, column_name, es_types, text_fields, text_fields_with_keyword);
 		if (translated) {
 			yyjson_mut_arr_append(must_arr, translated);
 		}

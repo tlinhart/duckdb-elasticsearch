@@ -6,6 +6,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -156,7 +157,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	// Translate pushed filters to Elasticsearch Query DSL.
 	// IS NULL / IS NOT NULL filters are now handled through table_filters (added by pushdown_complex_filter).
 	yyjson_mut_val *filter_clause = nullptr;
-	if (filters && !filters->filters.empty()) {
+	if (filters && filters->HasFilters()) {
 		// Build column names vector for the filter translator.
 		// Important: Filter indices in TableFilterSet are relative to column_ids (the projected columns)
 		// and not the original bind schema, we need to map them correctly.
@@ -722,7 +723,7 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 	// Direct column reference.
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
-		idx_t output_col_idx = col_ref.binding.column_index;
+		idx_t output_col_idx = col_ref.binding.column_index.index;
 
 		if (output_col_idx >= column_ids.size()) {
 			return result;
