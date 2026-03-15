@@ -162,7 +162,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		// Important: Filter indices in TableFilterSet are relative to column_ids (the projected columns)
 		// and not the original bind schema, we need to map them correctly.
 		//
-		// column_ids contains indices into the bind schema: [_id (0), ...fields... (1-N), optionally _unmapped_ (N+1)]
+		// column_ids contains indices into the bind schema: [_id (0), ...fields... (1 to N), _unmapped_ (N+1)]
 		// Filter indices are positions within column_ids.
 		vector<string> filter_column_names;
 		for (idx_t col_id : column_ids) {
@@ -396,15 +396,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	bind_data->text_fields = std::move(schema.text_fields);
 	bind_data->text_fields_with_keyword = std::move(schema.text_fields_with_keyword);
 
-	// If no columns found, add a default _source column.
-	if (bind_data->all_column_names.empty()) {
-		bind_data->all_column_names.push_back("_source");
-		bind_data->all_column_types.push_back(LogicalType::VARCHAR);
-		bind_data->field_paths.push_back("_source");
-		bind_data->es_types.push_back("object");
-	}
-
-	// Build output schema: [_id, ...fields..., optionally _unmapped_].
+	// Build output schema: [_id, ...fields..., _unmapped_].
 	names.push_back("_id");
 	return_types.push_back(LogicalType::VARCHAR);
 
@@ -468,7 +460,7 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 		state->projected_columns = input.column_ids;
 
 		// Build projected field info for all columns.
-		// Column layout: [_id (0), ...fields... (1 to N), optionally _unmapped_ (N+1 if present)].
+		// Column layout: [_id (0), ...fields... (1 to N), _unmapped_ (N+1)].
 		for (idx_t col_id : input.column_ids) {
 			if (col_id == 0) {
 				// _id column
@@ -680,12 +672,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 				}
 			} else {
 				// regular field
-				yyjson_val *val = nullptr;
-				if (field_path == "_source") {
-					val = source;
-				} else {
-					val = GetValueByPath(source, field_path);
-				}
+				yyjson_val *val = GetValueByPath(source, field_path);
 				SetValueFromJSON(val, output.data[out_col], output_idx, col_type, es_type);
 			}
 		}
