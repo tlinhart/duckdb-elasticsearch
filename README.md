@@ -553,12 +553,13 @@ extension detects arrays by sampling documents:
 
 `geo_point` values are converted to GeoJSON `Point` type:
 
-| Input format | Example                            | Output                                             |
-| ------------ | ---------------------------------- | -------------------------------------------------- |
-| object       | `{"lat": 40.7128, "lon": -74.006}` | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
-| array        | `[-74.006, 40.7128]`               | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
-| string       | `"40.7128,-74.006"`                | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
-| WKT          | `"POINT (-74.006 40.7128)"`        | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
+| Input format | Example                                                | Output                                             |
+| ------------ | ------------------------------------------------------ | -------------------------------------------------- |
+| object       | `{"lat": 40.7128, "lon": -74.006}`                     | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
+| GeoJSON      | `{"type": "Point", "coordinates": [-74.006, 40.7128]}` | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
+| array        | `[-74.006, 40.7128]`                                   | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
+| string       | `"40.7128,-74.006"`                                    | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
+| WKT          | `"POINT (-74.006 40.7128)"`                            | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
 
 `geo_shape` values are converted to relevant GeoJSON geometry types:
 
