@@ -444,11 +444,13 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 
 	// geo_point can be in multiple formats:
 	// 1. object: {"lat": 41.12, "lon": -71.34}
-	// 2. array: [-71.34, 41.12] (lon, lat order)
-	// 3. string: "41.12,-71.34" or geohash
-	// 4. WKT: "POINT (-71.34 41.12)"
+	// 2. GeoJSON: {"type": "Point", "coordinates": [-71.34, 41.12]}
+	// 3. array: [-71.34, 41.12] (lon, lat order)
+	// 4. string: "41.12,-71.34" or geohash
+	// 5. WKT: "POINT (-71.34 41.12)"
 
 	if (yyjson_is_obj(val)) {
+		// lat/lon object: {"lat": 41.12, "lon": -71.34}
 		yyjson_val *lat = yyjson_obj_get(val, "lat");
 		yyjson_val *lon = yyjson_obj_get(val, "lon");
 		if (lat && lon) {
@@ -457,7 +459,20 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 			return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon_d) + "," +
 			       CoordinateToString(lat_d) + "]}";
 		}
+
+		// GeoJSON object: {"type": "Point", "coordinates": [lon, lat]}
+		yyjson_val *type_val = yyjson_obj_get(val, "type");
+		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+		if (type_val && yyjson_is_str(type_val) && coords && yyjson_is_arr(coords)) {
+			char *json_str = yyjson_val_write(val, 0, nullptr);
+			if (json_str) {
+				std::string result(json_str);
+				free(json_str);
+				return result;
+			}
+		}
 	} else if (yyjson_is_arr(val)) {
+		// Array: [-71.34, 41.12] (lon, lat order)
 		yyjson_val *lon = yyjson_arr_get(val, 0);
 		yyjson_val *lat = yyjson_arr_get(val, 1);
 		if (lat && lon) {
@@ -470,12 +485,12 @@ std::string GeoPointToGeoJSON(yyjson_val *val) {
 		const char *str = yyjson_get_str(val);
 		std::string s(str);
 
-		// Check for WKT POINT format.
+		// WKT: "POINT (lon lat)"
 		if (s.find("POINT") == 0) {
 			return WKTPointToGeoJSON(s);
 		}
 
-		// Check if it's "lat,lon" format.
+		// "lat,lon" string: "41.12,-71.34"
 		auto comma_pos = s.find(',');
 		if (comma_pos != std::string::npos) {
 			try {
