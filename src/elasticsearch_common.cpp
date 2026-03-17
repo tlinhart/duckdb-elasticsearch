@@ -978,16 +978,8 @@ bool ExtractPointCoordinates(const std::string &geojson, double &lon, double &la
 		return false;
 	}
 
-	lon = yyjson_get_real(lon_val);
-	lat = yyjson_get_real(lat_val);
-
-	// yyjson_get_real returns 0.0 for integers, need to check for int type.
-	if (yyjson_is_int(lon_val)) {
-		lon = static_cast<double>(yyjson_get_int(lon_val));
-	}
-	if (yyjson_is_int(lat_val)) {
-		lat = static_cast<double>(yyjson_get_int(lat_val));
-	}
+	lon = YyjsonGetNum(lon_val);
+	lat = YyjsonGetNum(lat_val);
 
 	yyjson_doc_free(doc);
 	return true;
