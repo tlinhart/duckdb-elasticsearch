@@ -15,7 +15,7 @@ This extension provides a table function that allows you to:
 
 The extension automatically infers the schema from Elasticsearch index
 mappings, handles type conversions and supports advanced features like nested
-objects, geo types, and multi-index queries.
+objects, geo types and multi-index queries.
 
 ## Features
 
