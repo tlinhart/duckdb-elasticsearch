@@ -1,7 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "elasticsearch_extension.hpp"
-#include "elasticsearch_cache.hpp"
+#include "elasticsearch_schema.hpp"
 #include "elasticsearch_query.hpp"
 #include "elasticsearch_optimizer.hpp"
 #include "duckdb.hpp"

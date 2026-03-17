@@ -7,7 +7,7 @@ namespace duckdb {
 
 // Optimizer extension for Elasticsearch LIMIT/OFFSET pushdown.
 // This extension walks the logical plan to find LIMIT operators above Elasticsearch scans,
-// extracts the limit and offset values, stores them in the bind data, and removes the
+// extracts the limit and offset values, stores them in the bind data and removes the
 // LIMIT operator from the plan so that DuckDB does not duplicate limit enforcement.
 class ElasticsearchOptimizerExtension : public OptimizerExtension {
 public:

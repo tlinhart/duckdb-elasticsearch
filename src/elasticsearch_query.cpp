@@ -1,6 +1,7 @@
 #include "elasticsearch_query.hpp"
 #include "elasticsearch_common.hpp"
 #include "elasticsearch_filter_pushdown.hpp"
+#include "elasticsearch_schema.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/settings.hpp"
@@ -23,9 +24,8 @@
 #include "yyjson.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <set>
-#include <unordered_map>
-#include <unordered_set>
 
 namespace duckdb {
 
@@ -40,27 +40,9 @@ struct ElasticsearchQueryBindData : public TableFunctionData {
 	// Logger for HTTP request logging, captured from ClientContext during bind.
 	shared_ptr<Logger> logger;
 
-	// Schema information (all columns from the mapping).
-	vector<string> all_column_names;
-	vector<LogicalType> all_column_types;
-
-	// For storing the Elasticsearch field paths (may differ from column names for nested fields).
-	vector<string> field_paths;
-
-	// For storing all mapped field paths including nested (for unmapped detection).
-	std::set<string> all_mapped_paths;
-
-	// Store Elasticsearch types for special handling (geo types, text fields).
-	vector<string> es_types;
-
-	// Map from column name to Elasticsearch type (for filter translation).
-	unordered_map<string, string> es_type_map;
-
-	// Set of text fields (need .keyword for exact matching).
-	unordered_set<string> text_fields;
-
-	// Set of text fields that have a .keyword subfield (enables filter pushdown).
-	unordered_set<string> text_fields_with_keyword;
+	// Resolved Elasticsearch schema containing all mapping and sampling information.
+	// Produced by ResolveElasticsearchSchema() and consumed by query building, filter pushdown and scanning.
+	ElasticsearchSchema schema;
 
 	// Sample size for array detection (0 = disabled).
 	// Populated from elasticsearch_sample_size setting, overridable by named parameter.
@@ -76,6 +58,22 @@ struct ElasticsearchQueryBindData : public TableFunctionData {
 	// -1 means no limit, 0 means no offset.
 	int64_t limit = -1;
 	int64_t offset = 0;
+};
+
+// Projected subset of schema information for the columns actually needed during scanning.
+// Built during init from the full ElasticsearchSchema by selecting only the projected columns.
+struct ProjectedSchema {
+	// Indices into the bind schema's column layout: [_id (0), ...fields... (1 to N), _unmapped_ (N+1)].
+	vector<idx_t> column_indices;
+
+	// Elasticsearch field paths for projected columns (for reading values from _source).
+	vector<string> field_paths;
+
+	// Elasticsearch type strings for projected columns (for special type handling during scanning).
+	vector<string> es_types;
+
+	// DuckDB types for projected columns (for value extraction and type conversion).
+	vector<LogicalType> column_types;
 };
 
 // Global state for scanning.
@@ -97,13 +95,9 @@ struct ElasticsearchQueryGlobalState : public GlobalTableFunctionState {
 	int64_t rows_to_skip;
 	int64_t rows_skipped;
 
-	// Projected column indices (from projection pushdown).
-	vector<idx_t> projected_columns;
-
-	// Column names for projected columns (for reading from _source).
-	vector<string> projected_field_paths;
-	vector<string> projected_es_types;
-	vector<LogicalType> projected_types;
+	// Projected subset of schema information for the columns needed during scanning.
+	// Built during init from the full ElasticsearchSchema by selecting only the projected columns.
+	ProjectedSchema projected;
 
 	// The final query sent to Elasticsearch (with filters merged).
 	std::string final_query;
@@ -168,9 +162,9 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		for (idx_t col_id : column_ids) {
 			if (col_id == 0) {
 				filter_column_names.push_back("_id");
-			} else if (col_id <= bind_data.all_column_names.size()) {
-				// regular field column (col_id 1 maps to all_column_names[0], etc.)
-				const string &name = bind_data.all_column_names[col_id - 1];
+			} else if (col_id <= bind_data.schema.column_names.size()) {
+				// regular field column (col_id 1 maps to column_names[0] etc.)
+				const string &name = bind_data.schema.column_names[col_id - 1];
 				filter_column_names.push_back(name);
 			} else {
 				// _unmapped_ column
@@ -179,8 +173,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		}
 
 		FilterTranslationResult translation_result =
-		    TranslateFilters(doc, *filters, filter_column_names, bind_data.es_type_map, bind_data.text_fields,
-		                     bind_data.text_fields_with_keyword);
+		    TranslateFilters(doc, *filters, filter_column_names, bind_data.schema);
 
 		filter_clause = translation_result.es_query;
 	}
@@ -241,7 +234,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		}
 		idx_t col_id = column_ids[i];
 		// _unmapped_ column is always at position field_paths.size() + 1 (after _id and all fields).
-		if (col_id > bind_data.field_paths.size()) {
+		if (col_id > bind_data.schema.field_paths.size()) {
 			needs_full_source = true;
 			break;
 		}
@@ -260,8 +253,8 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 				continue;
 			}
 			idx_t field_idx = col_id - 1; // adjust for _id column
-			if (field_idx < bind_data.field_paths.size()) {
-				source_fields.push_back(bind_data.field_paths[field_idx]);
+			if (field_idx < bind_data.schema.field_paths.size()) {
+				source_fields.push_back(bind_data.schema.field_paths[field_idx]);
 			}
 		}
 
@@ -384,25 +377,16 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	// Resolve schema from Elasticsearch (mapping + document sampling), with caching.
 	// On cache hit, no HTTP requests are made. On cache miss, the mapping is fetched and
 	// documents are sampled to detect arrays and unmapped fields.
-	auto schema = ResolveElasticsearchSchema(bind_data->config, bind_data->index, bind_data->base_query,
-	                                         bind_data->sample_size, bind_data->logger);
-
-	bind_data->all_column_names = std::move(schema.all_column_names);
-	bind_data->all_column_types = std::move(schema.all_column_types);
-	bind_data->field_paths = std::move(schema.field_paths);
-	bind_data->es_types = std::move(schema.es_types);
-	bind_data->all_mapped_paths = std::move(schema.all_mapped_paths);
-	bind_data->es_type_map = std::move(schema.es_type_map);
-	bind_data->text_fields = std::move(schema.text_fields);
-	bind_data->text_fields_with_keyword = std::move(schema.text_fields_with_keyword);
+	bind_data->schema = ResolveElasticsearchSchema(bind_data->config, bind_data->index, bind_data->base_query,
+	                                               bind_data->sample_size, bind_data->logger);
 
 	// Build output schema: [_id, ...fields..., _unmapped_].
 	names.push_back("_id");
 	return_types.push_back(LogicalType::VARCHAR);
 
-	for (size_t i = 0; i < bind_data->all_column_names.size(); i++) {
-		names.push_back(bind_data->all_column_names[i]);
-		return_types.push_back(bind_data->all_column_types[i]);
+	for (size_t i = 0; i < bind_data->schema.column_names.size(); i++) {
+		names.push_back(bind_data->schema.column_names[i]);
+		return_types.push_back(bind_data->schema.column_types[i]);
 	}
 
 	// Always add _unmapped_ column to capture fields not in the mapping.
@@ -423,7 +407,7 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	// projection_ids contains indices into column_ids for output columns only.
 	// If projection_ids is empty, all column_ids are output columns (no filter pruning).
 	//
-	// We build projected_* arrays only for output columns, since:
+	// We populate the projected schema only for output columns, since:
 	// 1. filter-only columns are excluded from _source (Elasticsearch filters server-side)
 	// 2. the output DataChunk has projection_ids.size() columns (or column_ids.size() if empty)
 	// 3. we write directly to output.data[i] where i corresponds to output column index
@@ -432,52 +416,52 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 
 	if (has_filter_prune) {
 		// Filter pruning is active, only build metadata for output columns.
-		// projected_columns will contain the actual column IDs for output columns.
+		// projected.column_indices will contain the actual column IDs for output columns.
 		for (idx_t proj_idx : input.projection_ids) {
 			idx_t col_id = input.column_ids[proj_idx];
-			state->projected_columns.push_back(col_id);
+			state->projected.column_indices.push_back(col_id);
 
 			if (col_id == 0) {
 				// _id column
-				state->projected_field_paths.push_back("_id");
-				state->projected_es_types.push_back("");
-				state->projected_types.push_back(LogicalType::VARCHAR);
-			} else if (col_id <= bind_data.field_paths.size()) {
+				state->projected.field_paths.push_back("_id");
+				state->projected.es_types.push_back("");
+				state->projected.column_types.push_back(LogicalType::VARCHAR);
+			} else if (col_id <= bind_data.schema.field_paths.size()) {
 				// regular field column
 				idx_t field_idx = col_id - 1;
-				state->projected_field_paths.push_back(bind_data.field_paths[field_idx]);
-				state->projected_es_types.push_back(bind_data.es_types[field_idx]);
-				state->projected_types.push_back(bind_data.all_column_types[field_idx]);
+				state->projected.field_paths.push_back(bind_data.schema.field_paths[field_idx]);
+				state->projected.es_types.push_back(bind_data.schema.es_types[field_idx]);
+				state->projected.column_types.push_back(bind_data.schema.column_types[field_idx]);
 			} else {
 				// _unmapped_ column
-				state->projected_field_paths.push_back("_unmapped_");
-				state->projected_es_types.push_back("");
-				state->projected_types.push_back(LogicalType::JSON());
+				state->projected.field_paths.push_back("_unmapped_");
+				state->projected.es_types.push_back("");
+				state->projected.column_types.push_back(LogicalType::JSON());
 			}
 		}
 	} else {
 		// No filter pruning: all column_ids are output columns.
-		state->projected_columns = input.column_ids;
+		state->projected.column_indices = input.column_ids;
 
 		// Build projected field info for all columns.
 		// Column layout: [_id (0), ...fields... (1 to N), _unmapped_ (N+1)].
 		for (idx_t col_id : input.column_ids) {
 			if (col_id == 0) {
 				// _id column
-				state->projected_field_paths.push_back("_id");
-				state->projected_es_types.push_back("");
-				state->projected_types.push_back(LogicalType::VARCHAR);
-			} else if (col_id <= bind_data.field_paths.size()) {
+				state->projected.field_paths.push_back("_id");
+				state->projected.es_types.push_back("");
+				state->projected.column_types.push_back(LogicalType::VARCHAR);
+			} else if (col_id <= bind_data.schema.field_paths.size()) {
 				// regular field column
 				idx_t field_idx = col_id - 1;
-				state->projected_field_paths.push_back(bind_data.field_paths[field_idx]);
-				state->projected_es_types.push_back(bind_data.es_types[field_idx]);
-				state->projected_types.push_back(bind_data.all_column_types[field_idx]);
+				state->projected.field_paths.push_back(bind_data.schema.field_paths[field_idx]);
+				state->projected.es_types.push_back(bind_data.schema.es_types[field_idx]);
+				state->projected.column_types.push_back(bind_data.schema.column_types[field_idx]);
 			} else {
 				// _unmapped_ column
-				state->projected_field_paths.push_back("_unmapped_");
-				state->projected_es_types.push_back("");
-				state->projected_types.push_back(LogicalType::JSON());
+				state->projected.field_paths.push_back("_unmapped_");
+				state->projected.es_types.push_back("");
+				state->projected.column_types.push_back(LogicalType::JSON());
 			}
 		}
 	}
@@ -548,6 +532,151 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 	}
 
 	return std::move(state);
+}
+
+// Collect unmapped fields from _source that are not in the schema's mapped paths.
+// Returns a JSON string of unmapped fields or empty string if none found.
+// Used to populate the _unmapped_ output column during scanning.
+static std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string> &mapped_paths,
+                                         const std::string &prefix = "") {
+	if (!source || !yyjson_is_obj(source)) {
+		return "";
+	}
+
+	// Use yyjson mutable doc to build the unmapped object.
+	yyjson_mut_doc *unmapped_doc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val *unmapped_root = yyjson_mut_obj(unmapped_doc);
+	yyjson_mut_doc_set_root(unmapped_doc, unmapped_root);
+
+	bool has_unmapped = false;
+
+	// Recursive helper to collect unmapped fields.
+	std::function<void(yyjson_val *, yyjson_mut_val *, const std::string &)> collect_unmapped =
+	    [&](yyjson_val *obj, yyjson_mut_val *target, const std::string &current_prefix) {
+		    if (!obj || !yyjson_is_obj(obj))
+			    return;
+
+		    yyjson_obj_iter iter;
+		    yyjson_obj_iter_init(obj, &iter);
+		    yyjson_val *key;
+
+		    while ((key = yyjson_obj_iter_next(&iter))) {
+			    const char *field_name = yyjson_get_str(key);
+			    yyjson_val *field_val = yyjson_obj_iter_get_val(key);
+
+			    std::string field_path = current_prefix.empty() ? field_name : current_prefix + "." + field_name;
+
+			    // Check if this exact path is mapped.
+			    bool is_mapped = mapped_paths.count(field_path) > 0;
+
+			    // Also check if any mapped path starts with this path (it's a parent of a mapped field).
+			    bool is_parent_of_mapped = false;
+			    for (const auto &mapped_path : mapped_paths) {
+				    if (mapped_path.find(field_path + ".") == 0) {
+					    is_parent_of_mapped = true;
+					    break;
+				    }
+			    }
+
+			    if (is_mapped) {
+				    // This field is mapped, but check if it is an object/nested type with child fields.
+				    // If the field has no children in mapped_paths, it's a terminal type (geo_point etc.)
+				    // and we should not recurse into it even if the value is an object.
+				    bool has_mapped_children = false;
+				    for (const auto &mp : mapped_paths) {
+					    if (mp.find(field_path + ".") == 0) {
+						    has_mapped_children = true;
+						    break;
+					    }
+				    }
+
+				    if (has_mapped_children && yyjson_is_obj(field_val)) {
+					    // This is an object/nested type with defined child fields, check for unmapped children.
+					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
+					    bool sub_has_unmapped = false;
+
+					    yyjson_obj_iter sub_iter;
+					    yyjson_obj_iter_init(field_val, &sub_iter);
+					    yyjson_val *sub_key;
+
+					    while ((sub_key = yyjson_obj_iter_next(&sub_iter))) {
+						    const char *subfield_name = yyjson_get_str(sub_key);
+						    yyjson_val *subfield_val = yyjson_obj_iter_get_val(sub_key);
+						    std::string subfield_path = field_path + "." + subfield_name;
+
+						    if (mapped_paths.count(subfield_path) == 0) {
+							    // Check if it's a parent of any mapped field.
+							    bool is_sub_parent = false;
+							    for (const auto &mp : mapped_paths) {
+								    if (mp.find(subfield_path + ".") == 0) {
+									    is_sub_parent = true;
+									    break;
+								    }
+							    }
+
+							    if (!is_sub_parent) {
+								    // This subfield is unmapped, add it.
+								    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, subfield_val);
+								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, copied);
+								    sub_has_unmapped = true;
+							    } else {
+								    // Recurse into this object.
+								    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
+								    collect_unmapped(subfield_val, nested_obj, subfield_path);
+								    if (yyjson_mut_obj_size(nested_obj) > 0) {
+									    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, nested_obj);
+									    sub_has_unmapped = true;
+								    }
+							    }
+						    } else if (yyjson_is_obj(subfield_val)) {
+							    // Recurse for nested mapped objects.
+							    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
+							    collect_unmapped(subfield_val, nested_obj, subfield_path);
+							    if (yyjson_mut_obj_size(nested_obj) > 0) {
+								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, nested_obj);
+								    sub_has_unmapped = true;
+							    }
+						    }
+					    }
+
+					    if (sub_has_unmapped) {
+						    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, sub_obj);
+						    has_unmapped = true;
+					    }
+				    }
+				    // Terminal type (geo_point, keyword etc.), do not recurse.
+			    } else if (is_parent_of_mapped) {
+				    // This is a parent object of mapped fields, recurse to find unmapped children.
+				    if (yyjson_is_obj(field_val)) {
+					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
+					    collect_unmapped(field_val, sub_obj, field_path);
+					    if (yyjson_mut_obj_size(sub_obj) > 0) {
+						    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, sub_obj);
+						    has_unmapped = true;
+					    }
+				    }
+			    } else {
+				    // This field is completely unmapped, add the entire value.
+				    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, field_val);
+				    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, copied);
+				    has_unmapped = true;
+			    }
+		    }
+	    };
+
+	collect_unmapped(source, unmapped_root, prefix);
+
+	std::string result;
+	if (has_unmapped) {
+		char *json_str = yyjson_mut_write(unmapped_doc, 0, nullptr);
+		if (json_str) {
+			result = json_str;
+			free(json_str);
+		}
+	}
+
+	yyjson_mut_doc_free(unmapped_doc);
+	return result;
 }
 
 // Main scan function.
@@ -647,11 +776,11 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 		yyjson_val *id_val = yyjson_obj_get(hit, "_id");
 
 		// Process each projected column.
-		for (idx_t out_col = 0; out_col < state.projected_columns.size(); out_col++) {
-			idx_t col_id = state.projected_columns[out_col];
-			const std::string &field_path = state.projected_field_paths[out_col];
-			const std::string &es_type = state.projected_es_types[out_col];
-			const LogicalType &col_type = state.projected_types[out_col];
+		for (idx_t out_col = 0; out_col < state.projected.column_indices.size(); out_col++) {
+			idx_t col_id = state.projected.column_indices[out_col];
+			const std::string &field_path = state.projected.field_paths[out_col];
+			const std::string &es_type = state.projected.es_types[out_col];
+			const LogicalType &col_type = state.projected.column_types[out_col];
 
 			if (col_id == 0) {
 				// _id column
@@ -663,7 +792,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 				}
 			} else if (field_path == "_unmapped_") {
 				// _unmapped_ column
-				std::string unmapped_json = CollectUnmappedFields(source, bind_data.all_mapped_paths);
+				std::string unmapped_json = CollectUnmappedFields(source, bind_data.schema.all_mapped_paths);
 				if (unmapped_json.empty()) {
 					FlatVector::SetNull(output.data[out_col], output_idx, true);
 				} else {
@@ -673,7 +802,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 			} else {
 				// regular field
 				yyjson_val *val = GetValueByPath(source, field_path);
-				SetValueFromJSON(val, output.data[out_col], output_idx, col_type, es_type);
+				ConvertJSONToDuckDB(val, output.data[out_col], output_idx, col_type, es_type);
 			}
 		}
 
@@ -726,12 +855,12 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 			return result;
 		}
 
-		if (bind_col_id > bind_data.all_column_names.size()) {
+		if (bind_col_id > bind_data.schema.column_names.size()) {
 			return result;
 		}
 
 		result.output_col_idx = output_col_idx;
-		result.full_path = bind_data.all_column_names[bind_col_id - 1];
+		result.full_path = bind_data.schema.column_names[bind_col_id - 1];
 		return result;
 	}
 
@@ -823,8 +952,8 @@ static GeoColumnInfo ExtractGeoColumnFromArg(const Expression &expr, const Elast
 
 	// Verify the column is a geo_point or geo_shape field.
 	const string &col_name = col_path.full_path;
-	auto it = bind_data.es_type_map.find(col_name);
-	if (it == bind_data.es_type_map.end()) {
+	auto it = bind_data.schema.es_type_map.find(col_name);
+	if (it == bind_data.schema.es_type_map.end()) {
 		return result;
 	}
 	if (it->second != "geo_point" && it->second != "geo_shape") {
@@ -1196,8 +1325,8 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 
 			if (col_path_info.IsValid()) {
 				const string &col_name = col_path_info.full_path;
-				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
-				bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
+				bool is_text_field = bind_data.schema.text_fields.count(col_name) > 0;
+				bool has_keyword_subfield = bind_data.schema.text_fields_with_keyword.count(col_name) > 0;
 
 				if (is_text_field && !has_keyword_subfield) {
 					throw InvalidInputException(
@@ -1253,8 +1382,8 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 
 				const string &col_name = col_path_info.full_path;
 				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
-				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
-				bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
+				bool is_text_field = bind_data.schema.text_fields.count(col_name) > 0;
+				bool has_keyword_subfield = bind_data.schema.text_fields_with_keyword.count(col_name) > 0;
 
 				// Text fields without .keyword subfield don't support pattern matching correctly.
 				if (is_text_field && !has_keyword_subfield) {
@@ -1453,8 +1582,8 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				const string &col_name = col_path_info.full_path;
 				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
 
-				bool is_text_field = bind_data.text_fields.count(col_name) > 0;
-				bool has_keyword_subfield = bind_data.text_fields_with_keyword.count(col_name) > 0;
+				bool is_text_field = bind_data.schema.text_fields.count(col_name) > 0;
+				bool has_keyword_subfield = bind_data.schema.text_fields_with_keyword.count(col_name) > 0;
 				if (is_text_field && !has_keyword_subfield) {
 					throw InvalidInputException(
 					    "Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"

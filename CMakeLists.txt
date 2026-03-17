@@ -14,9 +14,9 @@ project(${TARGET_NAME})
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/elasticsearch_extension.cpp
-                      src/elasticsearch_cache.cpp
                       src/elasticsearch_client.cpp
                       src/elasticsearch_common.cpp
+                      src/elasticsearch_schema.cpp
                       src/elasticsearch_query.cpp
                       src/elasticsearch_filter_pushdown.cpp
                       src/elasticsearch_optimizer.cpp)

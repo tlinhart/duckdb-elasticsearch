@@ -2,7 +2,6 @@
 #include "elasticsearch_common.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
@@ -15,6 +14,16 @@
 namespace duckdb {
 
 using namespace duckdb_yyjson;
+
+// Get Elasticsearch field name adding .keyword suffix for text fields that have a .keyword subfield.
+// For text fields without .keyword subfield returns the base field name (caller should handle appropriately).
+static std::string GetElasticsearchFieldName(const std::string &column_name, bool is_text_field,
+                                             bool has_keyword_subfield) {
+	if (is_text_field && has_keyword_subfield) {
+		return column_name + ".keyword";
+	}
+	return column_name;
+}
 
 // Forward declarations of static helper functions.
 static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
@@ -63,16 +72,18 @@ static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const Bo
 
 // Public API implementation.
 FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterSet &filters,
-                                         const vector<string> &column_names,
-                                         const unordered_map<string, string> &es_types,
-                                         const unordered_set<string> &text_fields,
-                                         const unordered_set<string> &text_fields_with_keyword) {
+                                         const vector<string> &column_names, const ElasticsearchSchema &schema) {
 	FilterTranslationResult result;
 	result.es_query = nullptr;
 
 	if (!filters.HasFilters()) {
 		return result;
 	}
+
+	// Extract the schema fields needed by the internal filter translation functions.
+	const auto &es_types = schema.es_type_map;
+	const auto &text_fields = schema.text_fields;
+	const auto &text_fields_with_keyword = schema.text_fields_with_keyword;
 
 	// Collect translated filters.
 	yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
@@ -190,7 +201,7 @@ static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const Co
 	}
 
 	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
-	yyjson_mut_val *value = DuckDBValueToJSON(doc, filter.constant);
+	yyjson_mut_val *value = ConvertDuckDBToJSON(doc, filter.constant);
 
 	switch (filter.comparison_type) {
 	case ExpressionType::COMPARE_EQUAL: {
@@ -392,7 +403,7 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 
 	yyjson_mut_val *values_arr = yyjson_mut_arr(doc);
 	for (auto &value : filter.values) {
-		yyjson_mut_val *json_val = DuckDBValueToJSON(doc, value);
+		yyjson_mut_val *json_val = ConvertDuckDBToJSON(doc, value);
 		yyjson_mut_arr_append(values_arr, json_val);
 	}
 
@@ -416,7 +427,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 	// - Spatial extension functions ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint
 	//
 	// Note: For text fields without .keyword subfield an error is thrown early in TranslateLikePattern.
-	// Only text fields with .keyword or non-text fields (keyword, etc.) reach the pattern translation.
+	// Only text fields with .keyword or non-text fields (keyword etc.) reach the pattern translation.
 	auto &expr = *filter.expr;
 
 	// Check if this is a function expression.
@@ -538,7 +549,7 @@ static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &f
 		// Text field with .keyword subfield, always use .keyword for both LIKE and ILIKE.
 		es_field = field_name + ".keyword";
 	} else {
-		// Non-text field (keyword, etc.), use base field.
+		// Non-text field (keyword etc.), use base field.
 		es_field = field_name;
 	}
 
