@@ -43,8 +43,8 @@ objects, geo types and multi-index queries.
 
 - Full support for Elasticsearch scalar types (`text`, `keyword`, `integer`,
   `float`, `date`, `boolean`, `ip` etc.)
-- Nested objects mapped to DuckDB `STRUCT` types.
-- Nested arrays mapped to `LIST(STRUCT(...))` types.
+- Nested objects mapped to DuckDB `STRUCT` type.
+- Nested arrays mapped to `LIST(STRUCT(...))` type.
 - Geo types (`geo_point`, `geo_shape`) converted to GeoJSON format.
 - WKT geometry strings automatically parsed and converted.
 
