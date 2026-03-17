@@ -50,8 +50,7 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
                                                  const string &column_name, bool is_text_field,
-                                                 bool has_keyword_subfield,
-                                                 const unordered_map<string, string> &es_types);
+                                                 bool has_keyword_subfield);
 
 static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
                                             bool is_text_field, bool has_keyword_subfield, bool case_insensitive);
@@ -61,8 +60,7 @@ static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_
 static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name);
 
 static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
-                                                 const string &column_name,
-                                                 const unordered_map<string, string> &es_types);
+                                                 const string &column_name);
 
 static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const BoundComparisonExpression &comp_expr,
                                                       const string &column_name);
@@ -164,7 +162,7 @@ static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &f
 
 	case TableFilterType::EXPRESSION_FILTER: {
 		auto &expr_filter = filter.Cast<ExpressionFilter>();
-		return TranslateExpressionFilter(doc, expr_filter, column_name, is_text_field, has_keyword_subfield, es_types);
+		return TranslateExpressionFilter(doc, expr_filter, column_name, is_text_field, has_keyword_subfield);
 	}
 
 	case TableFilterType::STRUCT_EXTRACT: {
@@ -418,10 +416,9 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
                                                  const string &column_name, bool is_text_field,
-                                                 bool has_keyword_subfield,
-                                                 const unordered_map<string, string> &es_types) {
+                                                 bool has_keyword_subfield) {
 	// ExpressionFilter contains arbitrary expressions. We handle:
-	// - LIKE/ILIKE patterns (~~, ~~~, like_escape, ilike_escape)
+	// - LIKE/ILIKE patterns (~~, ~~*, like_escape, ilike_escape)
 	// - Optimized string functions from LikeOptimizationRule (prefix, suffix, contains)
 	// - ST_Distance comparisons
 	// - Spatial extension functions ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint
@@ -496,7 +493,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 		string func_name_lower = StringUtil::Lower(func_name);
 		if (func_name_lower == "st_within" || func_name_lower == "st_intersects" || func_name_lower == "st_contains" ||
 		    func_name_lower == "st_disjoint") {
-			return TranslateGeospatialFilter(doc, func_expr, column_name, es_types);
+			return TranslateGeospatialFilter(doc, func_expr, column_name);
 		}
 		if (func_name_lower == "st_dwithin") {
 			return TranslateGeoDistanceDWithin(doc, func_expr, column_name);
@@ -931,8 +928,7 @@ static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const Bo
 // One argument must be a GEOMETRY column reference (the Elasticsearch field), the other
 // must be a constant geometry expression. Functions are symmetric in argument position.
 static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
-                                                 const string &column_name,
-                                                 const unordered_map<string, string> &es_types) {
+                                                 const string &column_name) {
 	string func_name = StringUtil::Lower(func_expr.function.name);
 
 	// Determine which child is the geo column reference and which is the constant geometry.

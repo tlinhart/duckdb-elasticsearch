@@ -1177,10 +1177,6 @@ static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparis
 		return false;
 	}
 
-	// Normalize the comparison operator so it reads as "ST_Distance(...) <operator> distance".
-	// If the function is on the right, flip the operator.
-	auto comparison_type = func_on_left ? expr_type : FlipComparisonExpression(expr_type);
-
 	// From ST_Distance's children, extract the geo column and the constant point.
 	auto &func_expr = dist_func_expr->Cast<BoundFunctionExpression>();
 

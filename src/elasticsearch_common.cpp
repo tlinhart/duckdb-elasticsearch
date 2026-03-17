@@ -649,12 +649,11 @@ yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path) {
 	if (!obj || !yyjson_is_obj(obj))
 		return nullptr;
 
-	size_t pos = 0;
 	size_t dot_pos;
 	yyjson_val *current = obj;
 	std::string remaining = path;
 
-	while ((dot_pos = remaining.find('.', pos)) != std::string::npos) {
+	while ((dot_pos = remaining.find('.')) != std::string::npos) {
 		std::string key = remaining.substr(0, dot_pos);
 		current = yyjson_obj_get(current, key.c_str());
 		if (!current || !yyjson_is_obj(current))
