@@ -550,14 +550,13 @@ extension detects arrays by sampling documents:
 ### Geospatial types
 
 `geo_point` and `geo_shape` fields are returned as native DuckDB `GEOMETRY`
-type. The spatial extension is not needed for basic geometry output;
-`CAST(column AS VARCHAR)` produces WKT text natively. Spatial functions like
-`ST_Within`, `ST_Intersects` etc. require the spatial extension.
+type so the spatial extension is not needed for basic geometry output. Spatial
+functions like `ST_Within`, `ST_Intersects` etc. require the spatial extension.
 
 `geo_point` values are converted to WKB `Point` type. All five Elasticsearch
 input formats are supported:
 
-| Input format | Example                                                | WKT output (via `CAST`)   |
+| Input format | Example                                                | WKT output                |
 | ------------ | ------------------------------------------------------ | ------------------------- |
 | object       | `{"lat": 40.7128, "lon": -74.006}`                     | `POINT (-74.006 40.7128)` |
 | GeoJSON      | `{"type": "Point", "coordinates": [-74.006, 40.7128]}` | `POINT (-74.006 40.7128)` |
