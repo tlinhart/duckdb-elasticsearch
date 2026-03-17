@@ -1,10 +1,34 @@
 # name: test/sql/geospatial.test
-# description: Test geo types handling, GeoJSON conversion and geospatial queries
+# description: Test geo types handling and geospatial queries
 # group: [sql]
 
 require elasticsearch
 
 require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Test that geo_point columns have GEOMETRY type.
+query I
+SELECT typeof(location) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+GEOMETRY
+
+# Test that geo_shape columns have GEOMETRY type.
+query I
+SELECT typeof(geometry) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '1';
+----
+GEOMETRY
 
 # Test geo_point with object format ({"lat": 40.7128, "lon": -74.006}).
 query I
@@ -16,7 +40,7 @@ SELECT location FROM elasticsearch_query(
 )
 WHERE _id = '1';
 ----
-{"type":"Point","coordinates":[-74.006,40.7128]}
+POINT (-74.006 40.7128)
 
 # Test geo_point with string format ("51.5074,-0.1278").
 query I
@@ -28,7 +52,7 @@ SELECT location FROM elasticsearch_query(
 )
 WHERE _id = '2';
 ----
-{"type":"Point","coordinates":[-0.1278,51.5074]}
+POINT (-0.1278 51.5074)
 
 # Test geo_point with array format ([-118.2437, 34.0522]).
 query I
@@ -40,7 +64,7 @@ SELECT location FROM elasticsearch_query(
 )
 WHERE _id = '3';
 ----
-{"type":"Point","coordinates":[-118.2437,34.0522]}
+POINT (-118.2437 34.0522)
 
 # Test geo_point with WKT format ("POINT (139.6917 35.6895)").
 query I
@@ -52,7 +76,7 @@ SELECT location FROM elasticsearch_query(
 )
 WHERE _id = '4';
 ----
-{"type":"Point","coordinates":[139.6917,35.6895]}
+POINT (139.6917 35.6895)
 
 # Test geo_point with GeoJSON format ({"type": "Point", "coordinates": [2.3522, 48.8566]}).
 query I
@@ -64,7 +88,7 @@ SELECT location FROM elasticsearch_query(
 )
 WHERE _id = '6';
 ----
-{"type":"Point","coordinates":[2.3522,48.8566]}
+POINT (2.3522 48.8566)
 
 # Test geo_shape Point.
 query I
@@ -76,7 +100,7 @@ SELECT geometry FROM elasticsearch_query(
 )
 WHERE _id = '1';
 ----
-{"type":"Point","coordinates":[-122.4194,37.7749]}
+POINT (-122.4194 37.7749)
 
 # Test geo_shape LineString.
 query I
@@ -88,7 +112,7 @@ SELECT geometry FROM elasticsearch_query(
 )
 WHERE _id = '2';
 ----
-{"type":"LineString","coordinates":[[-73.9857,40.7484],[-73.9851,40.7479],[-73.9845,40.7475]]}
+LINESTRING (-73.9857 40.7484, -73.9851 40.7479, -73.9845 40.7475)
 
 # Test geo_shape Polygon.
 query I
@@ -100,7 +124,7 @@ SELECT geometry FROM elasticsearch_query(
 )
 WHERE _id = '3';
 ----
-{"type":"Polygon","coordinates":[[[-0.1357,51.5194],[-0.1197,51.5194],[-0.1197,51.5094],[-0.1357,51.5094],[-0.1357,51.5194]]]}
+POLYGON ((-0.1357 51.5194, -0.1197 51.5194, -0.1197 51.5094, -0.1357 51.5094, -0.1357 51.5194))
 
 # Test geo_shape MultiPoint.
 query I
@@ -112,37 +136,13 @@ SELECT geometry FROM elasticsearch_query(
 )
 WHERE _id = '4';
 ----
-{"type":"MultiPoint","coordinates":[[2.3522,48.8566],[2.3488,48.8534],[2.3555,48.8601]]}
+MULTIPOINT (2.3522 48.8566, 2.3488 48.8534, 2.3555 48.8601)
 
 statement ok
 INSTALL spatial;
 
 statement ok
 LOAD spatial;
-
-# Test deserialization from GeoJSON to GEOMETRY type (geo_point field).
-query I
-SELECT ST_GeomFromGeoJSON(location) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE _id = '3';
-----
-POINT (-118.2437 34.0522)
-
-# Test deserialization from GeoJSON to GEOMETRY type (geo_shape field).
-query I
-SELECT ST_GeomFromGeoJSON(geometry) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE _id = '4';
-----
-MULTIPOINT (2.3522 48.8566, 2.3488 48.8534, 2.3555 48.8601)
 
 # Test geo_bounding_box query via ST_Within on geo_point field.
 query I
@@ -152,7 +152,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_GeomFromGeoJSON(location), ST_MakeEnvelope(-1, 33, 0, 52));
+WHERE ST_Within(location, ST_MakeEnvelope(-1, 33, 0, 52));
 ----
 Michael Brown
 
@@ -164,7 +164,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Contains(ST_MakeEnvelope(-1, 33, 0, 52), ST_GeomFromGeoJSON(location));
+WHERE ST_Contains(ST_MakeEnvelope(-1, 33, 0, 52), location);
 ----
 Michael Brown
 
@@ -176,7 +176,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Intersects(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+WHERE ST_Intersects(geometry, ST_Point(-122.4194, 37.7749));
 ----
 Alice Johnson
 
@@ -188,7 +188,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Intersects(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry));
+WHERE ST_Intersects(ST_Point(-122.4194, 37.7749), geometry);
 ----
 Alice Johnson
 
@@ -200,7 +200,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Contains(ST_GeomFromGeoJSON(geometry), ST_Point(-0.13, 51.51));
+WHERE ST_Contains(geometry, ST_Point(-0.13, 51.51));
 ----
 Emma Wilson
 
@@ -212,7 +212,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_Point(-0.13, 51.51), ST_GeomFromGeoJSON(geometry));
+WHERE ST_Within(ST_Point(-0.13, 51.51), geometry);
 ----
 Emma Wilson
 
@@ -224,7 +224,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_GeomFromGeoJSON(geometry), ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-123,37],[-122,37],[-122,38],[-123,38],[-123,37]]]}'));
+WHERE ST_Within(geometry, ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-123,37],[-122,37],[-122,38],[-123,38],[-123,37]]]}'));
 ----
 Alice Johnson
 
@@ -236,7 +236,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Disjoint(ST_GeomFromGeoJSON(geometry), ST_Point(12.4964, 41.9028));
+WHERE ST_Disjoint(geometry, ST_Point(12.4964, 41.9028));
 ----
 Alice Johnson
 Benjamin Lee
@@ -256,7 +256,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_GeomFromGeoJSON(location), ST_MakeEnvelope(-10, 30, 10, 55)) AND
+WHERE ST_Within(location, ST_MakeEnvelope(-10, 30, 10, 55)) AND
       amount < 90;
 ----
 Michael Brown
@@ -269,7 +269,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000;
+WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) < 10000;
 ----
 Alice Johnson
 Benjamin Lee
@@ -282,7 +282,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) <= 10000;
+WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) <= 10000;
 ----
 Alice Johnson
 Benjamin Lee
@@ -295,7 +295,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location)) < 10000;
+WHERE ST_Distance(ST_Point(-74.006, 40.7128), location) < 10000;
 ----
 Alice Johnson
 Benjamin Lee
@@ -308,7 +308,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE 10000 > ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128));
+WHERE 10000 > ST_Distance(location, ST_Point(-74.006, 40.7128));
 ----
 Alice Johnson
 Benjamin Lee
@@ -321,7 +321,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) > 10000;
+WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) > 10000;
 ----
 Charlotte Anderson
 Daniel Taylor
@@ -340,7 +340,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749)) < 500000;
+WHERE ST_Distance(geometry, ST_Point(-122.4194, 37.7749)) < 500000;
 ----
 Alice Johnson
 
@@ -352,7 +352,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000 AND
+WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) < 10000 AND
       amount > 50;
 ----
 Benjamin Lee
@@ -365,7 +365,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000);
+WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000);
 ----
 Alice Johnson
 Benjamin Lee
@@ -378,7 +378,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location), 10000);
+WHERE ST_DWithin(ST_Point(-74.006, 40.7128), location, 10000);
 ----
 Alice Johnson
 Benjamin Lee
@@ -391,7 +391,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749), 500000);
+WHERE ST_DWithin(geometry, ST_Point(-122.4194, 37.7749), 500000);
 ----
 Alice Johnson
 
@@ -403,7 +403,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000) AND
+WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000) AND
       amount > 50;
 ----
 Benjamin Lee

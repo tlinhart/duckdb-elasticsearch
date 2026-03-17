@@ -2,32 +2,243 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/geometry.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
-#include <iomanip>
-#include <sstream>
+#include <cstring>
 
 namespace duckdb {
 
 using namespace duckdb_yyjson;
 
-// Formats a coordinate value as a string without trailing zeros.
-// This produces cleaner GeoJSON output like [-74.006,40.7128] instead of [-74.006000,40.712800].
-static std::string CoordinateToString(double val) {
-	std::ostringstream oss;
-	oss << std::setprecision(15) << val;
-	std::string s = oss.str();
+// Writes little-endian WKB binary into a growable buffer.
+// The output can be stored directly in a GEOMETRY vector via StringVector::AddStringOrBlob().
+class WKBWriter {
+public:
+	void WriteHeader(uint32_t type_id) {
+		WriteByte(0x01); // little-endian byte order
+		WriteUInt32(type_id);
+	}
 
-	// Remove trailing zeros after decimal point.
-	if (s.find('.') != std::string::npos) {
-		s.erase(s.find_last_not_of('0') + 1, std::string::npos);
-		// Remove trailing decimal point if no decimals remain.
-		if (s.back() == '.') {
-			s.pop_back();
+	void WritePoint(double x, double y) {
+		WriteDouble(x);
+		WriteDouble(y);
+	}
+
+	void WriteUInt32(uint32_t val) {
+		buf.append(reinterpret_cast<const char *>(&val), sizeof(val));
+	}
+
+	void WriteDouble(double val) {
+		buf.append(reinterpret_cast<const char *>(&val), sizeof(val));
+	}
+
+	void WriteByte(uint8_t val) {
+		buf.push_back(static_cast<char>(val));
+	}
+
+	// Store the buffer into a GEOMETRY vector and return the string_t handle.
+	string_t Store(Vector &result) {
+		return StringVector::AddStringOrBlob(result, buf.data(), buf.size());
+	}
+
+private:
+	std::string buf;
+};
+
+// WKB type IDs for 2D geometries.
+static constexpr uint32_t WKB_POINT = 1;
+static constexpr uint32_t WKB_LINESTRING = 2;
+static constexpr uint32_t WKB_POLYGON = 3;
+static constexpr uint32_t WKB_MULTIPOINT = 4;
+static constexpr uint32_t WKB_MULTILINESTRING = 5;
+static constexpr uint32_t WKB_MULTIPOLYGON = 6;
+static constexpr uint32_t WKB_GEOMETRYCOLLECTION = 7;
+
+// Forward declaration for recursive GeoJSON to WKB conversion.
+static bool GeoJSONObjectToWKB(yyjson_val *val, WKBWriter &writer);
+
+// Helper to get a numeric value from a yyjson value (handles both real and int).
+static double YyjsonGetNum(yyjson_val *val) {
+	if (yyjson_is_real(val)) {
+		return yyjson_get_real(val);
+	}
+	if (yyjson_is_int(val)) {
+		return static_cast<double>(yyjson_get_int(val));
+	}
+	if (yyjson_is_sint(val)) {
+		return static_cast<double>(yyjson_get_sint(val));
+	}
+	return 0.0;
+}
+
+// Write a GeoJSON coordinates array [lon, lat] as a WKB point (no header).
+static bool WriteGeoJSONCoordinates(yyjson_val *coord, WKBWriter &writer) {
+	if (!coord || !yyjson_is_arr(coord) || yyjson_arr_size(coord) < 2) {
+		return false;
+	}
+	double x = YyjsonGetNum(yyjson_arr_get(coord, 0));
+	double y = YyjsonGetNum(yyjson_arr_get(coord, 1));
+	writer.WritePoint(x, y);
+	return true;
+}
+
+// Write a GeoJSON coordinate ring [[lon, lat], [lon, lat], ...] (writes count + points, no header).
+static bool WriteGeoJSONCoordinateRing(yyjson_val *ring, WKBWriter &writer) {
+	if (!ring || !yyjson_is_arr(ring)) {
+		return false;
+	}
+	uint32_t count = static_cast<uint32_t>(yyjson_arr_size(ring));
+	writer.WriteUInt32(count);
+	size_t idx, max;
+	yyjson_val *coord;
+	yyjson_arr_foreach(ring, idx, max, coord) {
+		if (!WriteGeoJSONCoordinates(coord, writer)) {
+			return false;
 		}
 	}
-	return s;
+	return true;
+}
+
+// Recursively convert a GeoJSON object to WKB.
+static bool GeoJSONObjectToWKB(yyjson_val *val, WKBWriter &writer) {
+	if (!val || !yyjson_is_obj(val)) {
+		return false;
+	}
+
+	yyjson_val *type_val = yyjson_obj_get(val, "type");
+	if (!type_val || !yyjson_is_str(type_val)) {
+		return false;
+	}
+	const char *type_str = yyjson_get_str(type_val);
+
+	if (strcmp(type_str, "Point") == 0) {
+		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+		if (!coords || !yyjson_is_arr(coords) || yyjson_arr_size(coords) < 2) {
+			return false;
+		}
+		writer.WriteHeader(WKB_POINT);
+		double x = YyjsonGetNum(yyjson_arr_get(coords, 0));
+		double y = YyjsonGetNum(yyjson_arr_get(coords, 1));
+		writer.WritePoint(x, y);
+		return true;
+	}
+
+	if (strcmp(type_str, "LineString") == 0) {
+		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+		if (!coords || !yyjson_is_arr(coords)) {
+			return false;
+		}
+		writer.WriteHeader(WKB_LINESTRING);
+		return WriteGeoJSONCoordinateRing(coords, writer);
+	}
+
+	if (strcmp(type_str, "Polygon") == 0) {
+		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+		if (!coords || !yyjson_is_arr(coords)) {
+			return false;
+		}
+		writer.WriteHeader(WKB_POLYGON);
+		uint32_t nrings = static_cast<uint32_t>(yyjson_arr_size(coords));
+		writer.WriteUInt32(nrings);
+		size_t idx, max;
+		yyjson_val *ring;
+		yyjson_arr_foreach(coords, idx, max, ring) {
+			if (!WriteGeoJSONCoordinateRing(ring, writer)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	if (strcmp(type_str, "MultiPoint") == 0) {
+		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+		if (!coords || !yyjson_is_arr(coords)) {
+			return false;
+		}
+		writer.WriteHeader(WKB_MULTIPOINT);
+		uint32_t npoints = static_cast<uint32_t>(yyjson_arr_size(coords));
+		writer.WriteUInt32(npoints);
+		size_t idx, max;
+		yyjson_val *coord;
+		yyjson_arr_foreach(coords, idx, max, coord) {
+			// Each sub-geometry is a full WKB Point.
+			writer.WriteHeader(WKB_POINT);
+			if (!WriteGeoJSONCoordinates(coord, writer)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	if (strcmp(type_str, "MultiLineString") == 0) {
+		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+		if (!coords || !yyjson_is_arr(coords)) {
+			return false;
+		}
+		writer.WriteHeader(WKB_MULTILINESTRING);
+		uint32_t nlines = static_cast<uint32_t>(yyjson_arr_size(coords));
+		writer.WriteUInt32(nlines);
+		size_t idx, max;
+		yyjson_val *line;
+		yyjson_arr_foreach(coords, idx, max, line) {
+			writer.WriteHeader(WKB_LINESTRING);
+			if (!WriteGeoJSONCoordinateRing(line, writer)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	if (strcmp(type_str, "MultiPolygon") == 0) {
+		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+		if (!coords || !yyjson_is_arr(coords)) {
+			return false;
+		}
+		writer.WriteHeader(WKB_MULTIPOLYGON);
+		uint32_t npolys = static_cast<uint32_t>(yyjson_arr_size(coords));
+		writer.WriteUInt32(npolys);
+		size_t poly_idx, poly_max;
+		yyjson_val *poly;
+		yyjson_arr_foreach(coords, poly_idx, poly_max, poly) {
+			if (!yyjson_is_arr(poly)) {
+				return false;
+			}
+			writer.WriteHeader(WKB_POLYGON);
+			uint32_t nrings = static_cast<uint32_t>(yyjson_arr_size(poly));
+			writer.WriteUInt32(nrings);
+			size_t ring_idx, ring_max;
+			yyjson_val *ring;
+			yyjson_arr_foreach(poly, ring_idx, ring_max, ring) {
+				if (!WriteGeoJSONCoordinateRing(ring, writer)) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	if (strcmp(type_str, "GeometryCollection") == 0) {
+		yyjson_val *geometries = yyjson_obj_get(val, "geometries");
+		if (!geometries || !yyjson_is_arr(geometries)) {
+			return false;
+		}
+		writer.WriteHeader(WKB_GEOMETRYCOLLECTION);
+		uint32_t ngeoms = static_cast<uint32_t>(yyjson_arr_size(geometries));
+		writer.WriteUInt32(ngeoms);
+		size_t idx, max;
+		yyjson_val *geom;
+		yyjson_arr_foreach(geometries, idx, max, geom) {
+			if (!GeoJSONObjectToWKB(geom, writer)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Unknown GeoJSON type.
+	return false;
 }
 
 // Helper to trim whitespace from string.
@@ -39,496 +250,399 @@ static std::string TrimString(const std::string &s) {
 	return s.substr(start, end - start + 1);
 }
 
-// Helper to parse a coordinate pair "lon lat" from WKT.
-static bool ParseWKTCoordinate(const std::string &s, double &lon, double &lat) {
-	std::string trimmed = TrimString(s);
-	size_t space_pos = trimmed.find(' ');
-	if (space_pos == std::string::npos)
-		return false;
-
-	try {
-		lon = std::stod(trimmed.substr(0, space_pos));
-		lat = std::stod(TrimString(trimmed.substr(space_pos + 1)));
-		return true;
-	} catch (...) {
+// Convert an Elasticsearch geo_point value to WKB Point.
+// Handles all 5 input formats:
+// 1. object: {"lat": 41.12, "lon": -71.34}
+// 2. GeoJSON: {"type": "Point", "coordinates": [-71.34, 41.12]}
+// 3. array: [-71.34, 41.12] (lon, lat order)
+// 4. string: "41.12,-71.34" (lat, lon order)
+// 5. WKT: "POINT (-71.34 41.12)"
+static bool GeoPointToWKB(yyjson_val *val, WKBWriter &writer) {
+	if (!val) {
 		return false;
 	}
-}
 
-// Helper to parse a coordinate sequence "lon1 lat1, lon2 lat2, ..." into JSON array string.
-static std::string ParseWKTCoordinateSequence(const std::string &s) {
-	std::string result = "[";
-	std::string remaining = s;
-	bool first = true;
-
-	while (!remaining.empty()) {
-		size_t comma_pos = remaining.find(',');
-		std::string coord_str;
-		if (comma_pos == std::string::npos) {
-			coord_str = remaining;
-			remaining = "";
-		} else {
-			coord_str = remaining.substr(0, comma_pos);
-			remaining = remaining.substr(comma_pos + 1);
-		}
-
-		double lon, lat;
-		if (!ParseWKTCoordinate(coord_str, lon, lat)) {
-			return "";
-		}
-
-		if (!first)
-			result += ",";
-		first = false;
-		result += "[" + CoordinateToString(lon) + "," + CoordinateToString(lat) + "]";
-	}
-
-	result += "]";
-	return result;
-}
-
-// Helper to find matching closing parenthesis.
-static size_t FindMatchingParenthesis(const std::string &s, size_t open_pos) {
-	int depth = 1;
-	for (size_t i = open_pos + 1; i < s.size(); i++) {
-		if (s[i] == '(')
-			depth++;
-		else if (s[i] == ')') {
-			depth--;
-			if (depth == 0)
-				return i;
-		}
-	}
-	return std::string::npos;
-}
-
-// Parse WKT POINT to GeoJSON.
-static std::string WKTPointToGeoJSON(const std::string &wkt) {
-	size_t paren_start = wkt.find('(');
-	size_t paren_end = wkt.rfind(')');
-	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
-		return "";
-	}
-
-	std::string coords = wkt.substr(paren_start + 1, paren_end - paren_start - 1);
-	double lon, lat;
-	if (!ParseWKTCoordinate(coords, lon, lat)) {
-		return "";
-	}
-
-	return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon) + "," + CoordinateToString(lat) + "]}";
-}
-
-// Parse WKT LINESTRING to GeoJSON.
-static std::string WKTLineStringToGeoJSON(const std::string &wkt) {
-	size_t paren_start = wkt.find('(');
-	size_t paren_end = wkt.rfind(')');
-	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
-		return "";
-	}
-
-	std::string coords = wkt.substr(paren_start + 1, paren_end - paren_start - 1);
-	std::string coord_array = ParseWKTCoordinateSequence(coords);
-	if (coord_array.empty()) {
-		return "";
-	}
-
-	return "{\"type\":\"LineString\",\"coordinates\":" + coord_array + "}";
-}
-
-// Parse WKT POLYGON to GeoJSON.
-static std::string WKTPolygonToGeoJSON(const std::string &wkt) {
-	size_t paren_start = wkt.find('(');
-	if (paren_start == std::string::npos) {
-		return "";
-	}
-
-	std::string rings_str = wkt.substr(paren_start + 1);
-	// Remove trailing parenthesis.
-	if (!rings_str.empty() && rings_str.back() == ')') {
-		rings_str.pop_back();
-	}
-
-	std::string result = "{\"type\":\"Polygon\",\"coordinates\":[";
-	bool first_ring = true;
-
-	size_t pos = 0;
-	while (pos < rings_str.size()) {
-		// Find the next ring starting with parenthesis.
-		size_t ring_start = rings_str.find('(', pos);
-		if (ring_start == std::string::npos)
-			break;
-
-		size_t ring_end = FindMatchingParenthesis(rings_str, ring_start);
-		if (ring_end == std::string::npos) {
-			return "";
-		}
-
-		std::string ring_coords = rings_str.substr(ring_start + 1, ring_end - ring_start - 1);
-		std::string coord_array = ParseWKTCoordinateSequence(ring_coords);
-		if (coord_array.empty()) {
-			return "";
-		}
-
-		if (!first_ring)
-			result += ",";
-		first_ring = false;
-		result += coord_array;
-
-		pos = ring_end + 1;
-	}
-
-	result += "]}";
-	return result;
-}
-
-// Parse WKT MULTIPOINT to GeoJSON.
-static std::string WKTMultiPointToGeoJSON(const std::string &wkt) {
-	size_t paren_start = wkt.find('(');
-	size_t paren_end = wkt.rfind(')');
-	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
-		return "";
-	}
-
-	std::string content = wkt.substr(paren_start + 1, paren_end - paren_start - 1);
-	content = TrimString(content);
-
-	std::string result = "{\"type\":\"MultiPoint\",\"coordinates\":[";
-	bool first = true;
-
-	if (content.find('(') != std::string::npos) {
-		// It's ((lon lat), (lon lat)) format.
-		size_t pos = 0;
-		while (pos < content.size()) {
-			size_t point_start = content.find('(', pos);
-			if (point_start == std::string::npos)
-				break;
-
-			size_t point_end = content.find(')', point_start);
-			if (point_end == std::string::npos) {
-				return "";
-			}
-
-			std::string point_coords = content.substr(point_start + 1, point_end - point_start - 1);
-			double lon, lat;
-			if (!ParseWKTCoordinate(point_coords, lon, lat)) {
-				return "";
-			}
-
-			if (!first)
-				result += ",";
-			first = false;
-			result += "[" + CoordinateToString(lon) + "," + CoordinateToString(lat) + "]";
-
-			pos = point_end + 1;
-		}
-	} else {
-		// It's (lon1 lat1, lon2 lat2) format (simple coordinate list).
-		std::string coord_array = ParseWKTCoordinateSequence(content);
-		if (coord_array.empty()) {
-			return "";
-		}
-		// coord_array already has [], so strip them and use the content.
-		result += coord_array.substr(1, coord_array.size() - 2);
-		first = false;
-	}
-
-	result += "]}";
-	return result;
-}
-
-// Parse WKT MULTILINESTRING to GeoJSON.
-static std::string WKTMultiLineStringToGeoJSON(const std::string &wkt) {
-	size_t paren_start = wkt.find('(');
-	if (paren_start == std::string::npos) {
-		return "";
-	}
-
-	std::string lines_str = wkt.substr(paren_start + 1);
-	if (!lines_str.empty() && lines_str.back() == ')') {
-		lines_str.pop_back();
-	}
-
-	std::string result = "{\"type\":\"MultiLineString\",\"coordinates\":[";
-	bool first_line = true;
-
-	size_t pos = 0;
-	while (pos < lines_str.size()) {
-		size_t line_start = lines_str.find('(', pos);
-		if (line_start == std::string::npos)
-			break;
-
-		size_t line_end = FindMatchingParenthesis(lines_str, line_start);
-		if (line_end == std::string::npos) {
-			return "";
-		}
-
-		std::string line_coords = lines_str.substr(line_start + 1, line_end - line_start - 1);
-		std::string coord_array = ParseWKTCoordinateSequence(line_coords);
-		if (coord_array.empty()) {
-			return "";
-		}
-
-		if (!first_line)
-			result += ",";
-		first_line = false;
-		result += coord_array;
-
-		pos = line_end + 1;
-	}
-
-	result += "]}";
-	return result;
-}
-
-// Parse WKT MULTIPOLYGON to GeoJSON.
-static std::string WKTMultiPolygonToGeoJSON(const std::string &wkt) {
-	size_t paren_start = wkt.find('(');
-	if (paren_start == std::string::npos) {
-		return "";
-	}
-
-	std::string polys_str = wkt.substr(paren_start + 1);
-	if (!polys_str.empty() && polys_str.back() == ')') {
-		polys_str.pop_back();
-	}
-
-	std::string result = "{\"type\":\"MultiPolygon\",\"coordinates\":[";
-	bool first_poly = true;
-
-	size_t pos = 0;
-	while (pos < polys_str.size()) {
-		// Find the start of a polygon (double parenthesis).
-		size_t poly_start = polys_str.find('(', pos);
-		if (poly_start == std::string::npos)
-			break;
-
-		size_t poly_end = FindMatchingParenthesis(polys_str, poly_start);
-		if (poly_end == std::string::npos) {
-			return "";
-		}
-
-		// Parse the rings within this polygon.
-		std::string rings_str = polys_str.substr(poly_start + 1, poly_end - poly_start - 1);
-
-		std::string poly_coords = "[";
-		bool first_ring = true;
-
-		size_t ring_pos = 0;
-		while (ring_pos < rings_str.size()) {
-			size_t ring_start = rings_str.find('(', ring_pos);
-			if (ring_start == std::string::npos)
-				break;
-
-			size_t ring_end = FindMatchingParenthesis(rings_str, ring_start);
-			if (ring_end == std::string::npos) {
-				return "";
-			}
-
-			std::string ring_coords = rings_str.substr(ring_start + 1, ring_end - ring_start - 1);
-			std::string coord_array = ParseWKTCoordinateSequence(ring_coords);
-			if (coord_array.empty()) {
-				return "";
-			}
-
-			if (!first_ring)
-				poly_coords += ",";
-			first_ring = false;
-			poly_coords += coord_array;
-
-			ring_pos = ring_end + 1;
-		}
-
-		poly_coords += "]";
-
-		if (!first_poly)
-			result += ",";
-		first_poly = false;
-		result += poly_coords;
-
-		pos = poly_end + 1;
-	}
-
-	result += "]}";
-	return result;
-}
-
-// Parse WKT GEOMETRYCOLLECTION to GeoJSON.
-static std::string WKTGeometryCollectionToGeoJSON(const std::string &wkt) {
-	size_t paren_start = wkt.find('(');
-	size_t paren_end = wkt.rfind(')');
-	if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
-		return "";
-	}
-
-	std::string content = wkt.substr(paren_start + 1, paren_end - paren_start - 1);
-
-	std::string result = "{\"type\":\"GeometryCollection\",\"geometries\":[";
-	bool first = true;
-
-	// Parse individual geometries (separated by commas at depth 0).
-	size_t pos = 0;
-	while (pos < content.size()) {
-		// Skip whitespace and commas.
-		while (pos < content.size() && (content[pos] == ' ' || content[pos] == ',' || content[pos] == '\t' ||
-		                                content[pos] == '\n' || content[pos] == '\r')) {
-			pos++;
-		}
-		if (pos >= content.size())
-			break;
-
-		// Find the geometry type keyword.
-		size_t geom_start = pos;
-
-		// Find the opening parenthesis of this geometry.
-		size_t geom_paren = content.find('(', pos);
-		if (geom_paren == std::string::npos)
-			break;
-
-		// Find the matching closing parenthesis.
-		size_t geom_end = FindMatchingParenthesis(content, geom_paren);
-		if (geom_end == std::string::npos) {
-			return "";
-		}
-
-		std::string sub_wkt = content.substr(geom_start, geom_end - geom_start + 1);
-		std::string sub_geojson = WKTToGeoJSON(sub_wkt);
-		if (sub_geojson.empty()) {
-			return "";
-		}
-
-		if (!first)
-			result += ",";
-		first = false;
-		result += sub_geojson;
-
-		pos = geom_end + 1;
-	}
-
-	result += "]}";
-	return result;
-}
-
-// Convert WKT string to GeoJSON.
-std::string WKTToGeoJSON(const std::string &wkt) {
-	std::string trimmed = TrimString(wkt);
-	if (trimmed.empty()) {
-		return "";
-	}
-
-	// Check for WKT type keywords (uppercase only).
-	if (trimmed.find("GEOMETRYCOLLECTION") == 0) {
-		return WKTGeometryCollectionToGeoJSON(trimmed);
-	} else if (trimmed.find("MULTIPOLYGON") == 0) {
-		return WKTMultiPolygonToGeoJSON(trimmed);
-	} else if (trimmed.find("MULTILINESTRING") == 0) {
-		return WKTMultiLineStringToGeoJSON(trimmed);
-	} else if (trimmed.find("MULTIPOINT") == 0) {
-		return WKTMultiPointToGeoJSON(trimmed);
-	} else if (trimmed.find("POLYGON") == 0) {
-		return WKTPolygonToGeoJSON(trimmed);
-	} else if (trimmed.find("LINESTRING") == 0) {
-		return WKTLineStringToGeoJSON(trimmed);
-	} else if (trimmed.find("POINT") == 0) {
-		return WKTPointToGeoJSON(trimmed);
-	}
-
-	// Unknown WKT type.
-	return "";
-}
-
-// Convert Elasticsearch geo_point to GeoJSON format.
-static std::string GeoPointToGeoJSON(yyjson_val *val) {
-	if (!val)
-		return "";
-
-	// geo_point can be in multiple formats:
-	// 1. object: {"lat": 41.12, "lon": -71.34}
-	// 2. GeoJSON: {"type": "Point", "coordinates": [-71.34, 41.12]}
-	// 3. array: [-71.34, 41.12] (lon, lat order)
-	// 4. string: "41.12,-71.34" or geohash
-	// 5. WKT: "POINT (-71.34 41.12)"
+	double lon = 0, lat = 0;
 
 	if (yyjson_is_obj(val)) {
-		// lat/lon object: {"lat": 41.12, "lon": -71.34}
-		yyjson_val *lat = yyjson_obj_get(val, "lat");
-		yyjson_val *lon = yyjson_obj_get(val, "lon");
-		if (lat && lon) {
-			double lat_d = yyjson_is_real(lat) ? yyjson_get_real(lat) : static_cast<double>(yyjson_get_sint(lat));
-			double lon_d = yyjson_is_real(lon) ? yyjson_get_real(lon) : static_cast<double>(yyjson_get_sint(lon));
-			return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon_d) + "," +
-			       CoordinateToString(lat_d) + "]}";
-		}
-
-		// GeoJSON object: {"type": "Point", "coordinates": [lon, lat]}
-		yyjson_val *type_val = yyjson_obj_get(val, "type");
-		yyjson_val *coords = yyjson_obj_get(val, "coordinates");
-		if (type_val && yyjson_is_str(type_val) && coords && yyjson_is_arr(coords)) {
-			char *json_str = yyjson_val_write(val, 0, nullptr);
-			if (json_str) {
-				std::string result(json_str);
-				free(json_str);
-				return result;
+		// Check for lat/lon object first: {"lat": 41.12, "lon": -71.34}
+		yyjson_val *lat_val = yyjson_obj_get(val, "lat");
+		yyjson_val *lon_val = yyjson_obj_get(val, "lon");
+		if (lat_val && lon_val) {
+			lat = YyjsonGetNum(lat_val);
+			lon = YyjsonGetNum(lon_val);
+		} else {
+			// GeoJSON object: {"type": "Point", "coordinates": [lon, lat]}
+			yyjson_val *coords = yyjson_obj_get(val, "coordinates");
+			if (!coords || !yyjson_is_arr(coords) || yyjson_arr_size(coords) < 2) {
+				return false;
 			}
+			lon = YyjsonGetNum(yyjson_arr_get(coords, 0));
+			lat = YyjsonGetNum(yyjson_arr_get(coords, 1));
 		}
 	} else if (yyjson_is_arr(val)) {
 		// Array: [-71.34, 41.12] (lon, lat order)
-		yyjson_val *lon = yyjson_arr_get(val, 0);
-		yyjson_val *lat = yyjson_arr_get(val, 1);
-		if (lat && lon) {
-			double lat_d = yyjson_is_real(lat) ? yyjson_get_real(lat) : static_cast<double>(yyjson_get_sint(lat));
-			double lon_d = yyjson_is_real(lon) ? yyjson_get_real(lon) : static_cast<double>(yyjson_get_sint(lon));
-			return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon_d) + "," +
-			       CoordinateToString(lat_d) + "]}";
+		if (yyjson_arr_size(val) < 2) {
+			return false;
 		}
+		lon = YyjsonGetNum(yyjson_arr_get(val, 0));
+		lat = YyjsonGetNum(yyjson_arr_get(val, 1));
 	} else if (yyjson_is_str(val)) {
 		const char *str = yyjson_get_str(val);
 		std::string s(str);
 
-		// WKT: "POINT (lon lat)"
-		if (s.find("POINT") == 0) {
-			return WKTPointToGeoJSON(s);
-		}
-
-		// "lat,lon" string: "41.12,-71.34"
-		auto comma_pos = s.find(',');
-		if (comma_pos != std::string::npos) {
+		// WKT: "POINT (lon lat)" or "POINT(lon lat)"
+		std::string trimmed = TrimString(s);
+		if (trimmed.find("POINT") == 0) {
+			size_t paren_start = trimmed.find('(');
+			size_t paren_end = trimmed.rfind(')');
+			if (paren_start == std::string::npos || paren_end == std::string::npos || paren_end <= paren_start) {
+				return false;
+			}
+			std::string coords = TrimString(trimmed.substr(paren_start + 1, paren_end - paren_start - 1));
+			size_t space_pos = coords.find(' ');
+			if (space_pos == std::string::npos) {
+				return false;
+			}
 			try {
-				double lat = std::stod(s.substr(0, comma_pos));
-				double lon = std::stod(s.substr(comma_pos + 1));
-				return "{\"type\":\"Point\",\"coordinates\":[" + CoordinateToString(lon) + "," +
-				       CoordinateToString(lat) + "]}";
+				lon = std::stod(coords.substr(0, space_pos));
+				lat = std::stod(TrimString(coords.substr(space_pos + 1)));
 			} catch (...) {
-				// Not a valid "lat,lon" string, return empty (might be geohash - not supported).
+				return false;
+			}
+		} else {
+			// "lat,lon" string: "41.12,-71.34"
+			auto comma_pos = s.find(',');
+			if (comma_pos == std::string::npos) {
+				return false;
+			}
+			try {
+				lat = std::stod(s.substr(0, comma_pos));
+				lon = std::stod(s.substr(comma_pos + 1));
+			} catch (...) {
+				return false;
 			}
 		}
+	} else {
+		return false;
 	}
 
-	// Return empty string if we can't parse it (will result in NULL).
-	return "";
+	writer.WriteHeader(WKB_POINT);
+	writer.WritePoint(lon, lat);
+	return true;
 }
 
-// Convert Elasticsearch geo_shape to GeoJSON (it's already GeoJSON-like or WKT string).
-static std::string GeoShapeToGeoJSON(yyjson_val *val) {
-	if (!val)
-		return "";
+// Convert an Elasticsearch geo_shape value to WKB.
+// Handles GeoJSON objects and WKT strings.
+// For WKT input it uses DuckDB core's Geometry::FromString (WKT -> WKB).
+// Returns true on success (out_wkb is set) or false on failure.
+static bool GeoShapeToWKB(yyjson_val *val, Vector &result, string_t &out_wkb) {
+	if (!val) {
+		return false;
+	}
 
-	// geo_shape can be in GeoJSON format (object) or WKT format (string).
 	if (yyjson_is_str(val)) {
-		// WKT format, parse and convert to GeoJSON.
+		// WKT format: use DuckDB core's WKT parser to produce WKB directly.
 		const char *str = yyjson_get_str(val);
-		std::string wkt(str);
-		return WKTToGeoJSON(wkt);
+		string_t input(str, static_cast<uint32_t>(strlen(str)));
+		return Geometry::FromString(input, out_wkb, result, false);
 	}
 
-	// Object format (already GeoJSON), serialize it.
-	char *json_str = yyjson_val_write(val, 0, nullptr);
-	if (json_str) {
-		std::string result(json_str);
-		free(json_str);
-		return result;
+	// GeoJSON format: convert to WKB via our GeoJSON to WKB converter.
+	WKBWriter writer;
+	if (!GeoJSONObjectToWKB(val, writer)) {
+		return false;
 	}
-	return "";
+	out_wkb = writer.Store(result);
+	return true;
+}
+
+// Reader for little-endian WKB binary data.
+class WKBReader {
+public:
+	WKBReader(const char *data, uint32_t size) : data(data), pos(0), size(size) {
+	}
+
+	uint8_t ReadByte() {
+		if (pos >= size) {
+			return 0;
+		}
+		return static_cast<uint8_t>(data[pos++]);
+	}
+
+	uint32_t ReadUInt32() {
+		if (pos + sizeof(uint32_t) > size) {
+			return 0;
+		}
+		uint32_t val;
+		memcpy(&val, data + pos, sizeof(val));
+		pos += sizeof(val);
+		return val;
+	}
+
+	double ReadDouble() {
+		if (pos + sizeof(double) > size) {
+			return 0;
+		}
+		double val;
+		memcpy(&val, data + pos, sizeof(val));
+		pos += sizeof(val);
+		return val;
+	}
+
+private:
+	const char *data;
+	uint32_t pos;
+	uint32_t size;
+};
+
+// Forward declaration for recursive WKB to GeoJSON conversion.
+static bool WKBToGeoJSONRecursive(WKBReader &reader, yyjson_mut_doc *doc, yyjson_mut_val *parent_arr);
+
+// Read a single WKB geometry and append it as a GeoJSON object to parent_arr.
+static bool WKBToGeoJSONRecursive(WKBReader &reader, yyjson_mut_doc *doc, yyjson_mut_val *parent_arr) {
+	uint8_t byte_order = reader.ReadByte();
+	if (byte_order != 1) {
+		return false; // only little-endian supported
+	}
+
+	uint32_t type_id = reader.ReadUInt32();
+
+	yyjson_mut_val *geom_obj = yyjson_mut_obj(doc);
+
+	switch (type_id) {
+	case WKB_POINT: {
+		yyjson_mut_obj_add_str(doc, geom_obj, "type", "Point");
+		double x = reader.ReadDouble();
+		double y = reader.ReadDouble();
+		yyjson_mut_val *coords = yyjson_mut_arr(doc);
+		yyjson_mut_arr_add_real(doc, coords, x);
+		yyjson_mut_arr_add_real(doc, coords, y);
+		yyjson_mut_obj_add_val(doc, geom_obj, "coordinates", coords);
+		break;
+	}
+	case WKB_LINESTRING: {
+		yyjson_mut_obj_add_str(doc, geom_obj, "type", "LineString");
+		uint32_t npoints = reader.ReadUInt32();
+		yyjson_mut_val *coords = yyjson_mut_arr(doc);
+		for (uint32_t i = 0; i < npoints; i++) {
+			double x = reader.ReadDouble();
+			double y = reader.ReadDouble();
+			yyjson_mut_val *pt = yyjson_mut_arr(doc);
+			yyjson_mut_arr_add_real(doc, pt, x);
+			yyjson_mut_arr_add_real(doc, pt, y);
+			yyjson_mut_arr_append(coords, pt);
+		}
+		yyjson_mut_obj_add_val(doc, geom_obj, "coordinates", coords);
+		break;
+	}
+	case WKB_POLYGON: {
+		yyjson_mut_obj_add_str(doc, geom_obj, "type", "Polygon");
+		uint32_t nrings = reader.ReadUInt32();
+		yyjson_mut_val *rings = yyjson_mut_arr(doc);
+		for (uint32_t r = 0; r < nrings; r++) {
+			uint32_t npoints = reader.ReadUInt32();
+			yyjson_mut_val *ring = yyjson_mut_arr(doc);
+			for (uint32_t i = 0; i < npoints; i++) {
+				double x = reader.ReadDouble();
+				double y = reader.ReadDouble();
+				yyjson_mut_val *pt = yyjson_mut_arr(doc);
+				yyjson_mut_arr_add_real(doc, pt, x);
+				yyjson_mut_arr_add_real(doc, pt, y);
+				yyjson_mut_arr_append(ring, pt);
+			}
+			yyjson_mut_arr_append(rings, ring);
+		}
+		yyjson_mut_obj_add_val(doc, geom_obj, "coordinates", rings);
+		break;
+	}
+	case WKB_MULTIPOINT: {
+		yyjson_mut_obj_add_str(doc, geom_obj, "type", "MultiPoint");
+		uint32_t ngeoms = reader.ReadUInt32();
+		yyjson_mut_val *coords = yyjson_mut_arr(doc);
+		for (uint32_t i = 0; i < ngeoms; i++) {
+			// Each sub-geometry is a full WKB Point (byte_order + type + x + y).
+			reader.ReadByte();   // byte_order
+			reader.ReadUInt32(); // type_id (Point=1)
+			double x = reader.ReadDouble();
+			double y = reader.ReadDouble();
+			yyjson_mut_val *pt = yyjson_mut_arr(doc);
+			yyjson_mut_arr_add_real(doc, pt, x);
+			yyjson_mut_arr_add_real(doc, pt, y);
+			yyjson_mut_arr_append(coords, pt);
+		}
+		yyjson_mut_obj_add_val(doc, geom_obj, "coordinates", coords);
+		break;
+	}
+	case WKB_MULTILINESTRING: {
+		yyjson_mut_obj_add_str(doc, geom_obj, "type", "MultiLineString");
+		uint32_t ngeoms = reader.ReadUInt32();
+		yyjson_mut_val *lines = yyjson_mut_arr(doc);
+		for (uint32_t g = 0; g < ngeoms; g++) {
+			reader.ReadByte();   // byte_order
+			reader.ReadUInt32(); // type_id (LineString=2)
+			uint32_t npoints = reader.ReadUInt32();
+			yyjson_mut_val *line = yyjson_mut_arr(doc);
+			for (uint32_t i = 0; i < npoints; i++) {
+				double x = reader.ReadDouble();
+				double y = reader.ReadDouble();
+				yyjson_mut_val *pt = yyjson_mut_arr(doc);
+				yyjson_mut_arr_add_real(doc, pt, x);
+				yyjson_mut_arr_add_real(doc, pt, y);
+				yyjson_mut_arr_append(line, pt);
+			}
+			yyjson_mut_arr_append(lines, line);
+		}
+		yyjson_mut_obj_add_val(doc, geom_obj, "coordinates", lines);
+		break;
+	}
+	case WKB_MULTIPOLYGON: {
+		yyjson_mut_obj_add_str(doc, geom_obj, "type", "MultiPolygon");
+		uint32_t ngeoms = reader.ReadUInt32();
+		yyjson_mut_val *polys = yyjson_mut_arr(doc);
+		for (uint32_t g = 0; g < ngeoms; g++) {
+			reader.ReadByte();   // byte_order
+			reader.ReadUInt32(); // type_id (Polygon=3)
+			uint32_t nrings = reader.ReadUInt32();
+			yyjson_mut_val *poly = yyjson_mut_arr(doc);
+			for (uint32_t r = 0; r < nrings; r++) {
+				uint32_t npoints = reader.ReadUInt32();
+				yyjson_mut_val *ring = yyjson_mut_arr(doc);
+				for (uint32_t i = 0; i < npoints; i++) {
+					double x = reader.ReadDouble();
+					double y = reader.ReadDouble();
+					yyjson_mut_val *pt = yyjson_mut_arr(doc);
+					yyjson_mut_arr_add_real(doc, pt, x);
+					yyjson_mut_arr_add_real(doc, pt, y);
+					yyjson_mut_arr_append(ring, pt);
+				}
+				yyjson_mut_arr_append(poly, ring);
+			}
+			yyjson_mut_arr_append(polys, poly);
+		}
+		yyjson_mut_obj_add_val(doc, geom_obj, "coordinates", polys);
+		break;
+	}
+	case WKB_GEOMETRYCOLLECTION: {
+		yyjson_mut_obj_add_str(doc, geom_obj, "type", "GeometryCollection");
+		uint32_t ngeoms = reader.ReadUInt32();
+		yyjson_mut_val *geometries = yyjson_mut_arr(doc);
+		for (uint32_t i = 0; i < ngeoms; i++) {
+			if (!WKBToGeoJSONRecursive(reader, doc, geometries)) {
+				return false;
+			}
+		}
+		yyjson_mut_obj_add_val(doc, geom_obj, "geometries", geometries);
+		break;
+	}
+	default:
+		return false; // unknown geometry type
+	}
+
+	yyjson_mut_arr_append(parent_arr, geom_obj);
+	return true;
+}
+
+// Convert WKB binary to a GeoJSON string.
+// Used by filter pushdown to convert GEOMETRY constants (WKB) to GeoJSON for Elasticsearch query DSL.
+std::string WKBToGeoJSON(const string_t &wkb) {
+	if (wkb.GetSize() == 0) {
+		return "";
+	}
+
+	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val *arr = yyjson_mut_arr(doc);
+
+	WKBReader reader(wkb.GetData(), static_cast<uint32_t>(wkb.GetSize()));
+	if (!WKBToGeoJSONRecursive(reader, doc, arr)) {
+		yyjson_mut_doc_free(doc);
+		return "";
+	}
+
+	// Extract the single geometry object from the array.
+	yyjson_mut_val *geom = yyjson_mut_arr_get_first(arr);
+	if (!geom) {
+		yyjson_mut_doc_free(doc);
+		return "";
+	}
+
+	char *json_str = yyjson_mut_val_write(geom, 0, nullptr);
+	yyjson_mut_doc_free(doc);
+
+	if (!json_str) {
+		return "";
+	}
+
+	std::string result(json_str);
+	free(json_str);
+	return result;
+}
+
+// Check if a WKB Polygon is an axis-aligned rectangle (5 points forming a bbox).
+// Used to optimize ST_MakeEnvelope -> geo_bounding_box query in filter pushdown.
+// Returns true and fills xmin/ymin/xmax/ymax if the polygon is an axis-aligned rectangle.
+bool WKBIsAxisAlignedRectangle(const string_t &wkb, double &xmin, double &ymin, double &xmax, double &ymax) {
+	if (wkb.GetSize() < 5) {
+		return false;
+	}
+
+	WKBReader reader(wkb.GetData(), static_cast<uint32_t>(wkb.GetSize()));
+	uint8_t byte_order = reader.ReadByte();
+	if (byte_order != 1) {
+		return false;
+	}
+
+	uint32_t type_id = reader.ReadUInt32();
+	if (type_id != WKB_POLYGON) {
+		return false;
+	}
+
+	uint32_t nrings = reader.ReadUInt32();
+	if (nrings != 1) {
+		return false;
+	}
+
+	uint32_t npoints = reader.ReadUInt32();
+	if (npoints != 5) {
+		return false;
+	}
+
+	// Read the 5 points.
+	double xs[5], ys[5];
+	for (int i = 0; i < 5; i++) {
+		xs[i] = reader.ReadDouble();
+		ys[i] = reader.ReadDouble();
+	}
+
+	// Closing point must match the first point.
+	if (xs[0] != xs[4] || ys[0] != ys[4]) {
+		return false;
+	}
+
+	// Find bounding box of the 4 corners.
+	double env_xmin = xs[0], env_xmax = xs[0];
+	double env_ymin = ys[0], env_ymax = ys[0];
+	for (int j = 1; j < 4; j++) {
+		env_xmin = std::min(env_xmin, xs[j]);
+		env_xmax = std::max(env_xmax, xs[j]);
+		env_ymin = std::min(env_ymin, ys[j]);
+		env_ymax = std::max(env_ymax, ys[j]);
+	}
+
+	// Check if all 4 corners lie on the bounding box edges (axis-aligned rectangle).
+	for (int j = 0; j < 4; j++) {
+		bool on_x_edge = (xs[j] == env_xmin || xs[j] == env_xmax);
+		bool on_y_edge = (ys[j] == env_ymin || ys[j] == env_ymax);
+		if (!on_x_edge || !on_y_edge) {
+			return false;
+		}
+	}
+
+	xmin = env_xmin;
+	ymin = env_ymin;
+	xmax = env_xmax;
+	ymax = env_ymax;
+	return true;
 }
 
 yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path) {
@@ -640,7 +754,7 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 		return;
 	}
 
-	// If the type is LIST, we need to handle it specially. Either the value is an array,
+	// If the type is LIST, we need to handle it specially. Either the value is an array
 	// or it is a single value that should be wrapped in a single-element list.
 	// This must be checked before any es_type-specific handling.
 	if (type.id() == LogicalTypeId::LIST) {
@@ -648,20 +762,23 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 		return;
 	}
 
-	// Handle geo_point and geo_shape specially, convert to GeoJSON string.
+	// Handle geo_point and geo_shape: convert to native GEOMETRY (WKB binary).
+	// The WKB output is stored in the GEOMETRY vector via StringVector::AddStringOrBlob().
 	if (es_type == "geo_point" || es_type == "geo_shape") {
-		std::string geojson;
 		if (es_type == "geo_point") {
-			geojson = GeoPointToGeoJSON(val);
+			WKBWriter writer;
+			if (GeoPointToWKB(val, writer)) {
+				FlatVector::GetData<string_t>(result)[row_idx] = writer.Store(result);
+			} else {
+				FlatVector::SetNull(result, row_idx, true);
+			}
 		} else {
-			geojson = GeoShapeToGeoJSON(val);
-		}
-
-		if (geojson.empty()) {
-			FlatVector::SetNull(result, row_idx, true);
-		} else {
-			auto str_val = StringVector::AddString(result, geojson);
-			FlatVector::GetData<string_t>(result)[row_idx] = str_val;
+			string_t wkb;
+			if (GeoShapeToWKB(val, result, wkb)) {
+				FlatVector::GetData<string_t>(result)[row_idx] = wkb;
+			} else {
+				FlatVector::SetNull(result, row_idx, true);
+			}
 		}
 		return;
 	}
@@ -865,7 +982,7 @@ bool ExtractPointCoordinates(const std::string &geojson, double &lon, double &la
 	lon = yyjson_get_real(lon_val);
 	lat = yyjson_get_real(lat_val);
 
-	// yyjson_get_real returns 0 for integers, need to check for int type.
+	// yyjson_get_real returns 0.0 for integers, need to check for int type.
 	if (yyjson_is_int(lon_val)) {
 		lon = static_cast<double>(yyjson_get_int(lon_val));
 	}
@@ -951,25 +1068,20 @@ yyjson_mut_val *ConvertDuckDBToJSON(yyjson_mut_doc *doc, const Value &value) {
 	}
 }
 
-// Check if expression is ST_GeomFromGeoJSON(column_ref) i.e. references an Elasticsearch geo field.
-// Detects the pattern ST_GeomFromGeoJSON(BOUND_COLUMN_REF) or ST_GeomFromGeoJSON(struct_extract(...)).
+// Check if an expression references an Elasticsearch geo field.
+// With native GEOMETRY columns, this is a direct BOUND_COLUMN_REF with GEOMETRY type
+// or a struct_extract chain returning GEOMETRY (for nested geo fields).
 bool IsGeoColumnRef(const Expression &expr) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-		return false;
-	}
-	auto &func_expr = expr.Cast<BoundFunctionExpression>();
-	if (StringUtil::Lower(func_expr.function.name) != "st_geomfromgeojson" || func_expr.children.empty()) {
-		return false;
-	}
-	// If the child is a column ref (or struct_extract chain), it's a geo field reference.
-	// If it's a constant, it's a constant geometry.
-	auto child_class = func_expr.children[0]->GetExpressionClass();
-	if (child_class == ExpressionClass::BOUND_COLUMN_REF) {
+	// Direct GEOMETRY column reference.
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	    expr.return_type.id() == LogicalTypeId::GEOMETRY) {
 		return true;
 	}
-	if (child_class == ExpressionClass::BOUND_FUNCTION) {
-		auto &child_func = func_expr.children[0]->Cast<BoundFunctionExpression>();
-		if (StringUtil::Lower(child_func.function.name) == "struct_extract") {
+	// struct_extract returning GEOMETRY (nested geo field).
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &func_expr = expr.Cast<BoundFunctionExpression>();
+		if (StringUtil::Lower(func_expr.function.name) == "struct_extract" &&
+		    expr.return_type.id() == LogicalTypeId::GEOMETRY) {
 			return true;
 		}
 	}

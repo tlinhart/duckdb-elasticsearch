@@ -15,7 +15,7 @@ using namespace duckdb_yyjson;
 yyjson_val *GetValueByPath(yyjson_val *obj, const std::string &path);
 
 // Convert a yyjson value to a DuckDB Vector entry at the given row index.
-// Handles all DuckDB types including LIST, STRUCT and geo types (geo_point, geo_shape).
+// Handles all DuckDB types including LIST, STRUCT and GEOMETRY (internally WKB binary).
 void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
                          const std::string &es_type);
 
@@ -23,8 +23,13 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 // Handles all common DuckDB types including numeric, string, date and timestamp.
 yyjson_mut_val *ConvertDuckDBToJSON(yyjson_mut_doc *doc, const Value &value);
 
-// Convert WKT string to GeoJSON.
-std::string WKTToGeoJSON(const std::string &wkt);
+// Convert WKB binary (GEOMETRY internal format) to a GeoJSON string.
+// Used by filter pushdown to convert GEOMETRY constants to GeoJSON for Elasticsearch query DSL.
+std::string WKBToGeoJSON(const string_t &wkb);
+
+// Check if a WKB Polygon is an axis-aligned rectangle (5 points forming a bbox).
+// Returns true and fills xmin/ymin/xmax/ymax if the polygon is an axis-aligned rectangle.
+bool WKBIsAxisAlignedRectangle(const string_t &wkb, double &xmin, double &ymin, double &xmax, double &ymax);
 
 // Extract constant double value from a BoundConstantExpression.
 // Handles DOUBLE, FLOAT, INTEGER, BIGINT, SMALLINT, TINYINT and HUGEINT types.
@@ -40,8 +45,8 @@ bool ExtractEnvelopeCoordinates(const Expression &expr, double &xmin, double &ym
 // Returns true if the GeoJSON is a Point and coordinates were extracted.
 bool ExtractPointCoordinates(const std::string &geojson, double &lon, double &lat);
 
-// Check if expression is ST_GeomFromGeoJSON(column_ref) i.e. references an Elasticsearch geo field.
-// Detects the pattern ST_GeomFromGeoJSON(BOUND_COLUMN_REF) or ST_GeomFromGeoJSON(struct_extract(...)).
+// Check if an expression references an Elasticsearch geo field.
+// Detects direct BOUND_COLUMN_REF with GEOMETRY type or struct_extract chain returning GEOMETRY.
 bool IsGeoColumnRef(const Expression &expr);
 
 } // namespace duckdb

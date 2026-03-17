@@ -114,9 +114,10 @@ static LogicalType BuildDuckDBTypeFromMapping(yyjson_val *field_def) {
 			} else if (es_type == "ip") {
 				return LogicalType::VARCHAR;
 			} else if (es_type == "geo_point" || es_type == "geo_shape") {
-				// Return as VARCHAR containing GeoJSON. User can use ST_GeomFromGeoJSON if spatial
-				// extension is loaded.
-				return LogicalType::VARCHAR;
+				// Return as native GEOMETRY type (internally WKB). Geo fields are directly usable
+				// with spatial functions (ST_Within, ST_Intersects etc.) without wrapping in
+				// ST_GeomFromGeoJSON().
+				return LogicalType::GEOMETRY();
 			}
 			return LogicalType::VARCHAR; // default to VARCHAR
 		}

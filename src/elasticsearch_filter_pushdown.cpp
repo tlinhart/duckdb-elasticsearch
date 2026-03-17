@@ -504,7 +504,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 	}
 
 	// Handle comparison expressions containing ST_Distance.
-	// Pattern: ST_Distance(ST_GeomFromGeoJSON(col), point) </<=/>/>=  distance
+	// Pattern: ST_Distance(geo_col, point) </<=/>/>= distance
 	if (expr.type == ExpressionType::COMPARE_LESSTHAN || expr.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
 	    expr.type == ExpressionType::COMPARE_GREATERTHAN || expr.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
 		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
@@ -786,7 +786,7 @@ static yyjson_mut_val *BuildGeoBoundingBoxQuery(yyjson_mut_doc *doc, const strin
 }
 
 // Translate a ST_Distance comparison to an Elasticsearch geo_distance query.
-// Handles ST_Distance(ST_GeomFromGeoJSON(col), point) </<=/>/>=  distance.
+// Handles ST_Distance(geo_col, point) </<=/>/>= distance.
 // The pushdown stage has already replaced the GEOMETRY constant with a GeoJSON VARCHAR string.
 // For < and <= produce a direct geo_distance query (points within distance).
 // For > and >= produce a bool.must_not wrapper around geo_distance (points farther than distance).
@@ -826,8 +826,8 @@ static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const
 		return nullptr;
 	}
 
-	// From ST_Distance's children, find the constant GeoJSON point (the one that's not the column ref).
-	// One child is ST_GeomFromGeoJSON(col) (the column), the other is the constant point as GeoJSON VARCHAR.
+	// From ST_Distance's children, find the constant GeoJSON point (the one that's not the geo column reference).
+	// One child is the GEOMETRY column, the other is the constant point as GeoJSON VARCHAR.
 	idx_t const_child_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < 2; i++) {
 		if (!IsGeoColumnRef(*func_expr->children[i])) {
@@ -877,7 +877,7 @@ static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const
 
 // Translate a ST_DWithin function to an Elasticsearch geo_distance query.
 // ST_DWithin(geom1, geom2, distance) -> geo_distance query.
-// One of geom1/geom2 must be ST_GeomFromGeoJSON(col), the other a constant point.
+// One of geom1/geom2 must be a GEOMETRY column reference, the other a constant point.
 // The pushdown stage has already replaced the GEOMETRY constant with a GeoJSON VARCHAR string.
 static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
                                                    const string &column_name) {
@@ -885,7 +885,7 @@ static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const Bo
 		return nullptr;
 	}
 
-	// Find the constant geometry child (the one that's not the column ref) among the first two args.
+	// Find the constant geometry child (the one that's not the column reference) among the first two args.
 	idx_t const_child_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < 2; i++) {
 		if (!IsGeoColumnRef(*func_expr.children[i])) {
@@ -928,7 +928,7 @@ static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const Bo
 // - ST_Contains(A, B) -> geo_shape (relation depends on which arg is the field)
 // - ST_Disjoint(A, B) -> geo_shape with relation=disjoint
 //
-// One argument must be ST_GeomFromGeoJSON(column_ref) (the Elasticsearch field), the other
+// One argument must be a GEOMETRY column reference (the Elasticsearch field), the other
 // must be a constant geometry expression. Functions are symmetric in argument position.
 static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
                                                  const string &column_name,

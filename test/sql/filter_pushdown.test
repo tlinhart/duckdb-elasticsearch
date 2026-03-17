@@ -36,7 +36,7 @@
 # +---------------+--------+----------------+-------------------------------------+-----------+
 #
 # Notes on geospatial pushdown:
-# - The Elasticsearch field must be wrapped in ST_GeomFromGeoJSON(field)
+# - Elasticsearch geo fields have native GEOMETRY type (no wrapping needed)
 # - ST_MakeEnvelope is optimized to a geo_bounding_box query in Elasticsearch
 # - ST_DWithin(a, b, distance) is equivalent to ST_Distance(a, b) <= distance
 #
@@ -1218,7 +1218,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry));
+WHERE ST_Within(ST_Point(-122.4194, 37.7749), geometry);
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1231,7 +1231,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_GeomFromGeoJSON(geometry), ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-130,30],[-110,30],[-110,45],[-130,45],[-130,30]]]}'));
+WHERE ST_Within(geometry, ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-130,30],[-110,30],[-110,45],[-130,45],[-130,30]]]}'));
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1243,7 +1243,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_GeomFromGeoJSON(location), ST_MakeEnvelope(-74.1, 40.01, -71.12, 40.73));
+WHERE ST_Within(location, ST_MakeEnvelope(-74.1, 40.01, -71.12, 40.73));
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1255,7 +1255,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Contains(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+WHERE ST_Contains(geometry, ST_Point(-122.4194, 37.7749));
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1267,7 +1267,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Contains(ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-130,30],[-110,30],[-110,45],[-130,45],[-130,30]]]}'), ST_GeomFromGeoJSON(geometry));
+WHERE ST_Contains(ST_GeomFromGeoJSON('{"type":"Polygon","coordinates":[[[-130,30],[-110,30],[-110,45],[-130,45],[-130,30]]]}'), geometry);
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1279,7 +1279,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Contains(ST_MakeEnvelope(-74.1, 40.01, -71.12, 40.73), ST_GeomFromGeoJSON(location));
+WHERE ST_Contains(ST_MakeEnvelope(-74.1, 40.01, -71.12, 40.73), location);
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1291,7 +1291,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Intersects(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+WHERE ST_Intersects(geometry, ST_Point(-122.4194, 37.7749));
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1303,7 +1303,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Intersects(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry));
+WHERE ST_Intersects(ST_Point(-122.4194, 37.7749), geometry);
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1315,7 +1315,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Disjoint(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+WHERE ST_Disjoint(geometry, ST_Point(-122.4194, 37.7749));
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1327,7 +1327,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Within(ST_Point(-122.4194, 37.7749), ST_GeomFromGeoJSON(geometry)) AND
+WHERE ST_Within(ST_Point(-122.4194, 37.7749), geometry) AND
       amount > 10;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*amount>10.*
@@ -1340,7 +1340,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000;
+WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) < 10000;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1352,7 +1352,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) > 10000;
+WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) > 10000;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1364,7 +1364,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location)) < 10000;
+WHERE ST_Distance(ST_Point(-74.006, 40.7128), location) < 10000;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1376,7 +1376,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE 10000 > ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128));
+WHERE 10000 > ST_Distance(location, ST_Point(-74.006, 40.7128));
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1388,7 +1388,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749)) < 500000;
+WHERE ST_Distance(geometry, ST_Point(-122.4194, 37.7749)) < 500000;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1400,7 +1400,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Distance(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128)) < 10000 AND
+WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) < 10000 AND
       amount > 50;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*amount>50.*
@@ -1413,7 +1413,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000);
+WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000);
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1425,7 +1425,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_Point(-74.006, 40.7128), ST_GeomFromGeoJSON(location), 10000);
+WHERE ST_DWithin(ST_Point(-74.006, 40.7128), location, 10000);
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*
 
@@ -1437,7 +1437,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749), 500000);
+WHERE ST_DWithin(geometry, ST_Point(-122.4194, 37.7749), 500000);
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*
 
@@ -1449,7 +1449,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_DWithin(ST_GeomFromGeoJSON(location), ST_Point(-74.006, 40.7128), 10000) AND
+WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000) AND
       amount > 50;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*amount>50.*

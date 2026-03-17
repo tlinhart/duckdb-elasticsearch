@@ -915,7 +915,7 @@ struct SpatialDWithinBindData : public FunctionData {
 	}
 };
 
-// Information about a geospatial column reference found inside ST_GeomFromGeoJSON(column_ref).
+// Information about a geospatial column reference in a spatial function argument.
 struct GeoColumnInfo {
 	ColumnPathInfo col_path;
 	// Which child index (0 or 1) of the outer spatial function contains the geo column.
@@ -926,26 +926,21 @@ struct GeoColumnInfo {
 	}
 };
 
-// Try to extract a geo column path from a spatial function argument.
-// Recognizes ST_GeomFromGeoJSON(column_ref) or ST_GeomFromGeoJSON(struct_extract(column_ref, ...)).
-// Returns a valid GeoColumnInfo if found, with the column path and arg_index set.
+// Extract a geo column reference from a spatial function argument.
+// Detects direct BOUND_COLUMN_REF with GEOMETRY type or struct_extract chain
+// returning GEOMETRY and verifies the underlying Elasticsearch field is geo_point or geo_shape.
 static GeoColumnInfo ExtractGeoColumnFromArg(const Expression &expr, const ElasticsearchQueryBindData &bind_data,
                                              const vector<ColumnIndex> &column_ids, idx_t arg_index) {
 	GeoColumnInfo result;
 	result.arg_index = arg_index;
 
-	// Must be a function expression: ST_GeomFromGeoJSON(...)
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+	// The expression must return GEOMETRY type (native geo field).
+	if (expr.return_type.id() != LogicalTypeId::GEOMETRY) {
 		return result;
 	}
 
-	auto &func_expr = expr.Cast<BoundFunctionExpression>();
-	if (StringUtil::Lower(func_expr.function.name) != "st_geomfromgeojson" || func_expr.children.size() < 1) {
-		return result;
-	}
-
-	// The first child should be a column reference (direct or via struct_extract).
-	ColumnPathInfo col_path = ExtractColumnPath(*func_expr.children[0], bind_data, column_ids);
+	// Extract the column path from the expression (direct column reference or struct_extract chain).
+	ColumnPathInfo col_path = ExtractColumnPath(expr, bind_data, column_ids);
 	if (!col_path.IsValid()) {
 		return result;
 	}
@@ -964,31 +959,18 @@ static GeoColumnInfo ExtractGeoColumnFromArg(const Expression &expr, const Elast
 	return result;
 }
 
-// Try to convert a GEOMETRY value to WKT string using ClientContext.
-// Returns the WKT string on success, empty string on failure.
-static string GeometryValueToWKT(ClientContext &context, const Value &geometry_val) {
-	Value varchar_val;
-	string error_message;
-	bool success = geometry_val.TryCastAs(context, LogicalType::VARCHAR, varchar_val, &error_message, true);
-	if (!success || varchar_val.IsNull()) {
-		return "";
-	}
-	return StringValue::Get(varchar_val);
-}
-
 // Try to extract constant GeoJSON from a spatial expression.
 // Recognizes:
+// - BoundConstantExpression with GEOMETRY type -> convert WKB to GeoJSON directly
 // - ST_Point(lon, lat) -> {"type":"Point","coordinates":[lon,lat]}
 // - ST_MakeEnvelope(xmin, ymin, xmax, ymax) -> special "envelope" marker
 // - ST_GeomFromGeoJSON('{"type":...}') -> pass through the GeoJSON string
-// - BoundConstantExpression with GEOMETRY type -> convert via WKT to GeoJSON
 //
 // Note: After DuckDB's constant folding, function calls like ST_Point(-74, 40.7)
-// are already evaluated to a GEOMETRY constant. The ClientContext is needed
-// to cast GEOMETRY values to VARCHAR (WKT) using DuckDB's built-in GEOMETRY to VARCHAR cast.
+// are already evaluated to a GEOMETRY constant. The GEOMETRY value is internally WKB
+// which we convert directly to GeoJSON via WKBToGeoJSON().
 //
-// Returns the GeoJSON string on success, empty string on failure.
-// For ST_MakeEnvelope, sets is_envelope=true and fills bbox coordinates.
+// Returns a valid ConstantGeoInfo on success (geojson is set or is_envelope is true and bbox coordinates are set).
 struct ConstantGeoInfo {
 	string geojson;
 	bool is_envelope = false;
@@ -999,15 +981,14 @@ struct ConstantGeoInfo {
 	}
 };
 
-static ConstantGeoInfo ExtractConstantGeo(const Expression &expr, ClientContext &context) {
+static ConstantGeoInfo ExtractConstantGeo(const Expression &expr) {
 	ConstantGeoInfo result;
 
 	// Handle constant-folded GEOMETRY values.
 	// After DuckDB's optimizer constant-folds expressions like ST_Point(-74, 40.7),
-	// the result is a BoundConstantExpression with a native GEOMETRY type.
-	// We convert it to WKT via ClientContext cast, then to GeoJSON.
-	// For axis-aligned rectangles (from ST_MakeEnvelope), we detect the envelope pattern
-	// and set is_envelope=true to enable the geo_bounding_box optimization.
+	// the result is a BoundConstantExpression with a native GEOMETRY type (WKB binary).
+	// We convert the WKB directly to GeoJSON. For axis-aligned rectangles (from
+	// ST_MakeEnvelope), we detect the envelope pattern directly from WKB.
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
 		auto &const_expr = expr.Cast<BoundConstantExpression>();
 		if (const_expr.value.IsNull()) {
@@ -1015,72 +996,23 @@ static ConstantGeoInfo ExtractConstantGeo(const Expression &expr, ClientContext 
 		}
 		const auto &val_type = const_expr.value.type();
 		if (val_type.id() == LogicalTypeId::GEOMETRY) {
-			string wkt = GeometryValueToWKT(context, const_expr.value);
-			if (!wkt.empty()) {
-				// Check if this is an axis-aligned rectangle (envelope).
-				// ST_MakeEnvelope produces: POLYGON ((xmin ymin, xmin ymax, xmax ymax, xmax ymin, xmin ymin))
-				if (wkt.substr(0, 9) == "POLYGON (") {
-					string geojson = WKTToGeoJSON(wkt);
-					// Parse the GeoJSON to check for rectangle shape.
-					yyjson_doc *gdoc = yyjson_read(geojson.c_str(), geojson.size(), 0);
-					if (gdoc) {
-						yyjson_val *groot = yyjson_doc_get_root(gdoc);
-						yyjson_val *coords_arr = yyjson_obj_get(groot, "coordinates");
-						if (coords_arr && yyjson_is_arr(coords_arr) && yyjson_arr_size(coords_arr) == 1) {
-							yyjson_val *ring = yyjson_arr_get(coords_arr, 0);
-							if (ring && yyjson_is_arr(ring) && yyjson_arr_size(ring) == 5) {
-								// Extract corners to check for axis-aligned rectangle.
-								// 5 points = 4 corners + closing point (same as first).
-								double xs[5], ys[5];
-								bool valid = true;
-								for (int j = 0; j < 5; j++) {
-									yyjson_val *pt = yyjson_arr_get(ring, j);
-									if (!pt || !yyjson_is_arr(pt) || yyjson_arr_size(pt) < 2) {
-										valid = false;
-										break;
-									}
-									xs[j] = yyjson_get_num(yyjson_arr_get(pt, 0));
-									ys[j] = yyjson_get_num(yyjson_arr_get(pt, 1));
-								}
-								if (valid && xs[0] == xs[4] && ys[0] == ys[4]) {
-									// Find bounding box of the 4 corners.
-									double env_xmin = xs[0], env_xmax = xs[0];
-									double env_ymin = ys[0], env_ymax = ys[0];
-									for (int j = 1; j < 4; j++) {
-										env_xmin = std::min(env_xmin, xs[j]);
-										env_xmax = std::max(env_xmax, xs[j]);
-										env_ymin = std::min(env_ymin, ys[j]);
-										env_ymax = std::max(env_ymax, ys[j]);
-									}
-									// Check if all points lie on the bounding box edges (axis-aligned rectangle).
-									bool is_rect = true;
-									for (int j = 0; j < 4; j++) {
-										bool on_x_edge = (xs[j] == env_xmin || xs[j] == env_xmax);
-										bool on_y_edge = (ys[j] == env_ymin || ys[j] == env_ymax);
-										if (!on_x_edge || !on_y_edge) {
-											is_rect = false;
-											break;
-										}
-									}
-									if (is_rect) {
-										result.is_envelope = true;
-										result.xmin = env_xmin;
-										result.ymin = env_ymin;
-										result.xmax = env_xmax;
-										result.ymax = env_ymax;
-										yyjson_doc_free(gdoc);
-										return result;
-									}
-								}
-							}
-						}
-						yyjson_doc_free(gdoc);
-					}
-					result.geojson = std::move(geojson);
-				} else {
-					result.geojson = WKTToGeoJSON(wkt);
-				}
+			// Get the WKB binary from the GEOMETRY value.
+			const auto &str_val = StringValue::Get(const_expr.value);
+			string_t wkb(str_val);
+
+			// Check for axis-aligned rectangle (envelope) directly from WKB.
+			double env_xmin, env_ymin, env_xmax, env_ymax;
+			if (WKBIsAxisAlignedRectangle(wkb, env_xmin, env_ymin, env_xmax, env_ymax)) {
+				result.is_envelope = true;
+				result.xmin = env_xmin;
+				result.ymin = env_ymin;
+				result.xmax = env_xmax;
+				result.ymax = env_ymax;
+				return result;
 			}
+
+			// Convert WKB to GeoJSON for the Elasticsearch query.
+			result.geojson = WKBToGeoJSON(wkb);
 			return result;
 		}
 		return result;
@@ -1188,7 +1120,7 @@ static bool TryPushComparisonFilter(ClientContext &context, const BoundCompariso
 }
 
 // Try to push a geo_distance filter from a comparison involving ST_Distance.
-// Recognizes patterns like ST_Distance(ST_GeomFromGeoJSON(col), ST_Point(...)) < 1000.
+// Recognizes patterns like ST_Distance(geo_col, ST_Point(...)) < 1000.
 // The comparison must have ST_Distance on one side and a numeric constant on the other.
 // Only <, <=, >, >= are supported (not = or !=).
 static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparisonExpression &comp_expr,
@@ -1262,7 +1194,7 @@ static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparis
 
 	// Extract the constant geometry (must be a point for geo_distance).
 	idx_t const_arg_idx = (geo_col.arg_index == 0) ? 1 : 0;
-	ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx], context);
+	ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx]);
 	if (!const_geo.IsValid() || const_geo.is_envelope) {
 		return false;
 	}
@@ -1423,7 +1355,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 
 				// The other argument must be a constant geometry expression.
 				idx_t const_arg_idx = (geo_col.arg_index == 0) ? 1 : 0;
-				ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx], context);
+				ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx]);
 				if (!const_geo.IsValid()) {
 					continue;
 				}
@@ -1473,7 +1405,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 
 				// The other geometry argument must be a constant (the reference point).
 				idx_t const_arg_idx = (geo_col.arg_index == 0) ? 1 : 0;
-				ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx], context);
+				ConstantGeoInfo const_geo = ExtractConstantGeo(*func_expr.children[const_arg_idx]);
 				if (!const_geo.IsValid() || const_geo.is_envelope) {
 					continue;
 				}

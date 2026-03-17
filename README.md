@@ -45,8 +45,7 @@ objects, geo types and multi-index queries.
   `float`, `date`, `boolean`, `ip` etc.)
 - Nested objects mapped to DuckDB `STRUCT` type.
 - Nested arrays mapped to `LIST(STRUCT(...))` type.
-- Geo types (`geo_point`, `geo_shape`) converted to GeoJSON format.
-- WKT geometry strings automatically parsed and converted.
+- Geo types (`geo_point`, `geo_shape`) returned as native `GEOMETRY` type.
 
 ### Reliability
 
@@ -335,7 +334,7 @@ SELECT name FROM elasticsearch_query(
     username := 'elastic',
     password := 'test'
 )
-WHERE ST_Intersects(ST_GeomFromGeoJSON(geometry), ST_Point(-122.4194, 37.7749));
+WHERE ST_Intersects(geometry, ST_Point(-122.4194, 37.7749));
 ```
 
 The extension translates this to the following Elasticsearch query:
@@ -434,18 +433,17 @@ SELECT * FROM elasticsearch_query(
 ### Geo fields
 
 `geo_point` and `geo_shape` fields use spatial function predicates instead of
-standard SQL operators. Pushdown requires the DuckDB
-[spatial](https://duckdb.org/docs/stable/core_extensions/spatial/overview)
-extension to be installed and loaded:
+standard SQL operators. Pushdown requires the DuckDB spatial extension to be
+installed and loaded:
 
 ```sql
 INSTALL spatial;
 LOAD spatial;
 ```
 
-The Elasticsearch geo field must be wrapped in `ST_GeomFromGeoJSON()` and the
-other argument must be a constant geometry expression (e.g. `ST_Point()`,
-`ST_GeomFromGeoJSON()`, `ST_MakeEnvelope()`).
+Geo fields are returned as native `GEOMETRY` type and can be used directly in
+spatial predicates. The other argument must be a constant geometry expression
+(e.g. `ST_Point()`, `ST_GeomFromGeoJSON()`, `ST_MakeEnvelope()`).
 
 The following spatial predicates are pushed down:
 
@@ -532,8 +530,8 @@ The following table summarizes Elasticsearch to DuckDB type mapping:
 | `boolean`          | `BOOLEAN`           | True/false                                       |
 | `date`             | `TIMESTAMP`         | Parsed from ISO8601 or epoch                     |
 | `ip`               | `VARCHAR`           | IP addresses as strings                          |
-| `geo_point`        | `VARCHAR`           | Converted to GeoJSON `Point` type                |
-| `geo_shape`        | `VARCHAR`           | Converted to relevant GeoJSON geometry type      |
+| `geo_point`        | `GEOMETRY`          | Converted to WKB `Point` type                    |
+| `geo_shape`        | `GEOMETRY`          | Converted to relevant WKB geometry type          |
 | `object`           | `STRUCT(...)`       | Nested properties become struct fields           |
 | `nested`           | `LIST(STRUCT(...))` | Always treated as array of objects               |
 
@@ -551,17 +549,23 @@ extension detects arrays by sampling documents:
 
 ### Geospatial types
 
-`geo_point` values are converted to GeoJSON `Point` type:
+`geo_point` and `geo_shape` fields are returned as native DuckDB `GEOMETRY`
+type. The spatial extension is not needed for basic geometry output;
+`CAST(column AS VARCHAR)` produces WKT text natively. Spatial functions like
+`ST_Within`, `ST_Intersects` etc. require the spatial extension.
 
-| Input format | Example                                                | Output                                             |
-| ------------ | ------------------------------------------------------ | -------------------------------------------------- |
-| object       | `{"lat": 40.7128, "lon": -74.006}`                     | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
-| GeoJSON      | `{"type": "Point", "coordinates": [-74.006, 40.7128]}` | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
-| array        | `[-74.006, 40.7128]`                                   | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
-| string       | `"40.7128,-74.006"`                                    | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
-| WKT          | `"POINT (-74.006 40.7128)"`                            | `{"type":"Point","coordinates":[-74.006,40.7128]}` |
+`geo_point` values are converted to WKB `Point` type. All five Elasticsearch
+input formats are supported:
 
-`geo_shape` values are converted to relevant GeoJSON geometry types:
+| Input format | Example                                                | WKT output (via `CAST`)   |
+| ------------ | ------------------------------------------------------ | ------------------------- |
+| object       | `{"lat": 40.7128, "lon": -74.006}`                     | `POINT (-74.006 40.7128)` |
+| GeoJSON      | `{"type": "Point", "coordinates": [-74.006, 40.7128]}` | `POINT (-74.006 40.7128)` |
+| array        | `[-74.006, 40.7128]`                                   | `POINT (-74.006 40.7128)` |
+| string       | `"40.7128,-74.006"`                                    | `POINT (-74.006 40.7128)` |
+| WKT          | `"POINT (-74.006 40.7128)"`                            | `POINT (-74.006 40.7128)` |
+
+`geo_shape` values are converted to relevant WKB geometry type:
 
 | Input format | Supported types                                                        |
 | ------------ | ---------------------------------------------------------------------- |
