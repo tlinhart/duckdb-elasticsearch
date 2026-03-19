@@ -138,7 +138,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	yyjson_mut_val *query_clause = nullptr;
 	yyjson_mut_val *base_query_clause = nullptr;
 
-	// Parse base query if provided (the query parameter is the query clause itself now).
+	// Parse base query if provided (the query parameter is the query clause).
 	if (!bind_data.base_query.empty()) {
 		yyjson_doc *base_doc = yyjson_read(bind_data.base_query.c_str(), bind_data.base_query.size(), 0);
 		if (base_doc) {
@@ -149,7 +149,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 	}
 
 	// Translate pushed filters to Elasticsearch Query DSL.
-	// IS NULL / IS NOT NULL filters are now handled through table_filters (added by pushdown_complex_filter).
+	// IS NULL / IS NOT NULL filters are handled through table_filters (added by pushdown_complex_filter).
 	yyjson_mut_val *filter_clause = nullptr;
 	if (filters && filters->HasFilters()) {
 		// Build column names vector for the filter translator.
@@ -832,7 +832,7 @@ struct ColumnPathInfo {
 // - BOUND_COLUMN_REF(col=2) -> {2, "name", []}
 // - struct_extract(col, 'name') -> {col_idx, "employee.name", ["name"]}
 // - struct_extract(struct_extract(col, 'address'), 'city') -> {col_idx, "employee.address.city", ["address", "city"]}
-static ColumnPathInfo ExtractColumnPath(const Expression &expr, const ElasticsearchQueryBindData &bind_data,
+static ColumnPathInfo ExtractColumnPath(const Expression &expr, const ElasticsearchSchema &schema,
                                         const vector<ColumnIndex> &column_ids) {
 	ColumnPathInfo result;
 
@@ -855,12 +855,12 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 			return result;
 		}
 
-		if (bind_col_id > bind_data.schema.column_names.size()) {
+		if (bind_col_id > schema.column_names.size()) {
 			return result;
 		}
 
 		result.output_col_idx = output_col_idx;
-		result.full_path = bind_data.schema.column_names[bind_col_id - 1];
+		result.full_path = schema.column_names[bind_col_id - 1];
 		return result;
 	}
 
@@ -884,7 +884,7 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 		string field_name = StringValue::Get(field_name_expr.value);
 
 		// Recursively get the parent path.
-		ColumnPathInfo parent_result = ExtractColumnPath(*func_expr.children[0], bind_data, column_ids);
+		ColumnPathInfo parent_result = ExtractColumnPath(*func_expr.children[0], schema, column_ids);
 		if (!parent_result.IsValid()) {
 			return result;
 		}
@@ -929,7 +929,7 @@ struct GeoColumnInfo {
 // Extract a geo column reference from a spatial function argument.
 // Detects direct BOUND_COLUMN_REF with GEOMETRY type or struct_extract chain
 // returning GEOMETRY and verifies the underlying Elasticsearch field is geo_point or geo_shape.
-static GeoColumnInfo ExtractGeoColumnFromArg(const Expression &expr, const ElasticsearchQueryBindData &bind_data,
+static GeoColumnInfo ExtractGeoColumnFromArg(const Expression &expr, const ElasticsearchSchema &schema,
                                              const vector<ColumnIndex> &column_ids, idx_t arg_index) {
 	GeoColumnInfo result;
 	result.arg_index = arg_index;
@@ -940,15 +940,15 @@ static GeoColumnInfo ExtractGeoColumnFromArg(const Expression &expr, const Elast
 	}
 
 	// Extract the column path from the expression (direct column reference or struct_extract chain).
-	ColumnPathInfo col_path = ExtractColumnPath(expr, bind_data, column_ids);
+	ColumnPathInfo col_path = ExtractColumnPath(expr, schema, column_ids);
 	if (!col_path.IsValid()) {
 		return result;
 	}
 
 	// Verify the column is a geo_point or geo_shape field.
 	const string &col_name = col_path.full_path;
-	auto it = bind_data.schema.es_type_map.find(col_name);
-	if (it == bind_data.schema.es_type_map.end()) {
+	auto it = schema.es_type_map.find(col_name);
+	if (it == schema.es_type_map.end()) {
 		return result;
 	}
 	if (it->second != "geo_point" && it->second != "geo_shape") {
@@ -1071,7 +1071,7 @@ static unique_ptr<TableFilter> WrapInStructFilters(unique_ptr<TableFilter> inner
 // DuckDB optimizer to skip the FilterCombiner path. By also handling comparisons here, all filter types
 // are pushed in a single pass.
 static bool TryPushComparisonFilter(ClientContext &context, const BoundComparisonExpression &comp_expr,
-                                    const ElasticsearchQueryBindData &bind_data, const vector<ColumnIndex> &column_ids,
+                                    const ElasticsearchSchema &schema, const vector<ColumnIndex> &column_ids,
                                     LogicalGet &get) {
 	auto expr_type = comp_expr.GetExpressionType();
 	// Support: =, !=, >, >=, <, <=
@@ -1092,7 +1092,7 @@ static bool TryPushComparisonFilter(ClientContext &context, const BoundCompariso
 	auto &col_expr = left_is_scalar ? *comp_expr.right : *comp_expr.left;
 	auto &scalar_expr = left_is_scalar ? *comp_expr.left : *comp_expr.right;
 
-	ColumnPathInfo col_path_info = ExtractColumnPath(col_expr, bind_data, column_ids);
+	ColumnPathInfo col_path_info = ExtractColumnPath(col_expr, schema, column_ids);
 	if (!col_path_info.IsValid()) {
 		return false;
 	}
@@ -1124,7 +1124,7 @@ static bool TryPushComparisonFilter(ClientContext &context, const BoundCompariso
 // The comparison must have ST_Distance on one side and a numeric constant on the other.
 // Only <, <=, >, >= are supported (not = or !=).
 static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparisonExpression &comp_expr,
-                                     const ElasticsearchQueryBindData &bind_data, const vector<ColumnIndex> &column_ids,
+                                     const ElasticsearchSchema &schema, const vector<ColumnIndex> &column_ids,
                                      LogicalGet &get) {
 	auto expr_type = comp_expr.GetExpressionType();
 	if (expr_type != ExpressionType::COMPARE_LESSTHAN && expr_type != ExpressionType::COMPARE_LESSTHANOREQUALTO &&
@@ -1180,9 +1180,9 @@ static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparis
 	// From ST_Distance's children, extract the geo column and the constant point.
 	auto &func_expr = dist_func_expr->Cast<BoundFunctionExpression>();
 
-	GeoColumnInfo geo_col = ExtractGeoColumnFromArg(*func_expr.children[0], bind_data, column_ids, 0);
+	GeoColumnInfo geo_col = ExtractGeoColumnFromArg(*func_expr.children[0], schema, column_ids, 0);
 	if (!geo_col.IsValid()) {
-		geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data, column_ids, 1);
+		geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], schema, column_ids, 1);
 	}
 	if (!geo_col.IsValid()) {
 		return false;
@@ -1246,9 +1246,9 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 			auto &comp_expr = filter->Cast<BoundComparisonExpression>();
 
 			// Validate comparison expressions on text fields. By validating here we fail early (even during EXPLAIN).
-			ColumnPathInfo col_path_info = ExtractColumnPath(*comp_expr.left, bind_data, column_ids);
+			ColumnPathInfo col_path_info = ExtractColumnPath(*comp_expr.left, bind_data.schema, column_ids);
 			if (!col_path_info.IsValid()) {
-				col_path_info = ExtractColumnPath(*comp_expr.right, bind_data, column_ids);
+				col_path_info = ExtractColumnPath(*comp_expr.right, bind_data.schema, column_ids);
 			}
 
 			if (col_path_info.IsValid()) {
@@ -1266,13 +1266,13 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 			}
 
 			// Try geo_distance pushdown first: ST_Distance(...) < N or N > ST_Distance(...).
-			if (TryPushGeoDistanceFilter(context, comp_expr, bind_data, column_ids, get)) {
+			if (TryPushGeoDistanceFilter(context, comp_expr, bind_data.schema, column_ids, get)) {
 				filters[i] = nullptr;
 				continue;
 			}
 
 			// Push comparison as ConstantFilter.
-			if (TryPushComparisonFilter(context, comp_expr, bind_data, column_ids, get)) {
+			if (TryPushComparisonFilter(context, comp_expr, bind_data.schema, column_ids, get)) {
 				filters[i] = nullptr;
 			}
 			continue;
@@ -1303,7 +1303,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				ColumnPathInfo col_path_info = ExtractColumnPath(*func_expr.children[0], bind_data, column_ids);
+				ColumnPathInfo col_path_info = ExtractColumnPath(*func_expr.children[0], bind_data.schema, column_ids);
 				if (!col_path_info.IsValid()) {
 					continue;
 				}
@@ -1341,9 +1341,10 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				}
 
 				// Try to find the geo column in either argument position.
-				GeoColumnInfo geo_col = ExtractGeoColumnFromArg(*func_expr.children[0], bind_data, column_ids, 0);
+				GeoColumnInfo geo_col =
+				    ExtractGeoColumnFromArg(*func_expr.children[0], bind_data.schema, column_ids, 0);
 				if (!geo_col.IsValid()) {
-					geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data, column_ids, 1);
+					geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data.schema, column_ids, 1);
 				}
 				if (!geo_col.IsValid()) {
 					continue;
@@ -1391,9 +1392,10 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 			// with either 2 or 3 children.
 			if (func_name_lower == "st_dwithin") {
 				// Try to find the geo column in arg 0 or arg 1.
-				GeoColumnInfo geo_col = ExtractGeoColumnFromArg(*func_expr.children[0], bind_data, column_ids, 0);
+				GeoColumnInfo geo_col =
+				    ExtractGeoColumnFromArg(*func_expr.children[0], bind_data.schema, column_ids, 0);
 				if (!geo_col.IsValid()) {
-					geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data, column_ids, 1);
+					geo_col = ExtractGeoColumnFromArg(*func_expr.children[1], bind_data.schema, column_ids, 1);
 				}
 				if (!geo_col.IsValid()) {
 					continue;
@@ -1473,7 +1475,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				ColumnPathInfo col_path_info = ExtractColumnPath(*op_expr.children[0], bind_data, column_ids);
+				ColumnPathInfo col_path_info = ExtractColumnPath(*op_expr.children[0], bind_data.schema, column_ids);
 				if (!col_path_info.IsValid()) {
 					continue;
 				}
@@ -1502,7 +1504,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				ColumnPathInfo col_path_info = ExtractColumnPath(*op_expr.children[0], bind_data, column_ids);
+				ColumnPathInfo col_path_info = ExtractColumnPath(*op_expr.children[0], bind_data.schema, column_ids);
 				if (!col_path_info.IsValid()) {
 					continue;
 				}

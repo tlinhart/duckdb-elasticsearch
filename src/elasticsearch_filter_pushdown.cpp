@@ -27,33 +27,25 @@ static std::string GetElasticsearchFieldName(const std::string &column_name, boo
 
 // Forward declarations of static helper functions.
 static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
-                                       const unordered_map<string, string> &es_types,
-                                       const unordered_set<string> &text_fields,
-                                       const unordered_set<string> &text_fields_with_keyword);
+                                       const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const ConstantFilter &filter,
-                                                   const string &field_name, bool is_text_field,
-                                                   bool has_keyword_subfield);
+                                                   const string &field_name, const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const ConjunctionAndFilter &filter,
-                                               const string &column_name, const unordered_map<string, string> &es_types,
-                                               const unordered_set<string> &text_fields,
-                                               const unordered_set<string> &text_fields_with_keyword);
+                                               const string &column_name, const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const ConjunctionOrFilter &filter,
-                                              const string &column_name, const unordered_map<string, string> &es_types,
-                                              const unordered_set<string> &text_fields,
-                                              const unordered_set<string> &text_fields_with_keyword);
+                                              const string &column_name, const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter, const string &field_name,
-                                         bool is_text_field, bool has_keyword_subfield);
+                                         const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
-                                                 const string &column_name, bool is_text_field,
-                                                 bool has_keyword_subfield);
+                                                 const string &column_name, const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
-                                            bool is_text_field, bool has_keyword_subfield, bool case_insensitive);
+                                            const ElasticsearchSchema &schema, bool case_insensitive);
 
 static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_name);
 
@@ -78,11 +70,6 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 		return result;
 	}
 
-	// Extract the schema fields needed by the internal filter translation functions.
-	const auto &es_types = schema.es_type_map;
-	const auto &text_fields = schema.text_fields;
-	const auto &text_fields_with_keyword = schema.text_fields_with_keyword;
-
 	// Collect translated filters.
 	yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
 	yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
@@ -97,8 +84,7 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 
 		const string &column_name = column_names[col_idx];
 
-		yyjson_mut_val *translated =
-		    TranslateFilter(doc, filter, column_name, es_types, text_fields, text_fields_with_keyword);
+		yyjson_mut_val *translated = TranslateFilter(doc, filter, column_name, schema);
 		if (translated) {
 			yyjson_mut_arr_append(must_arr, translated);
 		}
@@ -125,18 +111,13 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 }
 
 // Translate a single filter for a specific column.
+// The schema is passed through to child functions for field type lookups.
 static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
-                                       const unordered_map<string, string> &es_types,
-                                       const unordered_set<string> &text_fields,
-                                       const unordered_set<string> &text_fields_with_keyword) {
-	// Look up the text field status for this column.
-	bool is_text_field = text_fields.count(column_name) > 0;
-	bool has_keyword_subfield = text_fields_with_keyword.count(column_name) > 0;
-
+                                       const ElasticsearchSchema &schema) {
 	switch (filter.filter_type) {
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &const_filter = filter.Cast<ConstantFilter>();
-		return TranslateConstantComparison(doc, const_filter, column_name, is_text_field, has_keyword_subfield);
+		return TranslateConstantComparison(doc, const_filter, column_name, schema);
 	}
 
 	case TableFilterType::IS_NULL:
@@ -147,22 +128,22 @@ static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &f
 
 	case TableFilterType::CONJUNCTION_AND: {
 		auto &conj_filter = filter.Cast<ConjunctionAndFilter>();
-		return TranslateConjunctionAnd(doc, conj_filter, column_name, es_types, text_fields, text_fields_with_keyword);
+		return TranslateConjunctionAnd(doc, conj_filter, column_name, schema);
 	}
 
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conj_filter = filter.Cast<ConjunctionOrFilter>();
-		return TranslateConjunctionOr(doc, conj_filter, column_name, es_types, text_fields, text_fields_with_keyword);
+		return TranslateConjunctionOr(doc, conj_filter, column_name, schema);
 	}
 
 	case TableFilterType::IN_FILTER: {
 		auto &in_filter = filter.Cast<InFilter>();
-		return TranslateInFilter(doc, in_filter, column_name, is_text_field, has_keyword_subfield);
+		return TranslateInFilter(doc, in_filter, column_name, schema);
 	}
 
 	case TableFilterType::EXPRESSION_FILTER: {
 		auto &expr_filter = filter.Cast<ExpressionFilter>();
-		return TranslateExpressionFilter(doc, expr_filter, column_name, is_text_field, has_keyword_subfield);
+		return TranslateExpressionFilter(doc, expr_filter, column_name, schema);
 	}
 
 	case TableFilterType::STRUCT_EXTRACT: {
@@ -174,9 +155,8 @@ static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &f
 		string nested_field = column_name + "." + struct_filter.child_name;
 
 		// Recursively translate the child filter with the nested field path.
-		// The es_types and text_fields maps may contain entries for nested paths.
-		return TranslateFilter(doc, *struct_filter.child_filter, nested_field, es_types, text_fields,
-		                       text_fields_with_keyword);
+		// The schema maps contain entries for nested paths (e.g. "employee.name").
+		return TranslateFilter(doc, *struct_filter.child_filter, nested_field, schema);
 	}
 
 	default:
@@ -186,8 +166,10 @@ static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &f
 }
 
 static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const ConstantFilter &filter,
-                                                   const string &field_name, bool is_text_field,
-                                                   bool has_keyword_subfield) {
+                                                   const string &field_name, const ElasticsearchSchema &schema) {
+	bool is_text_field = schema.text_fields.count(field_name) > 0;
+	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
+
 	// For text fields without .keyword subfield, we cannot push down comparisons.
 	// Text fields are analyzed (lowercased, tokenized) and term/range queries on them
 	// would not produce correct results. Throw an error with helpful suggestions.
@@ -321,15 +303,12 @@ static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &fie
 }
 
 static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const ConjunctionAndFilter &filter,
-                                               const string &column_name, const unordered_map<string, string> &es_types,
-                                               const unordered_set<string> &text_fields,
-                                               const unordered_set<string> &text_fields_with_keyword) {
+                                               const string &column_name, const ElasticsearchSchema &schema) {
 	// {"bool": {"must": [filter1, filter2, ...]}}
 	yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
 
 	for (auto &child_filter : filter.child_filters) {
-		yyjson_mut_val *translated =
-		    TranslateFilter(doc, *child_filter, column_name, es_types, text_fields, text_fields_with_keyword);
+		yyjson_mut_val *translated = TranslateFilter(doc, *child_filter, column_name, schema);
 		if (translated) {
 			yyjson_mut_arr_append(must_arr, translated);
 		}
@@ -352,15 +331,12 @@ static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const Conjun
 }
 
 static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const ConjunctionOrFilter &filter,
-                                              const string &column_name, const unordered_map<string, string> &es_types,
-                                              const unordered_set<string> &text_fields,
-                                              const unordered_set<string> &text_fields_with_keyword) {
+                                              const string &column_name, const ElasticsearchSchema &schema) {
 	// {"bool": {"should": [filter1, filter2, ...], "minimum_should_match": 1}}
 	yyjson_mut_val *should_arr = yyjson_mut_arr(doc);
 
 	for (auto &child_filter : filter.child_filters) {
-		yyjson_mut_val *translated =
-		    TranslateFilter(doc, *child_filter, column_name, es_types, text_fields, text_fields_with_keyword);
+		yyjson_mut_val *translated = TranslateFilter(doc, *child_filter, column_name, schema);
 		if (translated) {
 			yyjson_mut_arr_append(should_arr, translated);
 		}
@@ -384,7 +360,10 @@ static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const Conjunc
 }
 
 static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter, const string &field_name,
-                                         bool is_text_field, bool has_keyword_subfield) {
+                                         const ElasticsearchSchema &schema) {
+	bool is_text_field = schema.text_fields.count(field_name) > 0;
+	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
+
 	// For text fields without .keyword subfield, we cannot push down IN filters.
 	// Text fields are analyzed (lowercased, tokenized) and terms queries on them
 	// would not produce correct results. Throw an error with helpful suggestions.
@@ -415,8 +394,7 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 }
 
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
-                                                 const string &column_name, bool is_text_field,
-                                                 bool has_keyword_subfield) {
+                                                 const string &column_name, const ElasticsearchSchema &schema) {
 	// ExpressionFilter contains arbitrary expressions. We handle:
 	// - LIKE/ILIKE patterns (~~, ~~*, like_escape, ilike_escape)
 	// - Optimized string functions from LikeOptimizationRule (prefix, suffix, contains)
@@ -445,8 +423,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 						// ~~* and ilike_escape are case-insensitive (ILIKE)
 						// ~~ and like_escape are case-sensitive (LIKE)
 						bool case_insensitive = (func_name == "~~*" || func_name == "ilike_escape");
-						return TranslateLikePattern(doc, column_name, pattern, is_text_field, has_keyword_subfield,
-						                            case_insensitive);
+						return TranslateLikePattern(doc, column_name, pattern, schema, case_insensitive);
 					}
 				}
 			}
@@ -480,8 +457,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 							pattern = "%" + value + "%";
 						}
 						// These come from LIKE optimization, so they are case-sensitive.
-						return TranslateLikePattern(doc, column_name, pattern, is_text_field, has_keyword_subfield,
-						                            false);
+						return TranslateLikePattern(doc, column_name, pattern, schema, false);
 					}
 				}
 			}
@@ -516,7 +492,7 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 }
 
 static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
-                                            bool is_text_field, bool has_keyword_subfield, bool case_insensitive) {
+                                            const ElasticsearchSchema &schema, bool case_insensitive) {
 	// Convert SQL LIKE pattern to Elasticsearch wildcard query:
 	// SQL LIKE: % = any chars, _ = single char
 	// Elasticsearch wildcard: * = any chars, ? = single char
@@ -530,6 +506,9 @@ static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &f
 	// - ILIKE (case-insensitive): use field.keyword with case_insensitive option
 	//
 	// Throw an error for text fields without .keyword subfield.
+
+	bool is_text_field = schema.text_fields.count(field_name) > 0;
+	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
 
 	// For text fields without .keyword, LIKE/ILIKE patterns are not supported.
 	// Text fields are analyzed (tokenized, lowercased) so pattern matching doesn't work correctly.
@@ -956,8 +935,8 @@ static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const Boun
 	}
 
 	// Check if the constant geometry is an envelope for bounding box optimization.
-	// The pushdown stage converts ST_MakeEnvelope to {"type":"envelope","coordinates":[[xmin,ymax],[xmax,ymin]]}.
-	// A Polygon produced by WKT conversion of an envelope is also recognized.
+	// The pushdown stage converts ST_MakeEnvelope and axis-aligned rectangle Polygons to
+	// {"type":"envelope","coordinates":[[xmin,ymax],[xmax,ymin]]} before the filter reaches here.
 	// This applies when:
 	// - Function is ST_Within and the field is "within" the envelope
 	// - Function is ST_Contains and the envelope "contains" the field

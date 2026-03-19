@@ -56,9 +56,6 @@ static constexpr uint32_t WKB_MULTILINESTRING = 5;
 static constexpr uint32_t WKB_MULTIPOLYGON = 6;
 static constexpr uint32_t WKB_GEOMETRYCOLLECTION = 7;
 
-// Forward declaration for recursive GeoJSON to WKB conversion.
-static bool GeoJSONObjectToWKB(yyjson_val *val, WKBWriter &writer);
-
 // Helper to get a numeric value from a yyjson value (handles both real and int).
 static double YyjsonGetNum(yyjson_val *val) {
 	if (yyjson_is_real(val)) {
@@ -395,9 +392,6 @@ private:
 	uint32_t pos;
 	uint32_t size;
 };
-
-// Forward declaration for recursive WKB to GeoJSON conversion.
-static bool WKBToGeoJSONRecursive(WKBReader &reader, yyjson_mut_doc *doc, yyjson_mut_val *parent_arr);
 
 // Read a single WKB geometry and append it as a GeoJSON object to parent_arr.
 static bool WKBToGeoJSONRecursive(WKBReader &reader, yyjson_mut_doc *doc, yyjson_mut_val *parent_arr) {

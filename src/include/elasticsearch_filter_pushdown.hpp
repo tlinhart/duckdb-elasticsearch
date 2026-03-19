@@ -29,7 +29,7 @@ struct FilterTranslationResult {
 //   column_names: The column names corresponding to filter column indices (built from column_ids,
 //                 not necessarily the same as schema.column_names).
 //   schema: The resolved Elasticsearch schema containing type maps and text field information
-//           needed for filter translation (.keyword handling, type lookups).
+//           needed for filter translation (.keyword handling, field type checks).
 FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterSet &filters,
                                          const vector<string> &column_names, const ElasticsearchSchema &schema);
 
