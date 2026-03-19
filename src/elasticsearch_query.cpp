@@ -840,7 +840,7 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 	// Direct column reference.
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
-		idx_t output_col_idx = col_ref.binding.column_index.index;
+		idx_t output_col_idx = col_ref.binding.column_index.GetIndexUnsafe();
 
 		if (output_col_idx >= column_ids.size()) {
 			return result;
@@ -1110,13 +1110,12 @@ static bool TryPushComparisonFilter(ClientContext &context, const BoundCompariso
 	// If the scalar is on the left side, flip the comparison direction.
 	auto comparison_type = left_is_scalar ? FlipComparisonExpression(expr_type) : expr_type;
 
-	const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
 	unique_ptr<TableFilter> filter = make_uniq<ConstantFilter>(comparison_type, std::move(constant_value));
 	if (!col_path_info.nested_fields.empty()) {
 		filter = WrapInStructFilters(std::move(filter), col_path_info.nested_fields);
 	}
 
-	get.table_filters.PushFilter(col_index, std::move(filter));
+	get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(filter));
 	return true;
 }
 
@@ -1207,14 +1206,12 @@ static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparis
 	auto &mod_func = mod_func_ref->Cast<BoundFunctionExpression>();
 	mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
 
-	const ColumnIndex &col_index = column_ids[geo_col.col_path.output_col_idx];
-
 	unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
 	if (!geo_col.col_path.nested_fields.empty()) {
 		expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
 	}
 
-	get.table_filters.PushFilter(col_index, std::move(expr_filter));
+	get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx), std::move(expr_filter));
 	return true;
 }
 
@@ -1310,7 +1307,6 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				}
 
 				const string &col_name = col_path_info.full_path;
-				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
 				bool is_text_field = bind_data.schema.text_fields.count(col_name) > 0;
 				bool has_keyword_subfield = bind_data.schema.text_fields_with_keyword.count(col_name) > 0;
 
@@ -1328,7 +1324,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					expr_filter = WrapInStructFilters(std::move(expr_filter), col_path_info.nested_fields);
 				}
 
-				get.table_filters.PushFilter(col_index, std::move(expr_filter));
+				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(expr_filter));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1373,14 +1369,12 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
 				}
 
-				const ColumnIndex &col_index = column_ids[geo_col.col_path.output_col_idx];
-
 				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
 				if (!geo_col.col_path.nested_fields.empty()) {
 					expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
 				}
 
-				get.table_filters.PushFilter(col_index, std::move(expr_filter));
+				get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx), std::move(expr_filter));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1452,14 +1446,12 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					mod_func.children.push_back(make_uniq<BoundConstantExpression>(Value::DOUBLE(distance_meters)));
 				}
 
-				const ColumnIndex &col_index = column_ids[geo_col.col_path.output_col_idx];
-
 				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
 				if (!geo_col.col_path.nested_fields.empty()) {
 					expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
 				}
 
-				get.table_filters.PushFilter(col_index, std::move(expr_filter));
+				get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx), std::move(expr_filter));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1481,8 +1473,6 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
-
 				unique_ptr<TableFilter> null_filter;
 				if (expr_type == ExpressionType::OPERATOR_IS_NULL) {
 					null_filter = make_uniq<IsNullFilter>();
@@ -1494,7 +1484,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					null_filter = WrapInStructFilters(std::move(null_filter), col_path_info.nested_fields);
 				}
 
-				get.table_filters.PushFilter(col_index, std::move(null_filter));
+				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(null_filter));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1511,7 +1501,6 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				}
 
 				const string &col_name = col_path_info.full_path;
-				const ColumnIndex &col_index = column_ids[col_path_info.output_col_idx];
 
 				bool is_text_field = bind_data.schema.text_fields.count(col_name) > 0;
 				bool has_keyword_subfield = bind_data.schema.text_fields_with_keyword.count(col_name) > 0;
@@ -1548,7 +1537,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					in_filter = WrapInStructFilters(std::move(in_filter), col_path_info.nested_fields);
 				}
 
-				get.table_filters.PushFilter(col_index, std::move(in_filter));
+				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(in_filter));
 				filters[i] = nullptr;
 				continue;
 			}

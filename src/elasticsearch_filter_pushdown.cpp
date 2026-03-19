@@ -75,7 +75,7 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 	yyjson_mut_val *must_arr = yyjson_mut_arr(doc);
 
 	for (auto &entry : filters) {
-		idx_t col_idx = entry.ColumnIndex();
+		idx_t col_idx = entry.GetIndex();
 		auto &filter = entry.Filter();
 
 		if (col_idx >= column_names.size()) {
