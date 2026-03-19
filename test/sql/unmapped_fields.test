@@ -1,5 +1,5 @@
 # name: test/sql/unmapped_fields.test
-# description: Test unmapped fields captured in the _unmapped_ JSON column
+# description: Test unmapped fields captured in the _unmapped_ VARIANT column
 # group: [sql]
 
 require elasticsearch
@@ -30,11 +30,11 @@ SELECT _unmapped_ FROM elasticsearch_query(
 WHERE _id IN ('2', '5', '8')
 ORDER BY _id;
 ----
-{"extra":10}
-{"extra":["one","two","three"]}
-{"extra":{"note":"This is a note","value":20.3}}
+{'extra': 10}
+{'extra': [one, two, three]}
+{'extra': {'note': This is a note, 'value': 20.3}}
 
-# Verify _unmapped_ column has a JSON type.
+# Verify _unmapped_ column has a VARIANT type.
 query I
 SELECT typeof(_unmapped_) FROM elasticsearch_query(
     host := 'localhost',
@@ -44,7 +44,7 @@ SELECT typeof(_unmapped_) FROM elasticsearch_query(
 )
 WHERE _id = '2';
 ----
-JSON
+VARIANT
 
 # Test document without unmapped fields returns NULL in the _unmapped_ column.
 query I
@@ -58,20 +58,26 @@ WHERE _id = '1';
 ----
 NULL
 
-statement ok
-INSTALL json;
-
-statement ok
-LOAD json;
-
-# Test extracting nested data from the _unmapped_ column.
+# Test extracting nested data from the _unmapped_ column using dot notation.
 query I
-SELECT _unmapped_->>'$.extra[1]' FROM elasticsearch_query(
+SELECT _unmapped_.extra.note FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
     password := 'test'
 )
-WHERE _id = '5';
+WHERE _id = '8';
 ----
-two
+This is a note
+
+# Test extracting nested data from the _unmapped_ column using variant_extract.
+query I
+SELECT variant_extract(_unmapped_, 'extra') FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id = '2';
+----
+10

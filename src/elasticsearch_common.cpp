@@ -1073,4 +1073,51 @@ bool IsGeoColumnRef(const Expression &expr) {
 	return false;
 }
 
+// Convert a yyjson value to a VariantValue for building VARIANT column data.
+VariantValue ConvertYyjsonToVariantValue(yyjson_val *val) {
+	if (!val || yyjson_is_null(val)) {
+		return VariantValue(Value());
+	}
+
+	if (yyjson_is_bool(val)) {
+		return VariantValue(Value::BOOLEAN(yyjson_get_bool(val)));
+	}
+	if (yyjson_is_sint(val)) {
+		return VariantValue(Value::BIGINT(yyjson_get_sint(val)));
+	}
+	if (yyjson_is_uint(val)) {
+		return VariantValue(Value::UBIGINT(yyjson_get_uint(val)));
+	}
+	if (yyjson_is_real(val)) {
+		return VariantValue(Value::DOUBLE(yyjson_get_real(val)));
+	}
+	if (yyjson_is_str(val)) {
+		return VariantValue(Value(yyjson_get_str(val)));
+	}
+	if (yyjson_is_arr(val)) {
+		VariantValue arr(VariantValueType::ARRAY);
+		size_t idx, max;
+		yyjson_val *elem;
+		yyjson_arr_foreach(val, idx, max, elem) {
+			arr.AddItem(ConvertYyjsonToVariantValue(elem));
+		}
+		return arr;
+	}
+	if (yyjson_is_obj(val)) {
+		VariantValue obj(VariantValueType::OBJECT);
+		yyjson_obj_iter iter;
+		yyjson_obj_iter_init(val, &iter);
+		yyjson_val *key;
+		while ((key = yyjson_obj_iter_next(&iter))) {
+			const char *field_name = yyjson_get_str(key);
+			yyjson_val *field_val = yyjson_obj_iter_get_val(key);
+			obj.AddChild(field_name, ConvertYyjsonToVariantValue(field_val));
+		}
+		return obj;
+	}
+
+	// Fallback: serialize to string.
+	return VariantValue(Value(""));
+}
+
 } // namespace duckdb

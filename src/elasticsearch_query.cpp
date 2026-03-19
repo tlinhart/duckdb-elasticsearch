@@ -391,7 +391,7 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 
 	// Always add _unmapped_ column to capture fields not in the mapping.
 	names.push_back("_unmapped_");
-	return_types.push_back(LogicalType::JSON());
+	return_types.push_back(LogicalType::VARIANT());
 
 	return std::move(bind_data);
 }
@@ -436,7 +436,7 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 				// _unmapped_ column
 				state->projected.field_paths.push_back("_unmapped_");
 				state->projected.es_types.push_back("");
-				state->projected.column_types.push_back(LogicalType::JSON());
+				state->projected.column_types.push_back(LogicalType::VARIANT());
 			}
 		}
 	} else {
@@ -461,7 +461,7 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 				// _unmapped_ column
 				state->projected.field_paths.push_back("_unmapped_");
 				state->projected.es_types.push_back("");
-				state->projected.column_types.push_back(LogicalType::JSON());
+				state->projected.column_types.push_back(LogicalType::VARIANT());
 			}
 		}
 	}
@@ -535,24 +535,20 @@ static unique_ptr<GlobalTableFunctionState> ElasticsearchQueryInitGlobal(ClientC
 }
 
 // Collect unmapped fields from _source that are not in the schema's mapped paths.
-// Returns a JSON string of unmapped fields or empty string if none found.
+// Returns a VariantValue of unmapped fields or a null VariantValue if none found.
 // Used to populate the _unmapped_ output column during scanning.
-static std::string CollectUnmappedFields(yyjson_val *source, const std::set<std::string> &mapped_paths,
-                                         const std::string &prefix = "") {
+static VariantValue CollectUnmappedFields(yyjson_val *source, const std::set<std::string> &mapped_paths,
+                                          const std::string &prefix = "") {
 	if (!source || !yyjson_is_obj(source)) {
-		return "";
+		return VariantValue(Value());
 	}
 
-	// Use yyjson mutable doc to build the unmapped object.
-	yyjson_mut_doc *unmapped_doc = yyjson_mut_doc_new(nullptr);
-	yyjson_mut_val *unmapped_root = yyjson_mut_obj(unmapped_doc);
-	yyjson_mut_doc_set_root(unmapped_doc, unmapped_root);
-
 	bool has_unmapped = false;
+	VariantValue result_obj(VariantValueType::OBJECT);
 
 	// Recursive helper to collect unmapped fields.
-	std::function<void(yyjson_val *, yyjson_mut_val *, const std::string &)> collect_unmapped =
-	    [&](yyjson_val *obj, yyjson_mut_val *target, const std::string &current_prefix) {
+	std::function<void(yyjson_val *, VariantValue &, const std::string &)> collect_unmapped =
+	    [&](yyjson_val *obj, VariantValue &target, const std::string &current_prefix) {
 		    if (!obj || !yyjson_is_obj(obj))
 			    return;
 
@@ -592,7 +588,7 @@ static std::string CollectUnmappedFields(yyjson_val *source, const std::set<std:
 
 				    if (has_mapped_children && yyjson_is_obj(field_val)) {
 					    // This is an object/nested type with defined child fields, check for unmapped children.
-					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
+					    VariantValue sub_obj(VariantValueType::OBJECT);
 					    bool sub_has_unmapped = false;
 
 					    yyjson_obj_iter sub_iter;
@@ -616,31 +612,30 @@ static std::string CollectUnmappedFields(yyjson_val *source, const std::set<std:
 
 							    if (!is_sub_parent) {
 								    // This subfield is unmapped, add it.
-								    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, subfield_val);
-								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, copied);
+								    sub_obj.AddChild(subfield_name, ConvertYyjsonToVariantValue(subfield_val));
 								    sub_has_unmapped = true;
 							    } else {
 								    // Recurse into this object.
-								    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
+								    VariantValue nested_obj(VariantValueType::OBJECT);
 								    collect_unmapped(subfield_val, nested_obj, subfield_path);
-								    if (yyjson_mut_obj_size(nested_obj) > 0) {
-									    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, nested_obj);
+								    if (!nested_obj.object_children.empty()) {
+									    sub_obj.AddChild(subfield_name, std::move(nested_obj));
 									    sub_has_unmapped = true;
 								    }
 							    }
 						    } else if (yyjson_is_obj(subfield_val)) {
 							    // Recurse for nested mapped objects.
-							    yyjson_mut_val *nested_obj = yyjson_mut_obj(unmapped_doc);
+							    VariantValue nested_obj(VariantValueType::OBJECT);
 							    collect_unmapped(subfield_val, nested_obj, subfield_path);
-							    if (yyjson_mut_obj_size(nested_obj) > 0) {
-								    yyjson_mut_obj_add_val(unmapped_doc, sub_obj, subfield_name, nested_obj);
+							    if (!nested_obj.object_children.empty()) {
+								    sub_obj.AddChild(subfield_name, std::move(nested_obj));
 								    sub_has_unmapped = true;
 							    }
 						    }
 					    }
 
 					    if (sub_has_unmapped) {
-						    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, sub_obj);
+						    target.AddChild(field_name, std::move(sub_obj));
 						    has_unmapped = true;
 					    }
 				    }
@@ -648,35 +643,27 @@ static std::string CollectUnmappedFields(yyjson_val *source, const std::set<std:
 			    } else if (is_parent_of_mapped) {
 				    // This is a parent object of mapped fields, recurse to find unmapped children.
 				    if (yyjson_is_obj(field_val)) {
-					    yyjson_mut_val *sub_obj = yyjson_mut_obj(unmapped_doc);
+					    VariantValue sub_obj(VariantValueType::OBJECT);
 					    collect_unmapped(field_val, sub_obj, field_path);
-					    if (yyjson_mut_obj_size(sub_obj) > 0) {
-						    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, sub_obj);
+					    if (!sub_obj.object_children.empty()) {
+						    target.AddChild(field_name, std::move(sub_obj));
 						    has_unmapped = true;
 					    }
 				    }
 			    } else {
 				    // This field is completely unmapped, add the entire value.
-				    yyjson_mut_val *copied = yyjson_val_mut_copy(unmapped_doc, field_val);
-				    yyjson_mut_obj_add_val(unmapped_doc, target, field_name, copied);
+				    target.AddChild(field_name, ConvertYyjsonToVariantValue(field_val));
 				    has_unmapped = true;
 			    }
 		    }
 	    };
 
-	collect_unmapped(source, unmapped_root, prefix);
+	collect_unmapped(source, result_obj, prefix);
 
-	std::string result;
 	if (has_unmapped) {
-		char *json_str = yyjson_mut_write(unmapped_doc, 0, nullptr);
-		if (json_str) {
-			result = json_str;
-			free(json_str);
-		}
+		return result_obj;
 	}
-
-	yyjson_mut_doc_free(unmapped_doc);
-	return result;
+	return VariantValue(Value());
 }
 
 // Main scan function.
@@ -705,6 +692,20 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 		if (remaining < static_cast<int64_t>(max_output)) {
 			max_output = static_cast<idx_t>(remaining);
 		}
+	}
+
+	// Detect if _unmapped_ column is projected and track its output column index.
+	// VariantValue objects are collected per row and written to the output vector after the scan loop.
+	idx_t unmapped_out_col = DConstants::INVALID_INDEX;
+	for (idx_t out_col = 0; out_col < state.projected.field_paths.size(); out_col++) {
+		if (state.projected.field_paths[out_col] == "_unmapped_") {
+			unmapped_out_col = out_col;
+			break;
+		}
+	}
+	vector<VariantValue> unmapped_values;
+	if (unmapped_out_col != DConstants::INVALID_INDEX) {
+		unmapped_values.reserve(max_output);
 	}
 
 	while (output_idx < max_output && !state.finished) {
@@ -791,14 +792,9 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 					FlatVector::SetNull(output.data[out_col], output_idx, true);
 				}
 			} else if (field_path == "_unmapped_") {
-				// _unmapped_ column
-				std::string unmapped_json = CollectUnmappedFields(source, bind_data.schema.all_mapped_paths);
-				if (unmapped_json.empty()) {
-					FlatVector::SetNull(output.data[out_col], output_idx, true);
-				} else {
-					auto str_val = StringVector::AddString(output.data[out_col], unmapped_json);
-					FlatVector::GetData<string_t>(output.data[out_col])[output_idx] = str_val;
-				}
+				// _unmapped_ column: collect VariantValue written to output after the scan loop.
+				VariantValue unmapped = CollectUnmappedFields(source, bind_data.schema.all_mapped_paths);
+				unmapped_values.push_back(std::move(unmapped));
 			} else {
 				// regular field
 				yyjson_val *val = GetValueByPath(source, field_path);
@@ -809,6 +805,11 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 		output_idx++;
 		state.current_hit_idx++;
 		state.current_row++;
+	}
+
+	// Write collected VariantValues to the _unmapped_ output column.
+	if (unmapped_out_col != DConstants::INVALID_INDEX && output_idx > 0) {
+		VariantValue::ToVARIANT(unmapped_values, output.data[unmapped_out_col]);
 	}
 
 	output.SetCardinality(output_idx);

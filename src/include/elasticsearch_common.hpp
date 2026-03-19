@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/variant_value.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "yyjson.hpp"
 
@@ -22,6 +23,9 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 // Convert a DuckDB Value to a yyjson mutable value for Elasticsearch query building.
 // Handles all common DuckDB types including numeric, string, date and timestamp.
 yyjson_mut_val *ConvertDuckDBToJSON(yyjson_mut_doc *doc, const Value &value);
+
+// Convert a yyjson value to a VariantValue for building VARIANT column data.
+VariantValue ConvertYyjsonToVariantValue(yyjson_val *val);
 
 // Convert WKB binary (GEOMETRY internal format) to a GeoJSON string.
 // Used by filter pushdown to convert GEOMETRY constants to GeoJSON for Elasticsearch query DSL.

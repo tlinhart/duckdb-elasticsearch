@@ -37,7 +37,7 @@ objects, geo types and multi-index queries.
 - Supports multi-index queries (e.g. `logs-*`) with automatic mapping merging.
 - Array fields are detected by sampling documents.
 - Schema resolution results (index mappings and document sampling) are cached.
-- Unmapped/dynamic fields are collected into a `JSON` column.
+- Unmapped/dynamic fields are collected into a `VARIANT` column.
 
 ### Type support
 
@@ -237,8 +237,8 @@ The `elasticsearch_query` function returns a table with:
 1. `_id` (`VARCHAR`) – the Elasticsearch document ID.
 1. Mapped fields – columns for each field in the index mapping with inferred
    types.
-1. `_unmapped_` (`JSON`) – a JSON object containing any fields present in
-   documents but not in the mapping.
+1. `_unmapped_` (`VARIANT`) – semi-structured data containing any fields
+   present in documents but not in the mapping.
 
 #### How it works
 
@@ -573,8 +573,8 @@ input formats are supported:
 
 ### Unmapped fields
 
-The `_unmapped_` column (`JSON` type) captures fields that exist in documents
-but aren't defined in the index mapping. This is useful when:
+The `_unmapped_` column (`VARIANT` type) captures fields that exist in
+documents but aren't defined in the index mapping. This is useful when:
 
 - The index has `dynamic` set to `true` and documents contain ad-hoc fields.
 - Different documents have different structures.
@@ -583,7 +583,7 @@ but aren't defined in the index mapping. This is useful when:
 The following query shows how to extract values from the `_unmapped_` column:
 
 ```sql
-SELECT _unmapped_->>'$.extra.note' FROM elasticsearch_query(...)
+SELECT _unmapped_.extra.note FROM elasticsearch_query(...)
 WHERE _unmapped_ IS NOT NULL;
 ```
 
