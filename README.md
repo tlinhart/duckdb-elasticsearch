@@ -370,27 +370,27 @@ SELECT elasticsearch_clear_cache();
 
 The following SQL expressions are translated to Elasticsearch Query DSL:
 
-| SQL expression                   | Elasticsearch query                                                   |
-| -------------------------------- | --------------------------------------------------------------------- |
-| `column = value`                 | `{"term": {"column": value}}`                                         |
-| `column != value`                | `{"bool": {"must_not": {"term": {"column": value}}}}`                 |
-| `column < value`                 | `{"range": {"column": {"lt": value}}}`                                |
-| `column > value`                 | `{"range": {"column": {"gt": value}}}`                                |
-| `column <= value`                | `{"range": {"column": {"lte": value}}}`                               |
-| `column >= value`                | `{"range": {"column": {"gte": value}}}`                               |
-| `column IN (a, b, c)`            | `{"terms": {"column": [a, b, c]}}`                                    |
-| `column LIKE 'prefix%'`          | `{"prefix": {"column": "prefix"}}`                                    |
-| `column LIKE '%suffix'`          | `{"wildcard": {"column": {"value": "*suffix"}}}`                      |
-| `column LIKE '%pattern%'`        | `{"wildcard": {"column": {"value": "*pattern*"}}}`                    |
-| `column ILIKE 'pattern'`         | Case-insensitive wildcard query                                       |
-| `column IS NULL`                 | `{"bool": {"must_not": {"exists": {"field": "column"}}}}`             |
-| `column IS NOT NULL`             | `{"exists": {"field": "column"}}`                                     |
-| `ST_Within(column, shape)`       | `{"geo_shape": {"column": {"shape": ..., "relation": "within"}}}`     |
-| `ST_Contains(column, shape)`     | `{"geo_shape": {"column": {"shape": ..., "relation": "contains"}}}`   |
-| `ST_Intersects(column, shape)`   | `{"geo_shape": {"column": {"shape": ..., "relation": "intersects"}}}` |
-| `ST_Disjoint(column, shape)`     | `{"geo_shape": {"column": {"shape": ..., "relation": "disjoint"}}}`   |
-| `ST_DWithin(column, point, N)`   | `{"geo_distance": {"distance": "Nm", "column": [lon, lat]}}`          |
-| `ST_Distance(column, point) < N` | `{"geo_distance": {"distance": "Nm", "column": [lon, lat]}}`          |
+| SQL expression                   | Elasticsearch query                                                             |
+| -------------------------------- | ------------------------------------------------------------------------------- |
+| `column = value`                 | `{"term": {"column": value}}`                                                   |
+| `column != value`                | `{"bool": {"must_not": {"term": {"column": value}}}}`                           |
+| `column < value`                 | `{"range": {"column": {"lt": value}}}`                                          |
+| `column > value`                 | `{"range": {"column": {"gt": value}}}`                                          |
+| `column <= value`                | `{"range": {"column": {"lte": value}}}`                                         |
+| `column >= value`                | `{"range": {"column": {"gte": value}}}`                                         |
+| `column IN (a, b, c)`            | `{"terms": {"column": [a, b, c]}}`                                              |
+| `column LIKE 'prefix%'`          | `{"prefix": {"column": "prefix"}}`                                              |
+| `column LIKE '%suffix'`          | `{"wildcard": {"column": {"value": "*suffix"}}}`                                |
+| `column LIKE '%pattern%'`        | `{"wildcard": {"column": {"value": "*pattern*"}}}`                              |
+| `column ILIKE 'pattern'`         | Case-insensitive wildcard query                                                 |
+| `column IS NULL`                 | `{"bool": {"must_not": {"exists": {"field": "column"}}}}`                       |
+| `column IS NOT NULL`             | `{"exists": {"field": "column"}}`                                               |
+| `ST_Within(column, shape)`       | `{"geo_shape": {"column": {"shape": shape_geojson, "relation": "within"}}}`     |
+| `ST_Contains(column, shape)`     | `{"geo_shape": {"column": {"shape": shape_geojson, "relation": "contains"}}}`   |
+| `ST_Intersects(column, shape)`   | `{"geo_shape": {"column": {"shape": shape_geojson, "relation": "intersects"}}}` |
+| `ST_Disjoint(column, shape)`     | `{"geo_shape": {"column": {"shape": shape_geojson, "relation": "disjoint"}}}`   |
+| `ST_DWithin(column, point, N)`   | `{"geo_distance": {"distance": "Nm", "column": point_object}}`                  |
+| `ST_Distance(column, point) < N` | `{"geo_distance": {"distance": "Nm", "column": point_object}}`                  |
 
 The following table summarizes the pushdown behavior:
 
