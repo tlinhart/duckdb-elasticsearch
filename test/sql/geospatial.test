@@ -138,6 +138,54 @@ WHERE _id = '4';
 ----
 MULTIPOINT (2.3522 48.8566, 2.3488 48.8534, 2.3555 48.8601)
 
+# Test geo_point IS NULL filter.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location IS NULL;
+----
+0
+
+# Test geo_point IS NOT NULL filter.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location IS NOT NULL;
+----
+10
+
+# Test geo_shape IS NULL filter.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry IS NULL;
+----
+0
+
+# Test geo_shape IS NOT NULL filter.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry IS NOT NULL;
+----
+10
+
 statement ok
 INSTALL spatial;
 
