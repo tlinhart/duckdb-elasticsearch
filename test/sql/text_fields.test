@@ -214,7 +214,117 @@ WHERE description IS NULL;
 ----
 0
 
-# Test term query on missing .keyword subfield for nested array text field.
+# Test equality on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description = 'Lightweight running shoes with breathable mesh and responsive cushioning technology.';
+----
+1
+
+# Test inequality on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description != 'Lightweight running shoes with breathable mesh and responsive cushioning technology.';
+----
+9
+
+# Test greater than on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description > 'Stainless steel water bottle with vacuum insulation keeps drinks cold for 24 hours.';
+----
+0
+
+# Test greater than or equal on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description >= 'S';
+----
+2
+
+# Test less than on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description < 'M';
+----
+3
+
+# Test less than or equal on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description <= 'Ceramic non-stick cookware set with heat-resistant handles and dishwasher safe coating.';
+----
+1
+
+# Test IN on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description IN (
+    'Lightweight running shoes with breathable mesh and responsive cushioning technology.',
+    'Stainless steel water bottle with vacuum insulation keeps drinks cold for 24 hours.'
+);
+----
+2
+
+# Test LIKE on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description LIKE '%comfort%';
+----
+2
+
+# Test ILIKE on text field without .keyword subfield.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description ILIKE '%WIRELESS%';
+----
+1
+
 # The users.name.keyword field doesn't exist in the mapping so no documents match.
 query I
 SELECT count(*) FROM elasticsearch_query(

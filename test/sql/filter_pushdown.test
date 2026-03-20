@@ -14,7 +14,7 @@
 # | boolean             | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
 # | keyword             | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
 # | text w/ .keyword    | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
-# | text w/o .keyword   | ERROR  | ERROR        | ERROR  | ERROR       | PUSHED               |
+# | text w/o .keyword   | FILTER | FILTER       | FILTER | FILTER      | PUSHED               |
 # | nested object       | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
 # | array element       | FILTER | FILTER       | FILTER | FILTER      | FILTER               |
 # | geo_shape/geo_point | N/A    | N/A          | N/A    | N/A         | PUSHED               |
@@ -41,7 +41,6 @@
 # - PUSHED: Filter is translated to Elasticsearch Query DSL
 # - FILTER: Filter cannot be pushed down; handled by DuckDB's FILTER operator after the scan
 # - N/A: Not applicable for this field type
-# - ERROR: Throws an error
 
 require elasticsearch
 
@@ -407,6 +406,43 @@ WHERE _id IN ('1', '2', '3');
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*_id IN \('1', '2', '3'\).*
 
+# _id IS NOT NULL: optimized away (always true, _id is never null in Elasticsearch).
+# No filter appears in the plan - the scan runs normally without any Filters: line for _id.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id IS NOT NULL;
+----
+physical_plan	<!REGEX>:.*IS NOT NULL.*
+
+# _id IS NULL: optimized to EMPTY_RESULT (always false, _id is never null in Elasticsearch).
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id IS NULL;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# _id IS NULL combined with other filter: still EMPTY_RESULT (always false regardless).
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id IS NULL AND amount > 50;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
 # Keyword field: range comparison is pushed.
 query II
 EXPLAIN SELECT count(*) FROM elasticsearch_query(
@@ -635,9 +671,9 @@ WHERE name IS NOT NULL;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name IS NOT NULL.*
 
-# Text field without .keyword: equality filter throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
+# Text field without .keyword: equality filter is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
@@ -645,34 +681,10 @@ SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description = 'Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: EXPLAIN also throws error (fail at plan time).
-statement error
-EXPLAIN SELECT count(*) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE description = 'test';
-----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
-
-# Text field without .keyword: inequality filter throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE description != 'Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.';
-----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
-
-# Text field without .keyword: EXPLAIN inequality also throws error.
-statement error
+# Text field without .keyword: inequality filter is not pushed.
+query II
 EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
@@ -681,22 +693,10 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description != 'test';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: range comparison throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE description >= 'S';
-----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
-
-# Text field without .keyword: EXPLAIN range also throws error.
-statement error
+# Text field without .keyword: range comparison is not pushed.
+query II
 EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
@@ -705,22 +705,10 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description >= 'S';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: IN clause throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE description IN ('Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.', 'Non existent description');
-----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
-
-# Text field without .keyword: EXPLAIN IN also throws error.
-statement error
+# Text field without .keyword: IN clause is not pushed.
+query II
 EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
@@ -729,11 +717,11 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description IN ('test1', 'test2');
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: LIKE prefix throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
+# Text field without .keyword: LIKE prefix is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
@@ -741,23 +729,11 @@ SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description LIKE 'Premium%';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: EXPLAIN LIKE also throws error.
-statement error
+# Text field without .keyword: LIKE suffix is not pushed.
+query II
 EXPLAIN SELECT count(*) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE description LIKE 'test%';
-----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
-
-# Text field without .keyword: LIKE suffix throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
@@ -765,11 +741,11 @@ SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description LIKE '%comfort.';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: LIKE contains throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
+# Text field without .keyword: LIKE contains is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
@@ -777,11 +753,11 @@ SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description LIKE '%wireless%';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: ILIKE prefix throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
+# Text field without .keyword: ILIKE prefix is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
@@ -789,23 +765,11 @@ SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description ILIKE 'premium%';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: EXPLAIN ILIKE also throws error.
-statement error
+# Text field without .keyword: ILIKE suffix is not pushed.
+query II
 EXPLAIN SELECT count(*) FROM elasticsearch_query(
-    host := 'localhost',
-    index := 'test',
-    username := 'elastic',
-    password := 'test'
-)
-WHERE description ILIKE 'test%';
-----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
-
-# Text field without .keyword: ILIKE suffix throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
@@ -813,11 +777,11 @@ SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description ILIKE '%COMFORT.';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
 
-# Text field without .keyword: ILIKE contains throws error.
-statement error
-SELECT count(*) FROM elasticsearch_query(
+# Text field without .keyword: ILIKE contains is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
     host := 'localhost',
     index := 'test',
     username := 'elastic',
@@ -825,7 +789,20 @@ SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description ILIKE '%WIRELESS%';
 ----
-Cannot filter on text field 'description' because it lacks a .keyword subfield.
+physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# Text field without .keyword: guard filter (_id IS NOT NULL) must not appear in EXPLAIN output.
+# The guard is an internal mechanism to block the FilterCombiner and is stripped by the optimizer.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE description = 'Premium wireless headphones with noise cancellation and 30-hour battery life for music lovers.';
+----
+physical_plan	<!REGEX>:.*_id IS NOT NULL.*
 
 # Text field without .keyword: IS NOT NULL is pushed (exists query works on any field).
 query II

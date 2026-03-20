@@ -273,3 +273,39 @@ Benjamin Lee
 James Garcia
 Michael Brown
 Olivia Davis
+
+# _id IS NOT NULL returns all documents (always true: _id is never null in Elasticsearch).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id IS NOT NULL;
+----
+10
+
+# _id IS NULL returns no documents (always false: _id is never null in Elasticsearch).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id IS NULL;
+----
+0
+
+# _id IS NULL combined with other filter returns no documents (always false regardless).
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE _id IS NULL AND amount > 50;
+----
+0

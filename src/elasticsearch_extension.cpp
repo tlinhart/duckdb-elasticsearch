@@ -23,7 +23,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register scalar functions.
 	RegisterElasticsearchClearCacheFunction(loader);
 
-	// Register optimizer extension for LIMIT/OFFSET pushdown.
+	// Register optimizer extension for _id semantic optimization and LIMIT/OFFSET pushdown.
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	OptimizerExtension::Register(config, ElasticsearchOptimizerExtension());
 

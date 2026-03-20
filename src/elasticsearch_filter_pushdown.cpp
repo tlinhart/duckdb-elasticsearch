@@ -84,12 +84,23 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 
 		const string &column_name = column_names[col_idx];
 
+		// Defense-in-depth: skip _id IS NOT NULL and _id IS NULL filters. The optimizer extension
+		// (OptimizeIdFilters) normally handles these before we get here: IS NOT NULL is stripped
+		// as always-true and IS NULL replaces the scan with EMPTY_RESULT. If either somehow
+		// survives to translation, skip it rather than generating a pointless or incorrect
+		// Elasticsearch query. See the _id semantic optimization in elasticsearch_optimizer.cpp.
+		if (column_name == "_id" &&
+		    (filter.filter_type == TableFilterType::IS_NOT_NULL || filter.filter_type == TableFilterType::IS_NULL)) {
+			continue;
+		}
+
 		yyjson_mut_val *translated = TranslateFilter(doc, filter, column_name, schema);
 		if (translated) {
 			yyjson_mut_arr_append(must_arr, translated);
 		}
-		// Note: TranslateFilter now throws an error for unsupported filters on text fields
-		// without .keyword, so we don't need to track non-translated filters anymore.
+		// Note: TranslateFilter may return nullptr for unsupported filter types (e.g. text fields
+		// without .keyword that somehow reach here). Such filters are evaluated by DuckDB's FILTER
+		// stage above the scan instead.
 	}
 
 	if (yyjson_mut_arr_size(must_arr) == 0) {
@@ -170,14 +181,12 @@ static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const Co
 	bool is_text_field = schema.text_fields.count(field_name) > 0;
 	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
 
-	// For text fields without .keyword subfield, we cannot push down comparisons.
-	// Text fields are analyzed (lowercased, tokenized) and term/range queries on them
-	// would not produce correct results. Throw an error with helpful suggestions.
+	// Defense-in-depth: text fields without .keyword should never reach here (the guard filter
+	// in pushdown_complex_filter prevents the FilterCombiner from pushing comparisons on them).
+	// If they somehow do, return nullptr so DuckDB handles the filter instead of generating
+	// an incorrect term/range query on an analyzed text field.
 	if (is_text_field && !has_keyword_subfield) {
-		throw InvalidInputException("Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
-		                            "  - Add a .keyword subfield to the Elasticsearch mapping\n"
-		                            "  - Use the 'query' parameter with native Elasticsearch text queries",
-		                            field_name);
+		return nullptr;
 	}
 
 	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
@@ -364,14 +373,11 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 	bool is_text_field = schema.text_fields.count(field_name) > 0;
 	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
 
-	// For text fields without .keyword subfield, we cannot push down IN filters.
-	// Text fields are analyzed (lowercased, tokenized) and terms queries on them
-	// would not produce correct results. Throw an error with helpful suggestions.
+	// Defense-in-depth: text fields without .keyword should never reach here (the guard filter
+	// in pushdown_complex_filter prevents the FilterCombiner from pushing IN filters on them).
+	// If they somehow do, return nullptr so DuckDB handles the filter.
 	if (is_text_field && !has_keyword_subfield) {
-		throw InvalidInputException("Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
-		                            "  - Add a .keyword subfield to the Elasticsearch mapping\n"
-		                            "  - Use the 'query' parameter with native Elasticsearch text queries",
-		                            field_name);
+		return nullptr;
 	}
 
 	// {"terms": {"field": [value1, value2, ...]}}
@@ -401,8 +407,9 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 	// - ST_Distance comparisons
 	// - Spatial extension functions ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint
 	//
-	// Note: For text fields without .keyword subfield an error is thrown early in TranslateLikePattern.
-	// Only text fields with .keyword or non-text fields (keyword etc.) reach the pattern translation.
+	// Note: Filters on text fields without .keyword are excluded by the guard filter mechanism
+	// in pushdown_complex_filter and never reach this function. Only text fields with .keyword
+	// or non-text fields reach here.
 	auto &expr = *filter.expr;
 
 	// Check if this is a function expression.
@@ -504,19 +511,15 @@ static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &f
 	// For text fields with .keyword subfield:
 	// - LIKE (case-sensitive): use field.keyword for exact matching
 	// - ILIKE (case-insensitive): use field.keyword with case_insensitive option
-	//
-	// Throw an error for text fields without .keyword subfield.
 
 	bool is_text_field = schema.text_fields.count(field_name) > 0;
 	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
 
-	// For text fields without .keyword, LIKE/ILIKE patterns are not supported.
-	// Text fields are analyzed (tokenized, lowercased) so pattern matching doesn't work correctly.
+	// Defense-in-depth: text fields without .keyword should never reach here (the guard filter
+	// in pushdown_complex_filter prevents the FilterCombiner from pushing LIKE/ILIKE on them).
+	// If they somehow do, return nullptr so DuckDB handles the filter.
 	if (is_text_field && !has_keyword_subfield) {
-		throw InvalidInputException("Cannot filter on text field '%s' because it lacks a .keyword subfield. Options:\n"
-		                            "  - Add a .keyword subfield to the Elasticsearch mapping\n"
-		                            "  - Use the 'query' parameter with native Elasticsearch text queries",
-		                            field_name);
+		return nullptr;
 	}
 
 	// Determine the field to use for the query.

@@ -401,7 +401,7 @@ The following table summarizes the pushdown behavior:
 | boolean                 | PUSHED    | PUSHED               | PUSHED | N/A             | PUSHED                   |
 | keyword                 | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
 | text with `.keyword`    | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
-| text without `.keyword` | ERROR     | ERROR                | ERROR  | ERROR           | PUSHED                   |
+| text without `.keyword` | FILTER    | FILTER               | FILTER | FILTER          | PUSHED                   |
 | nested object fields    | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
 | array element access    | FILTER    | FILTER               | FILTER | FILTER          | FILTER                   |
 | geo fields              | N/A       | N/A                  | N/A    | N/A             | PUSHED                   |
@@ -409,17 +409,19 @@ The following table summarizes the pushdown behavior:
 PUSHED – filter is translated to Elasticsearch Query DSL.  
 FILTER – filter cannot be pushed down; handled by DuckDB's `FILTER` operator
 after the scan.  
-N/A – not applicable for this field type.  
-ERROR – throws an error.
+N/A – not applicable for this field type.
 
 ### Text fields
 
 Elasticsearch `text` fields are analyzed (tokenized) and don't support exact
 match queries like `term`. For fields with a `.keyword` subfield, filters are
 automatically redirected to the `.keyword` subfield for exact matching. For
-fields without `.keyword` subfield, an error is thrown. One possible solution
-is to add a `.keyword` subfield to the Elasticsearch mapping. Another
-workaround is using the `query` parameter:
+fields without `.keyword` subfield, filters cannot be pushed down to
+Elasticsearch and are instead handled by DuckDB's `FILTER` operator after the
+scan. This means the query still works correctly, but all documents are fetched
+from Elasticsearch and filtered locally by DuckDB. For better performance on
+text fields, consider adding a `.keyword` subfield to the Elasticsearch mapping
+or using the `query` parameter with native Elasticsearch text query:
 
 ```sql
 SELECT * FROM elasticsearch_query(

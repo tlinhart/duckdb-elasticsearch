@@ -19,9 +19,14 @@ struct FilterTranslationResult {
 // Translates DuckDB TableFilter objects into Elasticsearch Query DSL.
 // Returns a FilterTranslationResult containing the translated Elasticsearch query (nullptr if no filters).
 //
-// Important: For text fields without a .keyword subfield, only IS NULL / IS NOT NULL filters are supported.
-// Any other filter type on such fields will throw an InvalidInputException with a helpful error message
-// explaining workarounds.
+// Filters on text fields without a .keyword subfield (other than IS NULL / IS NOT NULL)
+// are prevented from reaching this function by the guard filter mechanism in
+// pushdown_complex_filter. A no-op IsNotNullFilter on _id gates off DuckDB's FilterCombiner,
+// preventing it from pushing ConstantFilter/InFilter for those columns. The guard is optimized
+// away by the optimizer extension (OptimizeIdFilters in elasticsearch_optimizer.cpp) as part of
+// the _id semantic optimization before physical plan creation. TranslateFilters also skips _id
+// null filters as defense-in-depth. Additional nullptr guards in the individual translate
+// functions provide a further safety net.
 //
 // Parameters:
 //   doc: The mutable JSON document to create values in.
