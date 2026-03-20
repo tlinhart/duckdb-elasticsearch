@@ -11,17 +11,14 @@
 # +---------------------+--------+--------------+--------+-------------+----------------------+
 # | numeric             | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
 # | date                | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
-# | boolean             | PUSHED | N/A          | PUSHED | N/A         | PUSHED               |
+# | boolean             | PUSHED | PUSHED       | PUSHED | N/A         | PUSHED               |
 # | keyword             | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
 # | text w/ .keyword    | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
 # | text w/o .keyword   | ERROR  | ERROR        | ERROR  | ERROR       | PUSHED               |
 # | nested object       | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
 # | array element       | FILTER | FILTER       | FILTER | FILTER      | FILTER               |
-# | geo_shape/geo_point | N/A*   | N/A*         | N/A*   | N/A*        | N/A*                 |
+# | geo_shape/geo_point | N/A    | N/A          | N/A    | N/A         | PUSHED               |
 # +---------------------+--------+--------------+--------+-------------+----------------------+
-#
-# * geo_shape/geo_point fields use spatial function predicates instead of standard SQL operators.
-#   See geospatial pushdown table below.
 #
 # Geospatial pushdown (requires the DuckDB spatial extension):
 # +---------------+--------+----------------+-------------------------------------+-----------+
@@ -42,9 +39,9 @@
 #
 # Legend:
 # - PUSHED: Filter is translated to Elasticsearch Query DSL
-# - ERROR: Throws error with suggestions (add .keyword subfield or use query parameter)
-# - FILTER: Filter cannot be pushed, handled by DuckDB FILTER operator above the scan
+# - FILTER: Filter cannot be pushed down; handled by DuckDB's FILTER operator after the scan
 # - N/A: Not applicable for this field type
+# - ERROR: Throws an error
 
 require elasticsearch
 
@@ -277,6 +274,54 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 WHERE deprecated != true;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated!=true.*
+
+# Boolean field: greater than filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated > false;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated>false.*
+
+# Boolean field: less than filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated < true;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated<true.*
+
+# Boolean field: greater than or equal filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated >= true;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated>=true.*
+
+# Boolean field: less than or equal filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE deprecated <= false;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated<=false.*
 
 # Boolean field: IN clause is pushed.
 query II
@@ -1202,6 +1247,54 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 WHERE CASE WHEN deprecated THEN amount ELSE 0 END > 50;
 ----
 physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# geo_point field: IS NULL filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location IS NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location IS NULL.*
+
+# geo_point field: IS NOT NULL filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location IS NOT NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location IS NOT NULL.*
+
+# geo_shape field: IS NULL filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry IS NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry IS NULL.*
+
+# geo_shape field: IS NOT NULL filter is pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry IS NOT NULL;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry IS NOT NULL.*
 
 statement ok
 INSTALL spatial;

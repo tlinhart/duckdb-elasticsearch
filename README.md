@@ -398,20 +398,19 @@ The following table summarizes the pushdown behavior:
 | ----------------------- | --------- | -------------------- | ------ | --------------- | ------------------------ |
 | numeric                 | PUSHED    | PUSHED               | PUSHED | N/A             | PUSHED                   |
 | date                    | PUSHED    | PUSHED               | PUSHED | N/A             | PUSHED                   |
-| boolean                 | PUSHED    | N/A                  | PUSHED | N/A             | PUSHED                   |
+| boolean                 | PUSHED    | PUSHED               | PUSHED | N/A             | PUSHED                   |
 | keyword                 | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
 | text with `.keyword`    | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
 | text without `.keyword` | ERROR     | ERROR                | ERROR  | ERROR           | PUSHED                   |
 | nested object fields    | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
 | array element access    | FILTER    | FILTER               | FILTER | FILTER          | FILTER                   |
-| geo fields              | N/A       | N/A                  | N/A    | N/A             | N/A                      |
+| geo fields              | N/A       | N/A                  | N/A    | N/A             | PUSHED                   |
 
 PUSHED – filter is translated to Elasticsearch Query DSL.  
-ERROR – throws an error.  
 FILTER – filter cannot be pushed down; handled by DuckDB's `FILTER` operator
 after the scan.  
-N/A – not applicable for this field type; geo fields use spatial predicates
-instead (see below).
+N/A – not applicable for this field type.  
+ERROR – throws an error.
 
 ### Text fields
 
