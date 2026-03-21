@@ -12,8 +12,9 @@ namespace duckdb {
 //      - _id IS NOT NULL  ->  always true   ->  filter stripped (no-op)
 //      - _id IS NULL      ->  always false  ->  scan replaced with EMPTY_RESULT
 //    This also serves as the mechanism for stripping the internal guard filter that
-//    ElasticsearchPushdownComplexFilter pushes to block the FilterCombiner. The guard is
-//    semantically "_id IS NOT NULL" and gets optimized away as part of the always-true case.
+//    ElasticsearchPushdownComplexFilter pushes to block the FilterCombiner from re-pushing
+//    deferred filters (text fields without .keyword, comparison/IN on geo fields). The guard
+//    is semantically "_id IS NOT NULL" and gets optimized away as part of the always-true case.
 // 2. LIMIT/OFFSET pushdown - finds LIMIT operators above Elasticsearch scans, stores the
 //    limit and offset values in the bind data and removes the LIMIT operator from the plan
 //    so that DuckDB does not duplicate limit enforcement.

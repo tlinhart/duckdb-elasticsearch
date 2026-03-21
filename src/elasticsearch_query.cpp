@@ -1232,9 +1232,11 @@ static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparis
 // in pushdown_complex_filter causes DuckDB's optimizer to skip the FilterCombiner path,
 // which would prevent standard comparison filters from being pushed down.
 //
-// For text fields without a .keyword subfield, comparison/LIKE/ILIKE/IN filters are not pushed -
-// they are left for DuckDB's FILTER stage. When such filters are deferred and no other filters
-// have been pushed into table_filters, a no-op IsNotNullFilter on _id is injected as a guard.
+// For text fields without a .keyword subfield, comparison/LIKE/ILIKE/IN filters are not
+// pushed - they are left for DuckDB's FILTER stage. For geo fields (geo_point, geo_shape),
+// equality/inequality and IN are deferred to DuckDB's FILTER stage, while range comparisons
+// are rejected with an error. When such filters are deferred and no other filters have been
+// pushed into table_filters, a no-op IsNotNullFilter on _id is injected as a guard.
 // This causes DuckDB's FilterCombiner (which runs after this callback) to see a non-empty
 // table_filters and skip its own pushdown, preventing it from re-pushing the deferred filters
 // as ConstantFilter/InFilter. The guard is optimized away by the optimizer extension
@@ -1246,9 +1248,10 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
 	const auto &column_ids = get.GetColumnIds();
 
-	// Track whether any filters on text fields without .keyword were skipped (deferred to DuckDB).
-	// Used to decide whether a guard filter is needed - see comment block after the loop.
-	bool has_deferred_text_filters = false;
+	// Track whether any filters were deferred to DuckDB (e.g. comparisons/IN on text fields without
+	// .keyword or geo fields). Used to decide whether a guard filter is needed - see comment block
+	// after the loop.
+	bool has_deferred_filters = false;
 
 	for (idx_t i = 0; i < filters.size(); i++) {
 		auto &filter = filters[i];
@@ -1274,7 +1277,28 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				bool has_keyword_subfield = bind_data.schema.text_fields_with_keyword.count(col_name) > 0;
 
 				if (is_text_field && !has_keyword_subfield) {
-					has_deferred_text_filters = true;
+					has_deferred_filters = true;
+					continue;
+				}
+
+				// Standard comparisons on geo fields cannot be pushed to Elasticsearch:
+				// - = and != would generate invalid term queries on geo fields
+				// - <, >, <=, >= are semantically meaningless for geometry types
+				// Note: ST_Distance(...) < N patterns are not caught here because ExtractColumnPath
+				// returns invalid for function expressions like ST_Distance - they fall through to
+				// TryPushGeoDistanceFilter below.
+				bool is_geo_field = bind_data.schema.geo_fields.count(col_name) > 0;
+				if (is_geo_field) {
+					auto comp_type = comp_expr.GetExpressionType();
+					if (comp_type == ExpressionType::COMPARE_GREATERTHAN ||
+					    comp_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO ||
+					    comp_type == ExpressionType::COMPARE_LESSTHAN ||
+					    comp_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+						throw InvalidInputException(
+						    "Range comparisons (<, >, <=, >=) are not supported on geo field '%s'.", col_name);
+					}
+					// = and != are deferred to DuckDB's FILTER stage.
+					has_deferred_filters = true;
 					continue;
 				}
 			}
@@ -1330,7 +1354,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				// because the field is analyzed/tokenized). The guard filter mechanism (see after the loop)
 				// prevents the FilterCombiner from re-pushing these.
 				if (is_text_field && !has_keyword_subfield) {
-					has_deferred_text_filters = true;
+					has_deferred_filters = true;
 					continue;
 				}
 
@@ -1524,7 +1548,14 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				// because the field is analyzed/tokenized). The guard filter mechanism (see after the loop)
 				// prevents the FilterCombiner from re-pushing these.
 				if (is_text_field && !has_keyword_subfield) {
-					has_deferred_text_filters = true;
+					has_deferred_filters = true;
+					continue;
+				}
+
+				// Skip IN on geo fields (term/terms queries are invalid on geo_point/geo_shape).
+				// The guard filter mechanism prevents the FilterCombiner from re-pushing these.
+				if (bind_data.schema.geo_fields.count(col_name) > 0) {
+					has_deferred_filters = true;
 					continue;
 				}
 
@@ -1560,15 +1591,16 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 		}
 	}
 
-	// Guard filter: prevent the FilterCombiner from re-pushing deferred text field filters.
+	// Guard filter: prevent the FilterCombiner from re-pushing deferred filters.
 	// DuckDB's optimizer runs two filter pushdown stages:
 	// 1. pushdown_complex_filter (this callback) - we selectively push supported filters.
 	// 2. FilterCombiner - runs only if table_filters is empty after stage 1.
 	//    It would convert leftover comparison expressions into ConstantFilter/InFilter, which
-	//    would then be pushed to Elasticsearch and produce incorrect results on analyzed text fields.
+	//    would then be pushed to Elasticsearch and produce incorrect results (e.g. term/range
+	//    queries on analyzed text fields or geo fields).
 	//
 	// To prevent stage 2 from running, we ensure table_filters is never empty when there are
-	// deferred text field filters. We push a no-op IsNotNullFilter on _id (which is always non-null
+	// deferred filters. We push a no-op IsNotNullFilter on _id (which is always non-null
 	// in Elasticsearch). If _id is not already in the projected columns, we add it via AddColumnId -
 	// DuckDB's filter_prune ensures the extra column won't appear in the query output.
 	//
@@ -1577,7 +1609,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 	// non-null, "_id IS NOT NULL" is always true and gets stripped. This happens after the
 	// FILTER_PUSHDOWN pass but before physical plan creation, so the guard never appears in
 	// EXPLAIN output. TranslateFilters also skips _id null filters as defense-in-depth.
-	if (has_deferred_text_filters && !get.table_filters.HasFilters()) {
+	if (has_deferred_filters && !get.table_filters.HasFilters()) {
 		// Find _id (schema column 0) in column_ids. If _id is not already projected (e.g. SELECT count(*)),
 		// add it - DuckDB's filter_prune ensures the extra column won't appear in the query output.
 		optional_idx guard_proj_idx;

@@ -99,8 +99,8 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 			yyjson_mut_arr_append(must_arr, translated);
 		}
 		// Note: TranslateFilter may return nullptr for unsupported filter types (e.g. text fields
-		// without .keyword that somehow reach here). Such filters are evaluated by DuckDB's FILTER
-		// stage above the scan instead.
+		// without .keyword or geo fields that somehow reach here). Such filters are evaluated by
+		// DuckDB's FILTER stage above the scan instead.
 	}
 
 	if (yyjson_mut_arr_size(must_arr) == 0) {
@@ -186,6 +186,14 @@ static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const Co
 	// If they somehow do, return nullptr so DuckDB handles the filter instead of generating
 	// an incorrect term/range query on an analyzed text field.
 	if (is_text_field && !has_keyword_subfield) {
+		return nullptr;
+	}
+
+	// Defense-in-depth: geo fields should never reach here (the guard filter in
+	// pushdown_complex_filter prevents the FilterCombiner from pushing comparisons on them).
+	// If they somehow do, return nullptr so DuckDB handles the filter instead of generating
+	// an invalid term/range query on a geo_point/geo_shape field.
+	if (schema.geo_fields.count(field_name) > 0) {
 		return nullptr;
 	}
 
@@ -380,6 +388,13 @@ static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &fi
 		return nullptr;
 	}
 
+	// Defense-in-depth: geo fields should never reach here (the guard filter in
+	// pushdown_complex_filter prevents the FilterCombiner from pushing IN filters on them).
+	// If they somehow do, return nullptr so DuckDB handles the filter.
+	if (schema.geo_fields.count(field_name) > 0) {
+		return nullptr;
+	}
+
 	// {"terms": {"field": [value1, value2, ...]}}
 	// or for text fields with .keyword: {"terms": {"field.keyword": [value1, value2, ...]}}
 	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
@@ -407,9 +422,10 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 	// - ST_Distance comparisons
 	// - Spatial extension functions ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint
 	//
-	// Note: Filters on text fields without .keyword are excluded by the guard filter mechanism
-	// in pushdown_complex_filter and never reach this function. Only text fields with .keyword
-	// or non-text fields reach here.
+	// Note: Standard comparison and IN filters on text fields without .keyword and on geo fields
+	// are excluded by the guard filter mechanism in pushdown_complex_filter and never reach this
+	// function as comparisons. Geo fields reach here only via spatial predicates (ST_Within,
+	// ST_DWithin etc.) which are pushed as ExpressionFilter.
 	auto &expr = *filter.expr;
 
 	// Check if this is a function expression.

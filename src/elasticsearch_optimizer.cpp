@@ -18,8 +18,8 @@ namespace duckdb {
 // This also serves as the mechanism for stripping the internal guard filter. The
 // pushdown_complex_filter callback pushes an IsNotNullFilter on _id to prevent DuckDB's
 // FilterCombiner from incorrectly pushing comparison filters on text fields without a
-// .keyword subfield. That guard is semantically "_id IS NOT NULL" and gets stripped here
-// as part of the general always-true optimization - not as a special case.
+// .keyword subfield or on geo fields. That guard is semantically "_id IS NOT NULL" and gets
+// stripped here as part of the general always-true optimization - not as a special case.
 //
 // Runs after the FILTER_PUSHDOWN pass but before physical plan creation, so the
 // optimizations are reflected in EXPLAIN / EXPLAIN ANALYZE output.

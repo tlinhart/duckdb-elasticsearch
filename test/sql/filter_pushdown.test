@@ -17,7 +17,7 @@
 # | text w/o .keyword   | FILTER | FILTER       | FILTER | FILTER      | PUSHED               |
 # | nested object       | PUSHED | PUSHED       | PUSHED | PUSHED      | PUSHED               |
 # | array element       | FILTER | FILTER       | FILTER | FILTER      | FILTER               |
-# | geo_shape/geo_point | N/A    | N/A          | N/A    | N/A         | PUSHED               |
+# | geo_shape/geo_point | FILTER | N/A          | FILTER | N/A         | PUSHED               |
 # +---------------------+--------+--------------+--------+-------------+----------------------+
 #
 # Geospatial pushdown (requires the DuckDB spatial extension):
@@ -1224,6 +1224,78 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 WHERE CASE WHEN deprecated THEN amount ELSE 0 END > 50;
 ----
 physical_plan	<REGEX>:.*FILTER.*ELASTICSEARCH_QUERY.*
+
+# geo_point field: equality filter is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location = 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+physical_plan	<REGEX>:.*FILTER.*location.*ELASTICSEARCH_QUERY.*
+
+# geo_point field: inequality filter is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location != 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+physical_plan	<REGEX>:.*FILTER.*location.*ELASTICSEARCH_QUERY.*
+
+# geo_point field: IN filter is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location IN ('POINT (-74.006 40.7128)'::GEOMETRY, 'POINT (-122.4194 37.7749)'::GEOMETRY);
+----
+physical_plan	<REGEX>:.*FILTER.*location.*ELASTICSEARCH_QUERY.*
+
+# geo_shape field: equality filter is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry = 'POINT (-122.4194 37.7749)'::GEOMETRY;
+----
+physical_plan	<REGEX>:.*FILTER.*geometry.*ELASTICSEARCH_QUERY.*
+
+# geo_shape field: inequality filter is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry != 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+physical_plan	<REGEX>:.*FILTER.*geometry.*ELASTICSEARCH_QUERY.*
+
+# geo_shape field: IN filter is not pushed.
+query II
+EXPLAIN SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry IN ('POINT (-74.006 40.7128)'::GEOMETRY, 'POINT (-122.4194 37.7749)'::GEOMETRY);
+----
+physical_plan	<REGEX>:.*FILTER.*geometry.*ELASTICSEARCH_QUERY.*
 
 # geo_point field: IS NULL filter is pushed.
 query II

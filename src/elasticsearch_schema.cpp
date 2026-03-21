@@ -692,7 +692,7 @@ ElasticsearchSchema ResolveElasticsearchSchema(const ElasticsearchConfig &config
 
 	yyjson_doc_free(doc);
 
-	// Build Elasticsearch type map and identify text fields from top-level columns.
+	// Build Elasticsearch type map and identify text/geo fields from top-level columns.
 	for (size_t i = 0; i < result.column_names.size(); i++) {
 		const string &col_name = result.column_names[i];
 		const string &es_type = result.es_types[i];
@@ -700,13 +700,19 @@ ElasticsearchSchema ResolveElasticsearchSchema(const ElasticsearchConfig &config
 		if (es_type == "text") {
 			result.text_fields.insert(col_name);
 		}
+		if (es_type == "geo_point" || es_type == "geo_shape") {
+			result.geo_fields.insert(col_name);
+		}
 	}
 
-	// Add all nested paths to es_type_map and text_fields.
+	// Add all nested paths to es_type_map, text_fields and geo_fields.
 	for (const auto &entry : all_path_types) {
 		result.es_type_map[entry.first] = entry.second;
 		if (entry.second == "text") {
 			result.text_fields.insert(entry.first);
+		}
+		if (entry.second == "geo_point" || entry.second == "geo_shape") {
+			result.geo_fields.insert(entry.first);
 		}
 	}
 

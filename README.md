@@ -404,7 +404,7 @@ The following table summarizes the pushdown behavior:
 | text without `.keyword` | FILTER    | FILTER               | FILTER | FILTER          | PUSHED                   |
 | nested object fields    | PUSHED    | PUSHED               | PUSHED | PUSHED          | PUSHED                   |
 | array element access    | FILTER    | FILTER               | FILTER | FILTER          | FILTER                   |
-| geo fields              | N/A       | N/A                  | N/A    | N/A             | PUSHED                   |
+| geo fields              | FILTER    | N/A                  | FILTER | N/A             | PUSHED                   |
 
 PUSHED – filter is translated to Elasticsearch Query DSL.  
 FILTER – filter cannot be pushed down; handled by DuckDB's `FILTER` operator
@@ -433,8 +433,14 @@ SELECT * FROM elasticsearch_query(
 
 ### Geo fields
 
-`geo_point` and `geo_shape` fields use spatial function predicates instead of
-standard SQL operators. Pushdown requires the DuckDB spatial extension to be
+`geo_point` and `geo_shape` fields use spatial function predicates for
+efficient server-side filtering. Standard comparison operators (`=`, `!=`) and
+`IN` cannot be pushed down to Elasticsearch and are instead handled by DuckDB's
+`FILTER` operator after the scan. Range comparisons (`<`, `>`, `<=`, `>=`) are
+rejected with an error since they are semantically meaningless for geometry
+types. `IS NULL` and `IS NOT NULL` are pushed down normally.
+
+Spatial predicate pushdown requires the DuckDB spatial extension to be
 installed and loaded:
 
 ```sql

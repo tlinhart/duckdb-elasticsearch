@@ -138,6 +138,168 @@ WHERE _id = '4';
 ----
 MULTIPOINT (2.3522 48.8566, 2.3488 48.8534, 2.3555 48.8601)
 
+# Test geo_point equality filter.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location = 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+Alice Johnson
+
+# Test geo_point inequality filter.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location != 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+9
+
+# Test geo_point IN filter.
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location IN ('POINT (-74.006 40.7128)'::GEOMETRY, 'POINT (-0.1278 51.5074)'::GEOMETRY);
+----
+Alice Johnson
+Michael Brown
+
+# Test geo_shape equality filter.
+query I
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry = 'POINT (-122.4194 37.7749)'::GEOMETRY;
+----
+Alice Johnson
+
+# Test geo_shape inequality filter.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry != 'POINT (-122.4194 37.7749)'::GEOMETRY;
+----
+9
+
+# Test geo_shape IN filter.
+query I rowsort
+SELECT name FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry IN ('POINT (-122.4194 37.7749)'::GEOMETRY, 'POINT (12.4964 41.9028)'::GEOMETRY);
+----
+Alice Johnson
+Sophia Martinez
+
+# Test geo_point less than is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location < 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+
+# Test geo_point greater than is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location > 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+
+# Test geo_point less than or equal is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location <= 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+
+# Test geo_point greater than or equal is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE location >= 'POINT (-74.006 40.7128)'::GEOMETRY;
+----
+
+# Test geo_shape less than is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry < 'POINT (-122.4194 37.7749)'::GEOMETRY;
+----
+
+# Test geo_shape greater than is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry > 'POINT (-122.4194 37.7749)'::GEOMETRY;
+----
+
+# Test geo_shape less than or equal is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry <= 'POINT (-122.4194 37.7749)'::GEOMETRY;
+----
+
+# Test geo_shape greater than or equal is rejected with an error.
+statement error
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+)
+WHERE geometry >= 'POINT (-122.4194 37.7749)'::GEOMETRY;
+----
+
 # Test geo_point IS NULL filter.
 query I
 SELECT count(*) FROM elasticsearch_query(

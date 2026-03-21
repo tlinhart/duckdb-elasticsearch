@@ -45,6 +45,11 @@ struct ElasticsearchSchema {
 	// Set of text field names/paths that have a .keyword subfield in the Elasticsearch mapping.
 	// Only these text fields support filter pushdown (except IS NULL/IS NOT NULL which work on any field).
 	std::unordered_set<string> text_fields_with_keyword;
+
+	// Set of field names/paths whose Elasticsearch type is "geo_point" or "geo_shape".
+	// Geo fields use spatial predicates (ST_Within, ST_DWithin, ST_Distance etc.) for pushdown;
+	// standard comparison (=, !=, <, >, <=, >=) and IN operators cannot be pushed to Elasticsearch.
+	std::unordered_set<string> geo_fields;
 };
 
 // Resolve schema for an Elasticsearch index, with caching.
