@@ -18,6 +18,7 @@ set(EXTENSION_SOURCES src/elasticsearch_extension.cpp
                       src/elasticsearch_common.cpp
                       src/elasticsearch_schema.cpp
                       src/elasticsearch_query.cpp
+                      src/elasticsearch_aggregate.cpp
                       src/elasticsearch_filter_pushdown.cpp
                       src/elasticsearch_optimizer.cpp)
 

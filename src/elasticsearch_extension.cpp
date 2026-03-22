@@ -3,10 +3,9 @@
 #include "elasticsearch_extension.hpp"
 #include "elasticsearch_schema.hpp"
 #include "elasticsearch_query.hpp"
+#include "elasticsearch_aggregate.hpp"
 #include "elasticsearch_optimizer.hpp"
 #include "duckdb.hpp"
-#include "duckdb/common/types/value.hpp"
-#include "duckdb/main/config.hpp"
 
 #include <curl/curl.h>
 
@@ -19,6 +18,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register table functions.
 	RegisterElasticsearchQueryFunction(loader);
+	RegisterElasticsearchAggregateFunction(loader);
 
 	// Register scalar functions.
 	RegisterElasticsearchClearCacheFunction(loader);
@@ -28,7 +28,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OptimizerExtension::Register(config, ElasticsearchOptimizerExtension());
 
 	// Register extension settings.
-	// These provide configurable defaults for elasticsearch_query() parameters.
+	// These provide configurable defaults for elasticsearch_query() and elasticsearch_aggregate() parameters.
 	// Named parameters on the function override these settings when specified.
 	config.AddExtensionOption("elasticsearch_verify_ssl",
 	                          "Whether to verify SSL certificates when connecting to Elasticsearch",

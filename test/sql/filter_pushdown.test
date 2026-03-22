@@ -1595,3 +1595,85 @@ WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000) AND
       amount > 50;
 ----
 physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*amount>50.*
+
+# ============================================================================
+# elasticsearch_aggregate filter pushdown tests
+# ============================================================================
+
+# Filter pushdown: numeric comparison (amount > 50) pushed to elasticsearch_aggregate.
+query II
+EXPLAIN SELECT avg_amount FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE amount > 50;
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_AGGREGATE.*Filters:.*amount>50.*
+
+# Filter pushdown: text field with .keyword subfield equality (name = 'Alice Johnson').
+query II
+EXPLAIN SELECT avg_amount FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE name = 'Alice Johnson';
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_AGGREGATE.*Filters:.*name='Alice Johnson'.*
+
+# Filter pushdown: keyword field IN clause (_id is a keyword virtual column).
+query II
+EXPLAIN SELECT avg_amount FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE _id IN ('1', '2', '3');
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_AGGREGATE.*Filters:.*_id IN \('1', '2', '3'\).*
+
+# _id IS NULL optimizer: optimized to EMPTY_RESULT.
+query II
+EXPLAIN SELECT avg_amount FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE _id IS NULL;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# _id IS NOT NULL optimizer: optimized away (always true).
+query II
+EXPLAIN SELECT avg_amount FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE _id IS NOT NULL;
+----
+physical_plan	<!REGEX>:.*IS NOT NULL.*
+
+# Filter pushdown: ST_DWithin on geo_point field (location) with aggregation.
+query II
+EXPLAIN SELECT avg_amount FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000);
+----
+physical_plan	<REGEX>:.*ELASTICSEARCH_AGGREGATE.*Filters:.*location.*

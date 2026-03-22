@@ -23,6 +23,13 @@ WHERE function_name = 'elasticsearch_clear_cache';
 ----
 0
 
+# Verify the elasticsearch_aggregate function doesn't exist before loading the extension.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_aggregate';
+----
+0
+
 require elasticsearch
 
 # Verify the extension is loaded.
@@ -80,3 +87,45 @@ FROM duckdb_functions()
 WHERE function_name = 'elasticsearch_clear_cache';
 ----
 scalar	[]	BOOLEAN
+
+# Verify the elasticsearch_aggregate function is registered.
+query II
+SELECT function_type, return_type
+FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_aggregate';
+----
+table	NULL
+
+# Verify elasticsearch_aggregate parameter names and types.
+query II
+SELECT unnest(list_zip(parameters, parameter_types), recursive := true)
+FROM duckdb_functions()
+WHERE function_name = 'elasticsearch_aggregate'
+ORDER BY 1;
+----
+aggs						VARCHAR
+host						VARCHAR
+index						VARCHAR
+max_retries					INTEGER
+password					VARCHAR
+port						INTEGER
+query						VARCHAR
+retry_backoff_factor		DOUBLE
+retry_interval				INTEGER
+sample_size					INTEGER
+timeout						INTEGER
+use_ssl						BOOLEAN
+username					VARCHAR
+verify_ssl					BOOLEAN
+
+# The index parameter is required for elasticsearch_aggregate.
+statement error
+SELECT * FROM elasticsearch_aggregate(aggs := '{"a": {"avg": {"field": "x"}}}');
+----
+requires 'index' parameter
+
+# Unknown parameters should be rejected for elasticsearch_aggregate.
+statement error
+SELECT * FROM elasticsearch_aggregate(index := 'test', aggs := '{"a": {"avg": {"field": "x"}}}', unknown_param := 'value');
+----
+Invalid named parameter

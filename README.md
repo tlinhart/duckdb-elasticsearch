@@ -6,9 +6,10 @@ pipelines or data movement.
 
 ## Overview
 
-This extension provides a table function that allows you to:
+This extension provides table functions that allow you to:
 
 - Query Elasticsearch indices using familiar SQL syntax.
+- Run Elasticsearch aggregations and process results in DuckDB.
 - Leverage DuckDB's query optimizer with filter, projection and limit pushdown.
 - Join Elasticsearch data with local tables, Parquet files or other data
   sources.
@@ -353,6 +354,205 @@ The extension translates this to the following Elasticsearch query:
 }
 ```
 
+### `elasticsearch_aggregate`
+
+The `elasticsearch_aggregate` table function executes Elasticsearch aggregations
+and returns the results as `VARIANT` columns. This enables running analytics
+directly in Elasticsearch (e.g. sums, averages, histograms, terms buckets) and
+processing the results in DuckDB.
+
+#### Parameters
+
+The function accepts the same connection and transport parameters as
+`elasticsearch_query`, plus the `aggs` parameter:
+
+| Parameter name           | Type      | Default value          | Description                                   |
+| ------------------------ | --------- | ---------------------- | --------------------------------------------- |
+| `host`                   | `VARCHAR` | `localhost` (required) | Elasticsearch hostname or IP address          |
+| `port`                   | `INTEGER` | `9200`                 | Elasticsearch HTTP port                       |
+| `index`                  | `VARCHAR` | – (required)           | Index name or pattern (e.g. `logs-*`)         |
+| `query`                  | `VARCHAR` | –                      | Optional base query to scope the aggregation  |
+| `aggs`                   | `VARCHAR` | – (required)           | Aggregation definition as JSON                |
+| `username`               | `VARCHAR` | –                      | Username for HTTP basic authentication        |
+| `password`               | `VARCHAR` | –                      | Password for HTTP basic authentication        |
+| `use_ssl`                | `BOOLEAN` | `false`                | Use HTTPS instead of HTTP                     |
+| `verify_ssl`\*           | `BOOLEAN` | `true`                 | Verify SSL certificates                       |
+| `timeout`\*              | `INTEGER` | `30000`                | Request timeout in milliseconds               |
+| `max_retries`\*          | `INTEGER` | `3`                    | Maximum retry attempts for transient errors   |
+| `retry_interval`\*       | `INTEGER` | `100`                  | Initial retry wait time in milliseconds       |
+| `retry_backoff_factor`\* | `DOUBLE`  | `2.0`                  | Exponential backoff multiplier                |
+| `sample_size`\*          | `INTEGER` | `100`                  | Documents to sample for array detection       |
+
+\* Default value inherited from the corresponding
+[extension setting](#configuration). When specified, the named parameter
+overrides the setting value for that query.
+
+The `aggs` parameter accepts the aggregation definition as a JSON object. The
+top-level keys become the output column names. For example:
+
+```json
+{
+  "avg_amount": { "avg": { "field": "amount" } },
+  "max_price": { "max": { "field": "price" } }
+}
+```
+
+The `query` parameter accepts an optional base query to scope the aggregation.
+If provided, it is merged with any filters pushed down from SQL `WHERE` clauses
+using `bool.must`.
+
+#### Output schema
+
+The function returns a single row with one `VARIANT` column per top-level
+aggregation key. The column names match the keys in the `aggs` parameter.
+
+- `SELECT *` returns only the aggregation result columns.
+- Index fields (e.g. `amount`, `name`) cannot be selected directly. They are
+  exposed as virtual columns for use in `WHERE` clauses only.
+
+#### Filter pushdown
+
+SQL `WHERE` clauses are pushed down to Elasticsearch, the same way as for
+`elasticsearch_query`. This scopes the aggregation to matching documents. For
+example, `WHERE amount > 50` translates to a `range` filter in the
+Elasticsearch request.
+
+Index fields are exposed as virtual columns, meaning:
+
+- `WHERE amount > 50` works for filter pushdown.
+- `SELECT amount` raises an error since index fields are not part of the output.
+
+#### How it works
+
+1. Bind phase – resolves schema from Elasticsearch index mapping (needed for
+   filter pushdown). Parses the `aggs` JSON and creates one `VARIANT` output
+   column per top-level key.
+1. Filter pushdown – `WHERE` clauses are translated to Elasticsearch Query DSL,
+   identical to `elasticsearch_query`.
+1. Init phase – builds a single Elasticsearch request with
+   `"size": 0` (no document hits), merges base query with pushed filters,
+   attaches the aggregation definition and executes the request.
+1. Scan phase – emits a single row, converting each top-level aggregation result
+   to a `VARIANT` value.
+
+#### Examples
+
+Simple metric aggregation:
+
+```sql
+SELECT avg_amount::JSON FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+```
+
+Multiple aggregations in one request:
+
+```sql
+SELECT
+    min_amount::JSON,
+    max_amount::JSON,
+    sum_amount::JSON
+FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{
+        "min_amount": {"min": {"field": "amount"}},
+        "max_amount": {"max": {"field": "amount"}},
+        "sum_amount": {"sum": {"field": "amount"}}
+    }'
+);
+```
+
+Aggregation scoped by a base query:
+
+```sql
+SELECT avg_salary::JSON FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"term": {"deprecated": true}}',
+    aggs := '{"avg_salary": {"avg": {"field": "employee.salary"}}}'
+);
+```
+
+Aggregation with SQL `WHERE` clause for filter pushdown:
+
+```sql
+SELECT avg_amount::JSON FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE amount > 50;
+```
+
+The extension translates this to the following Elasticsearch request:
+
+```json
+{
+  "query": {
+    "range": { "amount": { "gt": 50 } }
+  },
+  "aggs": {
+    "avg_amount": { "avg": { "field": "amount" } }
+  },
+  "size": 0
+}
+```
+
+Terms bucket aggregation with nested sub-aggregations:
+
+```sql
+SELECT by_deprecated::JSON FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{
+        "by_deprecated": {
+            "terms": {"field": "deprecated"},
+            "aggs": {
+                "avg_amount": {"avg": {"field": "amount"}}
+            }
+        }
+    }'
+);
+```
+
+Extracting typed values from `VARIANT` results:
+
+```sql
+SELECT avg_amount::JSON::STRUCT(value DOUBLE).value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+```
+
+Geospatial filter with aggregation (requires the DuckDB spatial extension):
+
+```sql
+SELECT avg_amount::JSON FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000);
+```
+
 ## Scalar functions
 
 ### `elasticsearch_clear_cache`
@@ -368,7 +568,8 @@ SELECT elasticsearch_clear_cache();
 
 ## Filter pushdown
 
-The following SQL expressions are translated to Elasticsearch Query DSL:
+The following SQL expressions are translated to Elasticsearch Query DSL and
+pushed down for both `elasticsearch_query` and `elasticsearch_aggregate`:
 
 | SQL expression                   | Elasticsearch query                                                             |
 | -------------------------------- | ------------------------------------------------------------------------------- |
@@ -510,7 +711,9 @@ since their values are not needed after server-side filtering.
 ## Limit and offset pushdown
 
 `LIMIT` and `OFFSET` clauses are pushed to Elasticsearch via an optimizer
-extension. This means:
+extension. This applies only to `elasticsearch_query` (not
+`elasticsearch_aggregate`, which always returns a single result row). This
+means:
 
 - Small result sets are fetched efficiently without scrolling through all
   documents.
@@ -597,7 +800,8 @@ WHERE _unmapped_ IS NOT NULL;
 ## Bind cache
 
 Schema resolution results (index mappings and document sampling) are cached
-in-process. Repeated queries with the same parameters skip HTTP requests to
+in-process. Both `elasticsearch_query` and `elasticsearch_aggregate` share the
+same cache. Repeated queries with the same parameters skip HTTP requests to
 Elasticsearch, which is useful for CTEs referenced multiple times, self-joins,
 `UNPIVOT ... ON COLUMNS(*)` and similar patterns where DuckDB calls bind
 multiple times.

@@ -1,0 +1,297 @@
+# name: test/sql/aggregations.test
+# description: Test elasticsearch_aggregate table function
+# group: [sql]
+
+require elasticsearch
+
+require-env ELASTICSEARCH_TEST_SERVER_AVAILABLE
+
+# Simple avg metric aggregation.
+query I
+SELECT typeof(avg_amount) FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+VARIANT
+
+# Simple avg metric aggregation: verify value.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8
+
+# Multiple metric aggregations in a single request.
+query II
+SELECT
+    min_amount.value,
+    max_amount.value
+FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"min_amount": {"min": {"field": "amount"}}, "max_amount": {"max": {"field": "amount"}}}'
+);
+----
+8.0	91.0
+
+# Projection pushdown: selecting a subset of multiple aggregations.
+# Defines three aggregations but only selects one, triggering projection pushdown
+# which reduces the output DataChunk to fewer columns than total aggregations.
+query I
+SELECT max_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"min_amount": {"min": {"field": "amount"}}, "avg_amount": {"avg": {"field": "amount"}}, "max_amount": {"max": {"field": "amount"}}}'
+);
+----
+91.0
+
+# Sum metric aggregation.
+query I
+SELECT sum_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"sum_amount": {"sum": {"field": "amount"}}}'
+);
+----
+498.0
+
+# Value count aggregation.
+query I
+SELECT amount_count.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"amount_count": {"value_count": {"field": "amount"}}}'
+);
+----
+10
+
+# Stats aggregation returns multiple values.
+query I
+SELECT typeof(amount_stats) FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"amount_stats": {"stats": {"field": "amount"}}}'
+);
+----
+VARIANT
+
+# Stats aggregation: extract count.
+query I
+SELECT amount_stats.count FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"amount_stats": {"stats": {"field": "amount"}}}'
+);
+----
+10
+
+# Terms bucket aggregation.
+query I
+SELECT typeof(by_deprecated) FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"by_deprecated": {"terms": {"field": "deprecated"}}}'
+);
+----
+VARIANT
+
+# Aggregation with base query parameter: avg of amount where deprecated=true.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"term": {"deprecated": true}}',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+58.5
+
+# Aggregation with SQL WHERE clause for filter pushdown.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE amount > 50;
+----
+74.2
+
+# Aggregation with combined base query and SQL WHERE clause.
+# Base query: deprecated=true (docs 2,4,7,9 with amounts 87,63,8,76).
+# SQL WHERE: amount > 50 (narrows to docs 2,4,9 with amounts 87,63,76).
+# Expected avg: (87+63+76)/3 = 75.333...
+query I
+SELECT round(avg_amount.value::DOUBLE, 1) FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := '{"term": {"deprecated": true}}',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+)
+WHERE amount > 50;
+----
+75.3
+
+# SELECT * returns only aggregation columns, not index fields.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM elasticsearch_aggregate(
+        host := 'localhost',
+        index := 'test',
+        username := 'elastic',
+        password := 'test',
+        aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+    )
+);
+----
+1
+
+# Nested aggregation with sub-aggregations.
+query I
+SELECT typeof(by_deprecated) FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"by_deprecated": {"terms": {"field": "deprecated"}, "aggs": {"avg_amount": {"avg": {"field": "amount"}}}}}'
+);
+----
+VARIANT
+
+# Error: missing aggs parameter.
+statement error
+SELECT * FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+elasticsearch_aggregate requires 'aggs' parameter
+
+# Error: invalid JSON in aggs parameter.
+statement error
+SELECT * FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := 'not valid json'
+);
+----
+elasticsearch_aggregate: 'aggs' parameter contains invalid JSON
+
+# Error: aggs parameter must be a JSON object.
+statement error
+SELECT * FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '"just a string"'
+);
+----
+elasticsearch_aggregate: 'aggs' parameter must be a JSON object
+
+# Error: empty aggs object.
+statement error
+SELECT * FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{}'
+);
+----
+elasticsearch_aggregate: 'aggs' parameter must contain at least one aggregation
+
+# Error: selecting an index field explicitly.
+statement error
+SELECT amount FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+elasticsearch_aggregate does not support selecting index field
+
+# Error: selecting _id virtual column.
+statement error
+SELECT _id FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+elasticsearch_aggregate does not support selecting index field '_id'
+
+# Error: selecting _unmapped_ virtual column.
+statement error
+SELECT _unmapped_ FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+elasticsearch_aggregate does not support selecting index field '_unmapped_'
+
+# Error: missing index parameter.
+statement error
+SELECT * FROM elasticsearch_aggregate(
+    host := 'localhost',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+requires 'index' parameter
+
+# Error: invalid JSON in query parameter is silently ignored (falls back to match_all).
+# This verifies the function does not crash on invalid query JSON.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    query := 'not valid json',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8

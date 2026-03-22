@@ -276,6 +276,132 @@ WHERE type = 'HTTP' AND message LIKE '%_mapping%';
 statement ok
 RESET elasticsearch_sample_size;
 
+# Test elasticsearch_aggregate: cache miss -> cache hit -> clear cache -> cache miss.
+# The aggregate function shares the same bind cache as elasticsearch_query.
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First aggregate query.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8
+
+# Verify exactly one _mapping request was logged (cache miss).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Truncate logs before the next query.
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second identical aggregate query: should not make any _mapping request.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8
+
+# Verify no _mapping request was logged (cache hit).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+0
+
+# Truncate logs and clear cache.
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+# Third aggregate query after cache clear.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8
+
+# Verify _mapping request was logged again (cache miss).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Test cross-function cache sharing: elasticsearch_query populates cache, elasticsearch_aggregate reuses it.
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First call via elasticsearch_query: cache miss.
+query I
+SELECT count(*) FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test'
+);
+----
+10
+
+# Verify one _mapping request (cache miss).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+1
+
+# Truncate logs before the aggregate query.
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second call via elasticsearch_aggregate with same connection parameters: cache hit.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8
+
+# Verify no _mapping request was logged (cache hit from elasticsearch_query's bind).
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'HTTP' AND message LIKE '%_mapping%';
+----
+0
+
 # Clear cache and disable logging to avoid polluting other tests.
 query I
 SELECT elasticsearch_clear_cache();
