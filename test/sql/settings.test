@@ -119,3 +119,59 @@ RESET elasticsearch_timeout;
 
 statement ok
 SELECT elasticsearch_clear_cache();
+
+# Test that named parameter overrides the elasticsearch_sample_size setting for elasticsearch_aggregate.
+# Setting disables sampling, but the named parameter re-enables it.
+
+statement ok
+SET elasticsearch_sample_size = 0;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+# With sampling disabled globally but re-enabled via named parameter, the aggregate function
+# should still resolve the schema correctly.
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    sample_size := 100,
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8
+
+statement ok
+RESET elasticsearch_sample_size;
+
+statement ok
+SELECT elasticsearch_clear_cache();
+
+# Test that named parameter overrides the elasticsearch_timeout setting for elasticsearch_aggregate.
+# Setting uses a very short timeout, but the named parameter restores a usable one.
+
+# Clear the default ignore_error_messages list so HTTP errors are not skipped.
+set ignore_error_messages
+
+statement ok
+SET elasticsearch_timeout = 1;
+
+query I
+SELECT avg_amount.value FROM elasticsearch_aggregate(
+    host := 'localhost',
+    index := 'test',
+    username := 'elastic',
+    password := 'test',
+    timeout := 30000,
+    aggs := '{"avg_amount": {"avg": {"field": "amount"}}}'
+);
+----
+49.8
+
+statement ok
+RESET elasticsearch_timeout;
+
+statement ok
+SELECT elasticsearch_clear_cache();

@@ -3,8 +3,6 @@
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -28,16 +26,20 @@ namespace duckdb {
 // OPERATOR_IS_NOT_NULL / OPERATOR_IS_NULL whose only child is a BoundReferenceExpression.
 // Any other shape is left untouched.
 //
-// Runs after the FILTER_PUSHDOWN pass but before physical plan creation, so the
+// Runs after all built-in optimizer passes but before physical plan creation, so the
 // optimizations are reflected in EXPLAIN / EXPLAIN ANALYZE output.
 static void OptimizeIdFilters(unique_ptr<LogicalOperator> &op) {
 	if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
-		if (get.function.name == "elasticsearch_query" && get.table_filters.HasFilters()) {
-			// Find the projection index that maps to schema column 0 (_id).
+		if ((get.function.name == "elasticsearch_query" || get.function.name == "elasticsearch_aggregate") &&
+		    get.table_filters.HasFilters()) {
+			// Find the projection index that maps to _id.
+			// For elasticsearch_query, _id is schema column 0.
+			// For elasticsearch_aggregate, _id is virtual column VIRTUAL_COLUMN_START.
 			auto &column_ids = get.GetColumnIds();
 			for (idx_t ci = 0; ci < column_ids.size(); ci++) {
-				if (column_ids[ci].GetPrimaryIndex() != 0) {
+				idx_t primary = column_ids[ci].GetPrimaryIndex();
+				if (primary != 0 && primary != VIRTUAL_COLUMN_START) {
 					continue;
 				}
 				// Found _id at projection index ci.
@@ -62,10 +64,7 @@ static void OptimizeIdFilters(unique_ptr<LogicalOperator> &op) {
 				} else if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
 					// _id IS NULL is always false -> replace scan with empty result.
 					// LogicalEmptyResult preserves column bindings and types from the
-					// original node. DuckDB's EmptyResultPullup pass will propagate the
-					// empty result upward through parent operators (FILTER, PROJECTION
-					// etc.) so compound conditions like "_id IS NULL AND x > 5" also
-					// resolve to EMPTY_RESULT.
+					// original node.
 					op = make_uniq<LogicalEmptyResult>(std::move(op));
 					return; // node replaced, no children to recurse into
 				}
@@ -150,7 +149,7 @@ static void OptimizeLimitPushdown(unique_ptr<LogicalOperator> &op) {
 	}
 }
 
-void OptimizeElasticsearchPlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+static void OptimizeElasticsearchPlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	OptimizeIdFilters(plan);
 	OptimizeLimitPushdown(plan);
 }
