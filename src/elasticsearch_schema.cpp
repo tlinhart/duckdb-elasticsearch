@@ -758,7 +758,7 @@ static void ElasticsearchClearCacheFunction(DataChunk &args, ExpressionState &st
 void RegisterElasticsearchClearCacheFunction(ExtensionLoader &loader) {
 	// Mark as VOLATILE so DuckDB won't optimize away the call or cache its result.
 	ScalarFunction clear_cache("elasticsearch_clear_cache", {}, LogicalType::BOOLEAN, ElasticsearchClearCacheFunction,
-	                           nullptr, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID),
+	                           nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID),
 	                           FunctionStability::VOLATILE);
 	loader.RegisterFunction(clear_cache);
 }

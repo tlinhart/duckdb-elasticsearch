@@ -63,7 +63,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
 )
 WHERE amount > 50;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*amount>50.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*\(amount > 50\).*
 
 # Test filter on multiple columns not in SELECT: only '_id' should be projected.
 query II
@@ -75,7 +75,7 @@ EXPLAIN SELECT _id FROM elasticsearch_query(
 )
 WHERE amount > 50 AND deprecated = true;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: _id.*Filters:.*amount>50.*deprecated=true.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: _id.*Filters:.*\(amount > 50\).*\(deprecated = true\).*
 
 # Test filter column also in SELECT: both 'name' and 'amount' should be projected.
 query II
@@ -87,7 +87,7 @@ EXPLAIN SELECT name, amount FROM elasticsearch_query(
 )
 WHERE amount > 50;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*amount.*name.*Filters:.*amount>50.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections:.*amount.*name.*Filters:.*\(amount > 50\).*
 
 # Test filter on nested struct field not in SELECT: only 'name' should be projected.
 query II
@@ -99,7 +99,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
 )
 WHERE employee.salary > 80000;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*employee\.salary>80000.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Projections: name[\s\S]*Filters:[\s\S]*\(struct_extract\(employee,[\s\S]*'salary'\)[\s\S]*> 80000\.0\).*
 
 # Test aggregation with single column: only 'amount' should be projected.
 query II
@@ -244,7 +244,7 @@ EXPLAIN SELECT name FROM (
     WHERE amount > 50
 );
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*amount>50.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*\(amount > 50\).*
 
 # Test nested subquery: only 'name' should be projected, not 'amount'.
 query II
@@ -431,7 +431,7 @@ EXPLAIN WITH data AS (
 )
 SELECT name FROM data;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*amount>50.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Projections: name.*Filters:.*\(amount > 50\).*
 
 # Test self-join via CTE.
 query II

@@ -3,6 +3,9 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/variant_value.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "yyjson.hpp"
 
@@ -50,7 +53,9 @@ bool ExtractEnvelopeCoordinates(const Expression &expr, double &xmin, double &ym
 bool ExtractPointCoordinates(const std::string &geojson, double &lon, double &lat);
 
 // Check if an expression references an Elasticsearch geo field.
-// Detects direct BOUND_COLUMN_REF with GEOMETRY type or struct_extract chain returning GEOMETRY.
+// Detects direct GEOMETRY column reference (BOUND_COLUMN_REF in the producer stage,
+// BOUND_REF in the consumer stage after column ref replacement) or a struct_extract chain
+// returning GEOMETRY (for nested geo fields).
 bool IsGeoColumnRef(const Expression &expr);
 
 } // namespace duckdb

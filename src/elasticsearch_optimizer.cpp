@@ -6,6 +6,9 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
 
@@ -16,10 +19,14 @@ namespace duckdb {
 //   _id IS NULL      ->  always false  ->  replace the scan with EMPTY_RESULT
 //
 // This also serves as the mechanism for stripping the internal guard filter. The
-// pushdown_complex_filter callback pushes an IsNotNullFilter on _id to prevent DuckDB's
-// FilterCombiner from incorrectly pushing comparison filters on text fields without a
-// .keyword subfield or on geo fields. That guard is semantically "_id IS NOT NULL" and gets
-// stripped here as part of the general always-true optimization - not as a special case.
+// pushdown_complex_filter callback pushes an "_id IS NOT NULL" ExpressionFilter to prevent
+// DuckDB's FilterCombiner from incorrectly pushing comparison filters on text fields without
+// a .keyword subfield or on geo fields. That guard gets stripped here as part of the general
+// always-true optimization - not as a special case.
+//
+// Filters on _id arrive as ExpressionFilter wrapping a BoundOperatorExpression of type
+// OPERATOR_IS_NOT_NULL / OPERATOR_IS_NULL whose only child is a BoundReferenceExpression.
+// Any other shape is left untouched.
 //
 // Runs after the FILTER_PUSHDOWN pass but before physical plan creation, so the
 // optimizations are reflected in EXPLAIN / EXPLAIN ANALYZE output.
@@ -36,14 +43,23 @@ static void OptimizeIdFilters(unique_ptr<LogicalOperator> &op) {
 				// Found _id at projection index ci.
 				ProjectionIndex proj_idx(ci);
 				auto filter = get.table_filters.TryGetFilterByColumnIndex(proj_idx);
-				if (!filter) {
+				if (!filter || filter->filter_type != TableFilterType::EXPRESSION_FILTER) {
+					break;
+				}
+				auto &expr_filter = filter->Cast<ExpressionFilter>();
+				if (expr_filter.expr->GetExpressionClass() != ExpressionClass::BOUND_OPERATOR) {
+					break;
+				}
+				auto &op_expr = expr_filter.expr->Cast<BoundOperatorExpression>();
+				if (op_expr.children.size() != 1 ||
+				    op_expr.children[0]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
 					break;
 				}
 
-				if (filter->filter_type == TableFilterType::IS_NOT_NULL) {
+				if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
 					// _id IS NOT NULL is always true -> strip (no-op).
 					get.table_filters.RemoveFilterByColumnIndex(proj_idx);
-				} else if (filter->filter_type == TableFilterType::IS_NULL) {
+				} else if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
 					// _id IS NULL is always false -> replace scan with empty result.
 					// LogicalEmptyResult preserves column bindings and types from the
 					// original node. DuckDB's EmptyResultPullup pass will propagate the

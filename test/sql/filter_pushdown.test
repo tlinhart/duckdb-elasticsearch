@@ -56,7 +56,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount = 42;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount=42.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount = 42\).*
 
 # Numeric field: inequality filter is pushed.
 query II
@@ -68,7 +68,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount != 42;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount!=42.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount != 42\).*
 
 # Numeric field: greater than filter is pushed.
 query II
@@ -80,7 +80,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount > 50;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>50.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount > 50\).*
 
 # Numeric field: less than or equal filter is pushed.
 query II
@@ -92,7 +92,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount <= 30;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount<=30.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount <= 30\).*
 
 # Numeric field: IN clause is pushed.
 query II
@@ -104,7 +104,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount IN (42, 87, 15);
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount IN \(42, 87, 15\).*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount IN \(42, 87, 15\)\).*
 
 # Numeric field: range filter (BETWEEN equivalent) is pushed.
 query II
@@ -116,7 +116,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount >= 30 AND amount <= 70;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>=30 AND amount<=70.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*\(amount >= 30\)[\s\S]*AND[\s\S]*\(amount[\s\S]*<= 70\).*
 
 # Numeric field: IS NULL filter is pushed.
 query II
@@ -128,7 +128,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount IS NULL\).*
 
 # Numeric field: IS NOT NULL filter is pushed.
 query II
@@ -140,7 +140,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount IS NOT NULL\).*
 
 # Date field: equality filter is pushed.
 query II
@@ -152,7 +152,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date = '2005-03-15';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date='2005-03-15.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*[\s\S]*\(birth_date = '2005-03-15[\s\S]*\).*
 
 # Date field: inequality filter is pushed.
 query II
@@ -164,7 +164,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date != '2005-03-15';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date!='2005-03-15.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*[\s\S]*\(birth_date != '2005-03-15[\s\S]*\).*
 
 # Date field: greater than filter is pushed.
 query II
@@ -176,7 +176,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date > '2010-01-01';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date>'2010-01-01.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*[\s\S]*\(birth_date > '2010-01-01[\s\S]*\).*
 
 # Date field: less than filter is pushed.
 query II
@@ -188,7 +188,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date < '2000-01-01';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date<'2000-01-01.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*[\s\S]*\(birth_date < '2000-01-01[\s\S]*\).*
 
 # Date field: greater than or equal filter is pushed.
 query II
@@ -200,7 +200,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date >= '2010-01-01';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date>='2010-01-01.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*[\s\S]*\(birth_date >= '2010-01-01[\s\S]*\).*
 
 # Date field: less than or equal filter is pushed.
 query II
@@ -212,7 +212,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date <= '2005-03-15';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date<='2005-03-15.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*[\s\S]*\(birth_date <= '2005-03-15[\s\S]*\).*
 
 # Date field: IN clause is pushed.
 query II
@@ -236,7 +236,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(birth_date IS NULL\).*
 
 # Date field: IS NOT NULL filter is pushed.
 query II
@@ -248,7 +248,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE birth_date IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*birth_date IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(birth_date IS NOT NULL\).*
 
 # Boolean field: equality filter is pushed.
 query II
@@ -260,7 +260,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated = true;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated=true.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated = true\).*
 
 # Boolean field: inequality filter is pushed.
 query II
@@ -272,7 +272,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated != true;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated!=true.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated != true\).*
 
 # Boolean field: greater than filter is pushed.
 query II
@@ -284,7 +284,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated > false;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated>false.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated > false\).*
 
 # Boolean field: less than filter is pushed.
 query II
@@ -296,7 +296,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated < true;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated<true.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated < true\).*
 
 # Boolean field: greater than or equal filter is pushed.
 query II
@@ -308,7 +308,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated >= true;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated>=true.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated >= true\).*
 
 # Boolean field: less than or equal filter is pushed.
 query II
@@ -320,7 +320,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated <= false;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated<=false.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated <= false\).*
 
 # Boolean field: IN clause is pushed.
 query II
@@ -344,7 +344,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated IS NULL\).*
 
 # Boolean field: IS NOT NULL filter is pushed.
 query II
@@ -356,7 +356,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated IS NOT NULL\).*
 
 # Keyword field (_id): equality filter is pushed.
 query II
@@ -368,7 +368,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE _id = '1';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*_id='1'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(_id = '1'\).*
 
 # Keyword field (email): equality filter is pushed.
 query II
@@ -380,7 +380,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE email = 'alice.johnson@example.com';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email=.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(email = '.*
 
 # Keyword field: inequality filter is pushed.
 query II
@@ -392,7 +392,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE email != 'alice.johnson@example.com';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email!=.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(email != '.*
 
 # Keyword field: IN clause is pushed.
 query II
@@ -404,7 +404,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE _id IN ('1', '2', '3');
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*_id IN \('1', '2', '3'\).*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(_id IN \('1', '2', '3'\)\).*
 
 # _id IS NOT NULL: optimized away (always true, _id is never null in Elasticsearch).
 # No filter appears in the plan - the scan runs normally without any Filters: line for _id.
@@ -453,7 +453,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE email >= 'j';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email>='j'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(email >= 'j'\).*
 
 # Keyword field: LIKE prefix is pushed.
 query II
@@ -501,7 +501,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE email ILIKE 'ALICE%';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email ~~\* 'ALICE%'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(email ~~\* 'ALICE%'\).*
 
 # Keyword field: IS NULL filter is pushed.
 query II
@@ -513,7 +513,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE email IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(email IS NULL\).*
 
 # Keyword field: IS NOT NULL filter is pushed.
 query II
@@ -525,7 +525,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE email IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*email IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(email IS NOT NULL\).*
 
 # Text field with .keyword: equality filter is pushed.
 query II
@@ -537,7 +537,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name = 'Alice Johnson';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name='Alice Johnson'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name = 'Alice Johnson'\).*
 
 # Text field with .keyword: inequality filter is pushed.
 query II
@@ -549,7 +549,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name != 'Alice Johnson';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name!='Alice Johnson'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name != 'Alice Johnson'\).*
 
 # Text field with .keyword: range comparison is pushed.
 query II
@@ -561,7 +561,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name >= 'M';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name>='M'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name >= 'M'\).*
 
 # Text field with .keyword: IN clause is pushed.
 query II
@@ -621,7 +621,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name ILIKE 'alice%';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name ~~\* 'alice%'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name ~~\* 'alice%'\).*
 
 # Text field with .keyword: ILIKE suffix is pushed.
 query II
@@ -633,7 +633,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name ILIKE '%SON';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name ~~\* '%SON'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name ~~\* '%SON'\).*
 
 # Text field with .keyword: ILIKE contains is pushed.
 query II
@@ -645,7 +645,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name ILIKE '%A%';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name ~~\* '%A%'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name ~~\* '%A%'\).*
 
 # Text field with .keyword: IS NULL filter is pushed.
 query II
@@ -657,7 +657,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name IS NULL\).*
 
 # Text field with .keyword: IS NOT NULL filter is pushed.
 query II
@@ -669,7 +669,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE name IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*name IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(name IS NOT NULL\).*
 
 # Text field without .keyword: equality filter is not pushed.
 query II
@@ -814,7 +814,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*description IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(description IS NOT NULL\).*
 
 # Text field without .keyword: IS NULL is pushed (exists query works on any field).
 query II
@@ -826,7 +826,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE description IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*description IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(description IS NULL\).*
 
 # Nested struct field (numeric): comparison filter is pushed.
 query II
@@ -838,7 +838,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.salary > 80000;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.salary>80000.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*\(struct_extract[\s\S]*\(employee,[\s\S]*'salary'\)[\s\S]*> 80000\.0\).*
 
 # Nested struct field (text with .keyword): equality filter is pushed.
 query II
@@ -850,7 +850,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.name = 'Robert Chen';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.name='Robert Chen'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(struct_extract[\s\S]*\(employee,[\s\S]*'name'\)[\s\S]*= 'Robert Chen'\).*
 
 # Nested struct field: inequality filter is pushed.
 query II
@@ -862,7 +862,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.name != 'Robert Chen';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*employee\.name!=[\s\S]*Robert[\s\S]*Chen[\s\S]*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*struct_extract[\s\S]*\(employee,[\s\S]*'name'\)[\s\S]*!=[\s\S]*Robert[\s\S]*Chen[\s\S]*
 
 # Nested struct field: range comparison is pushed.
 query II
@@ -874,7 +874,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.name >= 'R';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.name>='R'.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(struct_extract[\s\S]*\(employee,[\s\S]*'name'\)[\s\S]*>= 'R'\).*
 
 # Nested struct field: LIKE prefix is pushed.
 query II
@@ -910,7 +910,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.name IN ('Robert Chen', 'Sarah Miller');
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*employee\.name IN[\s\S]*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*struct_extract[\s\S]*\(employee,[\s\S]*'name'\)[\s\S]*IN[\s\S]*
 
 # Nested struct field: IS NULL filter is pushed.
 query II
@@ -922,7 +922,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.name IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.name IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(struct_extract[\s\S]*\(employee,[\s\S]*'name'\)[\s\S]*IS NULL\).*
 
 # Nested struct field: IS NOT NULL filter is pushed.
 query II
@@ -934,7 +934,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.name IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.name IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(struct_extract[\s\S]*\(employee,[\s\S]*'name'\)[\s\S]*IS NOT NULL\).*
 
 # Deeply nested struct field: equality filter is pushed.
 query II
@@ -946,7 +946,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.address.city = 'New York';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*employee\.address\.city[\s\S]*New[\s\S]*York[\s\S]*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*struct_extract[\s\S]*\(struct_extract[\s\S]*\(employee,[\s\S]*'address'\),[\s\S]*'city'\)[\s\S]*New[\s\S]*York[\s\S]*
 
 # Deeply nested struct field: inequality filter is pushed.
 query II
@@ -958,7 +958,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.address.city != 'New York';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*employee\.address\.city[\s\S]*!=[\s\S]*New[\s\S]*York[\s\S]*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*struct_extract[\s\S]*\(struct_extract[\s\S]*\(employee,[\s\S]*'address'\),[\s\S]*'city'\)[\s\S]*!=[\s\S]*New[\s\S]*York[\s\S]*
 
 # Deeply nested struct field: range comparison is pushed.
 query II
@@ -970,7 +970,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.address.city >= 'N';
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*employee\.address\.city[\s\S]*>=[\s\S]*'N'[\s\S]*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*struct_extract[\s\S]*\(struct_extract[\s\S]*\(employee,[\s\S]*'address'\),[\s\S]*'city'\)[\s\S]*>=[\s\S]*'N'[\s\S]*
 
 # Deeply nested struct field: IN clause is pushed.
 query II
@@ -982,7 +982,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.address.city IN ('New York', 'London', 'Paris');
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*employee\.address\.city IN[\s\S]*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY[\s\S]*Filters:[\s\S]*struct_extract[\s\S]*\(struct_extract[\s\S]*\(employee,[\s\S]*'address'\),[\s\S]*'city'\)[\s\S]*IN[\s\S]*
 
 # Deeply nested struct field: LIKE prefix is pushed.
 query II
@@ -1018,7 +1018,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.address.city IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.address\.city.*IS.*NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*struct_extract[\s\S]*\(struct_extract[\s\S]*\(employee,[\s\S]*'address'\),[\s\S]*'city'\).*IS.*NULL.*
 
 # Deeply nested struct field: IS NOT NULL filter is pushed.
 query II
@@ -1030,7 +1030,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE employee.address.city IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*employee\.address\.city.*IS.*NOT.*NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*struct_extract[\s\S]*\(struct_extract[\s\S]*\(employee,[\s\S]*'address'\),[\s\S]*'city'\).*IS.*NOT.*NULL.*
 
 # Boolean logic: AND combination is pushed.
 query II
@@ -1042,7 +1042,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount > 50 AND deprecated = true;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>50.*deprecated=true.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount > 50\).*\(deprecated = true\).*
 
 # Boolean logic: OR combination is pushed as optional filter.
 query II
@@ -1054,7 +1054,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount < 20 OR amount > 80;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*optional:.*amount<20 OR.*amount>80.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*optional:.*\(amount < 20\) OR.*\(amount > 80\).*
 
 # Boolean logic: complex nested conditions.
 query II
@@ -1079,7 +1079,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE deprecated = true;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*deprecated=true.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(deprecated = true\).*
 
 # Array element access: equality filter is not pushed (handled by DuckDB FILTER).
 query II
@@ -1211,7 +1211,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE amount + 10 > 50;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*amount>40.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(amount > 40\).*
 
 # CASE expression filter is not pushed.
 query II
@@ -1307,7 +1307,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE location IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(location IS NULL\).*
 
 # geo_point field: IS NOT NULL filter is pushed.
 query II
@@ -1319,7 +1319,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE location IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(location IS NOT NULL\).*
 
 # geo_shape field: IS NULL filter is pushed.
 query II
@@ -1331,7 +1331,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE geometry IS NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry IS NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(geometry IS NULL\).*
 
 # geo_shape field: IS NOT NULL filter is pushed.
 query II
@@ -1343,7 +1343,7 @@ EXPLAIN SELECT count(*) FROM elasticsearch_query(
 )
 WHERE geometry IS NOT NULL;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry IS NOT NULL.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*\(geometry IS NOT NULL\).*
 
 statement ok
 INSTALL spatial;
@@ -1472,7 +1472,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
 WHERE ST_Within(ST_Point(-122.4194, 37.7749), geometry) AND
       amount > 10;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*amount>10.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*geometry.*\(amount > 10\).*
 
 # ST_Distance with < operator: geo_distance pushdown on geo_point field.
 query II
@@ -1545,7 +1545,7 @@ EXPLAIN SELECT name FROM elasticsearch_query(
 WHERE ST_Distance(location, ST_Point(-74.006, 40.7128)) < 10000 AND
       amount > 50;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*amount>50.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*\(amount > 50\).*
 
 # ST_DWithin on geo_point field: geo_distance pushdown.
 query II
@@ -1594,4 +1594,4 @@ EXPLAIN SELECT name FROM elasticsearch_query(
 WHERE ST_DWithin(location, ST_Point(-74.006, 40.7128), 10000) AND
       amount > 50;
 ----
-physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*amount>50.*
+physical_plan	<REGEX>:.*ELASTICSEARCH_QUERY.*Filters:.*location.*\(amount > 50\).*

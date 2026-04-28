@@ -8,17 +8,15 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "yyjson.hpp"
@@ -148,11 +146,11 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		}
 	}
 
-	// Translate pushed filters to Elasticsearch Query DSL.
-	// IS NULL / IS NOT NULL filters are handled through table_filters (added by pushdown_complex_filter).
-	// Filters on _id (IS NOT NULL and IS NULL) are normally optimized away by the optimizer extension
-	// (OptimizeIdFilters) before physical plan creation. TranslateFilters also skips them as
-	// defense-in-depth.
+	// Translate pushed filters to Elasticsearch Query DSL. All recognized filter types
+	// (comparisons, IN, IS NULL/IS NOT NULL, LIKE/ILIKE, ST_*) are pushed into table_filters
+	// by ElasticsearchPushdownComplexFilter. Filters on _id are normally optimized away by
+	// OptimizeIdFilters (in elasticsearch_optimizer.cpp) before physical plan creation; if any
+	// survive, TranslateFilters produces a benign {"exists":{"field":"_id"}} term.
 	yyjson_mut_val *filter_clause = nullptr;
 	if (filters && filters->HasFilters()) {
 		// Build column names vector for the filter translator.
@@ -164,6 +162,7 @@ static std::string BuildFinalQuery(const ElasticsearchQueryBindData &bind_data, 
 		vector<string> filter_column_names;
 		for (idx_t col_id : column_ids) {
 			if (col_id == 0) {
+				// _id column
 				filter_column_names.push_back("_id");
 			} else if (col_id <= bind_data.schema.column_names.size()) {
 				// regular field column (col_id 1 maps to column_names[0] etc.)
@@ -621,7 +620,7 @@ static VariantValue CollectUnmappedFields(yyjson_val *source, const std::set<std
 								    // Recurse into this object.
 								    VariantValue nested_obj(VariantValueType::OBJECT);
 								    collect_unmapped(subfield_val, nested_obj, subfield_path);
-								    if (!nested_obj.object_children.empty()) {
+								    if (!nested_obj.ObjectChildren().empty()) {
 									    sub_obj.AddChild(subfield_name, std::move(nested_obj));
 									    sub_has_unmapped = true;
 								    }
@@ -630,7 +629,7 @@ static VariantValue CollectUnmappedFields(yyjson_val *source, const std::set<std
 							    // Recurse for nested mapped objects.
 							    VariantValue nested_obj(VariantValueType::OBJECT);
 							    collect_unmapped(subfield_val, nested_obj, subfield_path);
-							    if (!nested_obj.object_children.empty()) {
+							    if (!nested_obj.ObjectChildren().empty()) {
 								    sub_obj.AddChild(subfield_name, std::move(nested_obj));
 								    sub_has_unmapped = true;
 							    }
@@ -648,7 +647,7 @@ static VariantValue CollectUnmappedFields(yyjson_val *source, const std::set<std
 				    if (yyjson_is_obj(field_val)) {
 					    VariantValue sub_obj(VariantValueType::OBJECT);
 					    collect_unmapped(field_val, sub_obj, field_path);
-					    if (!sub_obj.object_children.empty()) {
+					    if (!sub_obj.ObjectChildren().empty()) {
 						    target.AddChild(field_name, std::move(sub_obj));
 						    has_unmapped = true;
 					    }
@@ -790,7 +789,7 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 				// _id column
 				if (id_val && yyjson_is_str(id_val)) {
 					auto str_val = StringVector::AddString(output.data[out_col], yyjson_get_str(id_val));
-					FlatVector::GetData<string_t>(output.data[out_col])[output_idx] = str_val;
+					FlatVector::GetDataMutable<string_t>(output.data[out_col])[output_idx] = str_val;
 				} else {
 					FlatVector::SetNull(output.data[out_col], output_idx, true);
 				}
@@ -822,7 +821,6 @@ static void ElasticsearchQueryScan(ClientContext &context, TableFunctionInput &d
 struct ColumnPathInfo {
 	idx_t output_col_idx = DConstants::INVALID_INDEX;
 	string full_path;
-	vector<string> nested_fields;
 
 	bool IsValid() const {
 		return output_col_idx != DConstants::INVALID_INDEX;
@@ -833,9 +831,9 @@ struct ColumnPathInfo {
 // Handles direct column references and struct_extract chains for nested object fields.
 //
 // Examples:
-// - BOUND_COLUMN_REF(col=2) -> {2, "name", []}
-// - struct_extract(col, 'name') -> {col_idx, "employee.name", ["name"]}
-// - struct_extract(struct_extract(col, 'address'), 'city') -> {col_idx, "employee.address.city", ["address", "city"]}
+// - BOUND_COLUMN_REF(col=2) -> {2, "name"}
+// - struct_extract(col, 'name') -> {col_idx, "employee.name"}
+// - struct_extract(struct_extract(col, 'address'), 'city') -> {col_idx, "employee.address.city"}
 static ColumnPathInfo ExtractColumnPath(const Expression &expr, const ElasticsearchSchema &schema,
                                         const vector<ColumnIndex> &column_ids) {
 	ColumnPathInfo result;
@@ -895,8 +893,6 @@ static ColumnPathInfo ExtractColumnPath(const Expression &expr, const Elasticsea
 
 		result.output_col_idx = parent_result.output_col_idx;
 		result.full_path = parent_result.full_path + "." + field_name;
-		result.nested_fields = std::move(parent_result.nested_fields);
-		result.nested_fields.push_back(field_name);
 		return result;
 	}
 
@@ -1058,19 +1054,19 @@ static ConstantGeoInfo ExtractConstantGeo(const Expression &expr) {
 	return result;
 }
 
-// Wrap a filter in StructFilter for each nesting level.
-// For nested_fields = ["address", "city"] wraps as StructFilter("address", StructFilter("city", inner_filter)).
-static unique_ptr<TableFilter> WrapInStructFilters(unique_ptr<TableFilter> inner_filter,
-                                                   const vector<string> &nested_fields) {
-	unique_ptr<TableFilter> result = std::move(inner_filter);
-	for (auto it = nested_fields.rbegin(); it != nested_fields.rend(); ++it) {
-		result = make_uniq<StructFilter>(0, *it, std::move(result));
-	}
-	return result;
+// Replace BoundColumnRefExpression leaves with BoundReferenceExpression(0) so the expression
+// becomes a valid filter target. The struct_extract chain (if any) is preserved verbatim;
+// ExpressionFilter::ToString later substitutes the BOUND_REF leaf with the column name to
+// reproduce dotted output like "struct_extract(employee, 'name')".
+static void ReplaceColumnRefsWithBoundRefs(unique_ptr<Expression> &root_expr) {
+	ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+	    root_expr, [&](BoundColumnRefExpression &col_ref, unique_ptr<Expression> &expr) {
+		    expr = make_uniq<BoundReferenceExpression>(col_ref.alias, col_ref.return_type, 0ULL);
+	    });
 }
 
-// Try to push a simple comparison filter into table_filters.
-// This replicates the core logic of FilterCombiner::AddBoundComparisonFilter + TryPushdownConstantFilter.
+// Try to push a simple comparison filter into table_filters as an ExpressionFilter.
+// This replicates the core logic of FilterCombiner::AddBoundComparisonFilter + TryPushdownExpressionFilter.
 // We do this in pushdown_complex_filter because pushing any filter to table_filters causes the
 // DuckDB optimizer to skip the FilterCombiner path. By also handling comparisons here, all filter types
 // are pushed in a single pass.
@@ -1110,13 +1106,16 @@ static bool TryPushComparisonFilter(ClientContext &context, const BoundCompariso
 		return false;
 	}
 
-	// If the scalar is on the left side, flip the comparison direction.
+	// If the scalar is on the left side, flip the comparison direction so the resulting
+	// expression is "<column> <op> <constant>".
 	auto comparison_type = left_is_scalar ? FlipComparisonExpression(expr_type) : expr_type;
 
-	unique_ptr<TableFilter> filter = make_uniq<ConstantFilter>(comparison_type, std::move(constant_value));
-	if (!col_path_info.nested_fields.empty()) {
-		filter = WrapInStructFilters(std::move(filter), col_path_info.nested_fields);
-	}
+	// Build "<col_expr_with_bound_ref> <op> <constant>" and wrap in ExpressionFilter.
+	auto column_side = col_expr.Copy();
+	ReplaceColumnRefsWithBoundRefs(column_side);
+	auto constant_side = make_uniq<BoundConstantExpression>(std::move(constant_value));
+	auto cmp = make_uniq<BoundComparisonExpression>(comparison_type, std::move(column_side), std::move(constant_side));
+	auto filter = make_uniq<ExpressionFilter>(std::move(cmp));
 
 	get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(filter));
 	return true;
@@ -1209,23 +1208,21 @@ static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparis
 	auto &mod_func = mod_func_ref->Cast<BoundFunctionExpression>();
 	mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
 
-	unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
-	if (!geo_col.col_path.nested_fields.empty()) {
-		expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
-	}
+	ReplaceColumnRefsWithBoundRefs(modified_expr);
+	auto expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
 
 	get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx), std::move(expr_filter));
 	return true;
 }
 
 // Pushdown complex filter callback.
-// Processes all filter expressions in a single pass:
-// - Comparison filters -> ConstantFilter
-// - IS NULL / IS NOT NULL -> IsNullFilter / IsNotNullFilter
-// - IN expressions -> InFilter
-// - LIKE/ILIKE patterns, prefix/suffix/contains -> ExpressionFilter
-// - ST_Distance comparisons -> ExpressionFilter
-// - ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint -> ExpressionFilter
+// Processes all filter expressions in a single pass and pushes recognized ones as ExpressionFilter:
+// - Comparison filters: =, !=, <, <=, >, >=
+// - IS NULL / IS NOT NULL
+// - IN expressions
+// - LIKE/ILIKE patterns and prefix/suffix/contains
+// - ST_Distance comparisons
+// - ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint
 //
 // All recognized filters are pushed into get.table_filters and consumed from the filters vector.
 // This approach handles everything in one pass, avoiding the issue where pushing to table_filters
@@ -1236,13 +1233,12 @@ static bool TryPushGeoDistanceFilter(ClientContext &context, const BoundComparis
 // pushed - they are left for DuckDB's FILTER stage. For geo fields (geo_point, geo_shape),
 // equality/inequality and IN are deferred to DuckDB's FILTER stage, while range comparisons
 // are rejected with an error. When such filters are deferred and no other filters have been
-// pushed into table_filters, a no-op IsNotNullFilter on _id is injected as a guard.
+// pushed into table_filters, a no-op _id IS NOT NULL ExpressionFilter is injected as a guard.
 // This causes DuckDB's FilterCombiner (which runs after this callback) to see a non-empty
-// table_filters and skip its own pushdown, preventing it from re-pushing the deferred filters
-// as ConstantFilter/InFilter. The guard is optimized away by the optimizer extension
-// (OptimizeIdFilters in elasticsearch_optimizer.cpp) as part of the general _id semantic
-// optimization: _id IS NOT NULL is always true, so it is stripped. TranslateFilters also
-// skips _id null filters as defense-in-depth.
+// table_filters and skip its own pushdown, preventing it from re-pushing the deferred filters.
+// The guard is optimized away by the optimizer extension (OptimizeIdFilters in
+// elasticsearch_optimizer.cpp) as part of the general _id semantic optimization: _id IS NOT NULL
+// is always true, so it is stripped.
 static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
                                                vector<unique_ptr<Expression>> &filters) {
 	auto &bind_data = bind_data_p->Cast<ElasticsearchQueryBindData>();
@@ -1265,7 +1261,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 
 			// Skip comparisons on text fields without .keyword (they cannot be pushed to Elasticsearch
 			// because the field is analyzed/tokenized). The guard filter mechanism (see after the loop)
-			// prevents the FilterCombiner from re-pushing these as ConstantFilter.
+			// prevents the FilterCombiner from re-pushing these as an ExpressionFilter.
 			ColumnPathInfo col_path_info = ExtractColumnPath(*comp_expr.left, bind_data.schema, column_ids);
 			if (!col_path_info.IsValid()) {
 				col_path_info = ExtractColumnPath(*comp_expr.right, bind_data.schema, column_ids);
@@ -1309,7 +1305,7 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				continue;
 			}
 
-			// Push comparison as ConstantFilter.
+			// Push comparison as ExpressionFilter.
 			if (TryPushComparisonFilter(context, comp_expr, bind_data.schema, column_ids, get)) {
 				filters[i] = nullptr;
 			}
@@ -1358,12 +1354,10 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(filter->Copy());
-				if (!col_path_info.nested_fields.empty()) {
-					expr_filter = WrapInStructFilters(std::move(expr_filter), col_path_info.nested_fields);
-				}
-
-				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(expr_filter));
+				auto modified_expr = filter->Copy();
+				ReplaceColumnRefsWithBoundRefs(modified_expr);
+				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx),
+				                             make_uniq<ExpressionFilter>(std::move(modified_expr)));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1408,12 +1402,9 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					mod_func.children[const_arg_idx] = make_uniq<BoundConstantExpression>(Value(const_geo.geojson));
 				}
 
-				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
-				if (!geo_col.col_path.nested_fields.empty()) {
-					expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
-				}
-
-				get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx), std::move(expr_filter));
+				ReplaceColumnRefsWithBoundRefs(modified_expr);
+				get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx),
+				                             make_uniq<ExpressionFilter>(std::move(modified_expr)));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1446,7 +1437,6 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 				// - 3 children: distance is in children[2] (spatial extension didn't constant-fold it)
 				// - 2 children: distance was erased by the spatial extension's Bind and stored in bind_info
 				double distance_meters = 0;
-				bool distance_found = false;
 
 				if (func_expr.children.size() == 3) {
 					// Case 1: distance is still in the expression as children[2].
@@ -1461,17 +1451,17 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 						continue;
 					}
 					distance_meters = DoubleValue::Get(dist_val);
-					distance_found = true;
 				} else if (func_expr.bind_info) {
 					// Case 2: the spatial extension erased the distance argument at bind time.
 					// The distance is stored in bind_info with a layout compatible with
 					// SpatialDWithinBindData (double distance as the first data member).
 					auto *dwithin_bind = reinterpret_cast<const SpatialDWithinBindData *>(func_expr.bind_info.get());
 					distance_meters = dwithin_bind->distance;
-					distance_found = true;
+				} else {
+					continue;
 				}
 
-				if (!distance_found || distance_meters < 0) {
+				if (distance_meters < 0) {
 					continue;
 				}
 
@@ -1485,12 +1475,9 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					mod_func.children.push_back(make_uniq<BoundConstantExpression>(Value::DOUBLE(distance_meters)));
 				}
 
-				unique_ptr<TableFilter> expr_filter = make_uniq<ExpressionFilter>(std::move(modified_expr));
-				if (!geo_col.col_path.nested_fields.empty()) {
-					expr_filter = WrapInStructFilters(std::move(expr_filter), geo_col.col_path.nested_fields);
-				}
-
-				get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx), std::move(expr_filter));
+				ReplaceColumnRefsWithBoundRefs(modified_expr);
+				get.table_filters.PushFilter(ProjectionIndex(geo_col.col_path.output_col_idx),
+				                             make_uniq<ExpressionFilter>(std::move(modified_expr)));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1512,18 +1499,12 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				unique_ptr<TableFilter> null_filter;
-				if (expr_type == ExpressionType::OPERATOR_IS_NULL) {
-					null_filter = make_uniq<IsNullFilter>();
-				} else {
-					null_filter = make_uniq<IsNotNullFilter>();
-				}
+				auto column_side = op_expr.children[0]->Copy();
+				ReplaceColumnRefsWithBoundRefs(column_side);
+				auto null_check = ExpressionFilter::CreateNullCheckExpression(std::move(column_side), expr_type);
 
-				if (!col_path_info.nested_fields.empty()) {
-					null_filter = WrapInStructFilters(std::move(null_filter), col_path_info.nested_fields);
-				}
-
-				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(null_filter));
+				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx),
+				                             make_uniq<ExpressionFilter>(std::move(null_check)));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1579,12 +1560,12 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 					continue;
 				}
 
-				unique_ptr<TableFilter> in_filter = make_uniq<InFilter>(std::move(in_values));
-				if (!col_path_info.nested_fields.empty()) {
-					in_filter = WrapInStructFilters(std::move(in_filter), col_path_info.nested_fields);
-				}
+				auto column_side = op_expr.children[0]->Copy();
+				ReplaceColumnRefsWithBoundRefs(column_side);
+				auto in_expr = ExpressionFilter::CreateInExpression(std::move(column_side), std::move(in_values));
 
-				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx), std::move(in_filter));
+				get.table_filters.PushFilter(ProjectionIndex(col_path_info.output_col_idx),
+				                             make_uniq<ExpressionFilter>(std::move(in_expr)));
 				filters[i] = nullptr;
 				continue;
 			}
@@ -1595,20 +1576,21 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 	// DuckDB's optimizer runs two filter pushdown stages:
 	// 1. pushdown_complex_filter (this callback) - we selectively push supported filters.
 	// 2. FilterCombiner - runs only if table_filters is empty after stage 1.
-	//    It would convert leftover comparison expressions into ConstantFilter/InFilter, which
+	//    It would convert leftover comparison expressions into ExpressionFilter, which
 	//    would then be pushed to Elasticsearch and produce incorrect results (e.g. term/range
 	//    queries on analyzed text fields or geo fields).
 	//
 	// To prevent stage 2 from running, we ensure table_filters is never empty when there are
-	// deferred filters. We push a no-op IsNotNullFilter on _id (which is always non-null
-	// in Elasticsearch). If _id is not already in the projected columns, we add it via AddColumnId -
-	// DuckDB's filter_prune ensures the extra column won't appear in the query output.
+	// deferred filters. We push a no-op _id IS NOT NULL ExpressionFilter (which is always true
+	// in Elasticsearch since every document has an _id). If _id is not already in the projected
+	// columns, we add it via AddColumnId - DuckDB's filter_prune ensures the extra column won't
+	// appear in the query output.
 	//
 	// The guard is optimized away by the optimizer extension (OptimizeIdFilters in
 	// elasticsearch_optimizer.cpp) as part of the _id semantic optimization: since _id is always
 	// non-null, "_id IS NOT NULL" is always true and gets stripped. This happens after the
 	// FILTER_PUSHDOWN pass but before physical plan creation, so the guard never appears in
-	// EXPLAIN output. TranslateFilters also skips _id null filters as defense-in-depth.
+	// EXPLAIN output.
 	if (has_deferred_filters && !get.table_filters.HasFilters()) {
 		// Find _id (schema column 0) in column_ids. If _id is not already projected (e.g. SELECT count(*)),
 		// add it - DuckDB's filter_prune ensures the extra column won't appear in the query output.
@@ -1622,7 +1604,11 @@ static void ElasticsearchPushdownComplexFilter(ClientContext &context, LogicalGe
 		if (!guard_proj_idx.IsValid()) {
 			guard_proj_idx = get.AddColumnId(0).GetIndex();
 		}
-		get.table_filters.PushFilter(ProjectionIndex(guard_proj_idx.GetIndex()), make_uniq<IsNotNullFilter>());
+		auto guard_col = make_uniq<BoundReferenceExpression>("_id", LogicalType::VARCHAR, 0ULL);
+		auto guard_expr =
+		    ExpressionFilter::CreateNullCheckExpression(std::move(guard_col), ExpressionType::OPERATOR_IS_NOT_NULL);
+		get.table_filters.PushFilter(ProjectionIndex(guard_proj_idx.GetIndex()),
+		                             make_uniq<ExpressionFilter>(std::move(guard_expr)));
 	}
 
 	// Remove processed filters.

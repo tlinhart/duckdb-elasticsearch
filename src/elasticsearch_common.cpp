@@ -684,13 +684,13 @@ static void ConvertJSONStructToDuckDB(yyjson_val *val, Vector &result, idx_t row
 		const auto &child_type = child_types[i].second;
 
 		yyjson_val *child_val = yyjson_obj_get(val, child_name.c_str());
-		ConvertJSONToDuckDB(child_val, *child_entries[i], row_idx, child_type, "");
+		ConvertJSONToDuckDB(child_val, child_entries[i], row_idx, child_type, "");
 	}
 }
 
 static void ConvertJSONListToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const LogicalType &type,
                                     const std::string &es_type) {
-	auto list_data = FlatVector::GetData<list_entry_t>(result);
+	auto list_data = FlatVector::GetDataMutable<list_entry_t>(result);
 
 	if (!val || yyjson_is_null(val)) {
 		FlatVector::SetNull(result, row_idx, true);
@@ -700,7 +700,7 @@ static void ConvertJSONListToDuckDB(yyjson_val *val, Vector &result, idx_t row_i
 	// Handle single value as single-element list (Elasticsearch can return single values for array fields).
 	if (!yyjson_is_arr(val)) {
 		// Single value, treat as list with one element.
-		auto &child_vector = ListVector::GetEntry(result);
+		auto &child_vector = ListVector::GetChildMutable(result);
 		idx_t current_size = ListVector::GetListSize(result);
 
 		list_data[row_idx].offset = current_size;
@@ -716,7 +716,7 @@ static void ConvertJSONListToDuckDB(yyjson_val *val, Vector &result, idx_t row_i
 
 	// Handle array.
 	size_t arr_len = yyjson_arr_size(val);
-	auto &child_vector = ListVector::GetEntry(result);
+	auto &child_vector = ListVector::GetChildMutable(result);
 	idx_t current_size = ListVector::GetListSize(result);
 
 	list_data[row_idx].offset = current_size;
@@ -761,14 +761,14 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 		if (es_type == "geo_point") {
 			WKBWriter writer;
 			if (GeoPointToWKB(val, writer)) {
-				FlatVector::GetData<string_t>(result)[row_idx] = writer.Store(result);
+				FlatVector::GetDataMutable<string_t>(result)[row_idx] = writer.Store(result);
 			} else {
 				FlatVector::SetNull(result, row_idx, true);
 			}
 		} else {
 			string_t wkb;
 			if (GeoShapeToWKB(val, result, wkb)) {
-				FlatVector::GetData<string_t>(result)[row_idx] = wkb;
+				FlatVector::GetDataMutable<string_t>(result)[row_idx] = wkb;
 			} else {
 				FlatVector::SetNull(result, row_idx, true);
 			}
@@ -780,13 +780,13 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 	case LogicalTypeId::VARCHAR: {
 		if (yyjson_is_str(val)) {
 			auto str_val = StringVector::AddString(result, yyjson_get_str(val));
-			FlatVector::GetData<string_t>(result)[row_idx] = str_val;
+			FlatVector::GetDataMutable<string_t>(result)[row_idx] = str_val;
 		} else {
 			// Convert non-string values to JSON string.
 			char *json_str = yyjson_val_write(val, 0, nullptr);
 			if (json_str) {
 				auto str_val = StringVector::AddString(result, json_str);
-				FlatVector::GetData<string_t>(result)[row_idx] = str_val;
+				FlatVector::GetDataMutable<string_t>(result)[row_idx] = str_val;
 				free(json_str);
 			} else {
 				FlatVector::SetNull(result, row_idx, true);
@@ -796,55 +796,55 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 	}
 	case LogicalTypeId::BIGINT:
 		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
-			FlatVector::GetData<int64_t>(result)[row_idx] = yyjson_get_sint(val);
+			FlatVector::GetDataMutable<int64_t>(result)[row_idx] = yyjson_get_sint(val);
 		} else if (yyjson_is_uint(val)) {
-			FlatVector::GetData<int64_t>(result)[row_idx] = static_cast<int64_t>(yyjson_get_uint(val));
+			FlatVector::GetDataMutable<int64_t>(result)[row_idx] = static_cast<int64_t>(yyjson_get_uint(val));
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
 		break;
 	case LogicalTypeId::INTEGER:
 		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
-			FlatVector::GetData<int32_t>(result)[row_idx] = static_cast<int32_t>(yyjson_get_sint(val));
+			FlatVector::GetDataMutable<int32_t>(result)[row_idx] = static_cast<int32_t>(yyjson_get_sint(val));
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
 		break;
 	case LogicalTypeId::SMALLINT:
 		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
-			FlatVector::GetData<int16_t>(result)[row_idx] = static_cast<int16_t>(yyjson_get_sint(val));
+			FlatVector::GetDataMutable<int16_t>(result)[row_idx] = static_cast<int16_t>(yyjson_get_sint(val));
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
 		break;
 	case LogicalTypeId::TINYINT:
 		if (yyjson_is_int(val) || yyjson_is_sint(val)) {
-			FlatVector::GetData<int8_t>(result)[row_idx] = static_cast<int8_t>(yyjson_get_sint(val));
+			FlatVector::GetDataMutable<int8_t>(result)[row_idx] = static_cast<int8_t>(yyjson_get_sint(val));
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
 		break;
 	case LogicalTypeId::DOUBLE:
 		if (yyjson_is_real(val)) {
-			FlatVector::GetData<double>(result)[row_idx] = yyjson_get_real(val);
+			FlatVector::GetDataMutable<double>(result)[row_idx] = yyjson_get_real(val);
 		} else if (yyjson_is_int(val)) {
-			FlatVector::GetData<double>(result)[row_idx] = static_cast<double>(yyjson_get_sint(val));
+			FlatVector::GetDataMutable<double>(result)[row_idx] = static_cast<double>(yyjson_get_sint(val));
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
 		break;
 	case LogicalTypeId::FLOAT:
 		if (yyjson_is_real(val)) {
-			FlatVector::GetData<float>(result)[row_idx] = static_cast<float>(yyjson_get_real(val));
+			FlatVector::GetDataMutable<float>(result)[row_idx] = static_cast<float>(yyjson_get_real(val));
 		} else if (yyjson_is_int(val)) {
-			FlatVector::GetData<float>(result)[row_idx] = static_cast<float>(yyjson_get_sint(val));
+			FlatVector::GetDataMutable<float>(result)[row_idx] = static_cast<float>(yyjson_get_sint(val));
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
 		break;
 	case LogicalTypeId::BOOLEAN:
 		if (yyjson_is_bool(val)) {
-			FlatVector::GetData<bool>(result)[row_idx] = yyjson_get_bool(val);
+			FlatVector::GetDataMutable<bool>(result)[row_idx] = yyjson_get_bool(val);
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
@@ -856,14 +856,14 @@ void ConvertJSONToDuckDB(yyjson_val *val, Vector &result, idx_t row_idx, const L
 			timestamp_t ts;
 			if (Timestamp::TryConvertTimestamp(str, strlen(str), ts, false, nullptr, false) ==
 			    TimestampCastResult::SUCCESS) {
-				FlatVector::GetData<timestamp_t>(result)[row_idx] = ts;
+				FlatVector::GetDataMutable<timestamp_t>(result)[row_idx] = ts;
 			} else {
 				FlatVector::SetNull(result, row_idx, true);
 			}
 		} else if (yyjson_is_int(val)) {
 			// Assume milliseconds since epoch.
 			auto ms = yyjson_get_sint(val);
-			FlatVector::GetData<timestamp_t>(result)[row_idx] = Timestamp::FromEpochMs(ms);
+			FlatVector::GetDataMutable<timestamp_t>(result)[row_idx] = Timestamp::FromEpochMs(ms);
 		} else {
 			FlatVector::SetNull(result, row_idx, true);
 		}
@@ -1054,16 +1054,18 @@ yyjson_mut_val *ConvertDuckDBToJSON(yyjson_mut_doc *doc, const Value &value) {
 }
 
 // Check if an expression references an Elasticsearch geo field.
-// With native GEOMETRY columns, this is a direct BOUND_COLUMN_REF with GEOMETRY type
+// With native GEOMETRY columns, this is a direct GEOMETRY column reference (BOUND_COLUMN_REF
+// in the producer stage or BOUND_REF in the consumer stage after column ref replacement)
 // or a struct_extract chain returning GEOMETRY (for nested geo fields).
 bool IsGeoColumnRef(const Expression &expr) {
-	// Direct GEOMETRY column reference.
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	// Direct GEOMETRY column reference (either BOUND_COLUMN_REF or BOUND_REF leaf).
+	auto cls = expr.GetExpressionClass();
+	if ((cls == ExpressionClass::BOUND_COLUMN_REF || cls == ExpressionClass::BOUND_REF) &&
 	    expr.return_type.id() == LogicalTypeId::GEOMETRY) {
 		return true;
 	}
 	// struct_extract returning GEOMETRY (nested geo field).
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+	if (cls == ExpressionClass::BOUND_FUNCTION) {
 		auto &func_expr = expr.Cast<BoundFunctionExpression>();
 		if (StringUtil::Lower(func_expr.function.name) == "struct_extract" &&
 		    expr.return_type.id() == LogicalTypeId::GEOMETRY) {

@@ -2,14 +2,13 @@
 #include "elasticsearch_common.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 namespace duckdb {
 
@@ -29,27 +28,17 @@ static std::string GetElasticsearchFieldName(const std::string &column_name, boo
 static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
                                        const ElasticsearchSchema &schema);
 
-static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const ConstantFilter &filter,
-                                                   const string &field_name, const ElasticsearchSchema &schema);
-
 static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const ConjunctionAndFilter &filter,
                                                const string &column_name, const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const ConjunctionOrFilter &filter,
                                               const string &column_name, const ElasticsearchSchema &schema);
 
-static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter, const string &field_name,
-                                         const ElasticsearchSchema &schema);
-
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
                                                  const string &column_name, const ElasticsearchSchema &schema);
 
 static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &field_name, const string &pattern,
                                             const ElasticsearchSchema &schema, bool case_insensitive);
-
-static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_name);
-
-static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name);
 
 static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
                                                  const string &column_name);
@@ -60,7 +49,181 @@ static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const
 static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const BoundFunctionExpression &func_expr,
                                                    const string &column_name);
 
-// Public API implementation.
+// Resolve a column expression (BOUND_REF leaf or struct_extract chain over a BOUND_REF leaf) to a
+// dotted Elasticsearch field path, anchored at base_name (the column name from TranslateFilter).
+// Returns true on success and writes the dotted path into out_path.
+//
+// Examples (with base_name = "employee"):
+// - BOUND_REF(0)                                              -> "employee"
+// - struct_extract(BOUND_REF(0), 'name')                      -> "employee.name"
+// - struct_extract(struct_extract(BOUND_REF(0), 'a'), 'b')    -> "employee.a.b"
+static bool ExtractDottedFieldPath(const Expression &expr, const string &base_name, string &out_path) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		out_path = base_name;
+		return true;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &func = expr.Cast<BoundFunctionExpression>();
+		if (func.function.name != "struct_extract" || func.children.size() != 2) {
+			return false;
+		}
+		if (func.children[1]->type != ExpressionType::VALUE_CONSTANT) {
+			return false;
+		}
+		auto &name_const = func.children[1]->Cast<BoundConstantExpression>();
+		if (name_const.value.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		string parent;
+		if (!ExtractDottedFieldPath(*func.children[0], base_name, parent)) {
+			return false;
+		}
+		out_path = parent + "." + StringValue::Get(name_const.value);
+		return true;
+	}
+	return false;
+}
+
+// Translate a comparison "<column> <op> <constant>" (or its flipped form) on a non-geo, non-text-without-keyword
+// field into the appropriate Elasticsearch term/range query.
+static yyjson_mut_val *TranslateScalarComparison(yyjson_mut_doc *doc, const string &field_name,
+                                                 ExpressionType comparison_type, const Value &constant,
+                                                 const ElasticsearchSchema &schema) {
+	bool is_text_field = schema.text_fields.count(field_name) > 0;
+	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
+
+	// Defense-in-depth: text fields without .keyword and geo fields should never reach here
+	// (the guard filter in pushdown_complex_filter prevents the FilterCombiner from re-pushing
+	// comparisons on them). If they somehow do, return nullptr so DuckDB handles the filter.
+	if (is_text_field && !has_keyword_subfield) {
+		return nullptr;
+	}
+	if (schema.geo_fields.count(field_name) > 0) {
+		return nullptr;
+	}
+
+	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
+	yyjson_mut_val *value = ConvertDuckDBToJSON(doc, constant);
+
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_EQUAL: {
+		// {"term": {"field": value}}
+		yyjson_mut_val *term_inner = yyjson_mut_obj(doc);
+		yyjson_mut_val *key = yyjson_mut_strcpy(doc, es_field.c_str());
+		yyjson_mut_obj_add(term_inner, key, value);
+		yyjson_mut_val *result = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, result, "term", term_inner);
+		return result;
+	}
+	case ExpressionType::COMPARE_NOTEQUAL: {
+		// {"bool": {"must_not": {"term": {"field": value}}}}
+		yyjson_mut_val *term_inner = yyjson_mut_obj(doc);
+		yyjson_mut_val *key_ne = yyjson_mut_strcpy(doc, es_field.c_str());
+		yyjson_mut_obj_add(term_inner, key_ne, value);
+		yyjson_mut_val *term = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, term, "term", term_inner);
+		yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, bool_obj, "must_not", term);
+		yyjson_mut_val *result = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, result, "bool", bool_obj);
+		return result;
+	}
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
+		// {"range": {"field": {"<op>": value}}}
+		const char *range_op;
+		switch (comparison_type) {
+		case ExpressionType::COMPARE_GREATERTHAN:
+			range_op = "gt";
+			break;
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			range_op = "gte";
+			break;
+		case ExpressionType::COMPARE_LESSTHAN:
+			range_op = "lt";
+			break;
+		default:
+			range_op = "lte";
+			break;
+		}
+		yyjson_mut_val *range_cond = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, range_cond, range_op, value);
+		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
+		yyjson_mut_val *key = yyjson_mut_strcpy(doc, es_field.c_str());
+		yyjson_mut_obj_add(range_inner, key, range_cond);
+		yyjson_mut_val *result = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, result, "range", range_inner);
+		return result;
+	}
+	default:
+		// Unsupported comparison type.
+		return nullptr;
+	}
+}
+
+// Translate IS NULL: Elasticsearch has no SQL NULL, so this matches documents where the field
+// does not exist.
+// {"bool": {"must_not": {"exists": {"field": "name"}}}}
+static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_name) {
+	yyjson_mut_val *exists_inner = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_strcpy(doc, exists_inner, "field", field_name.c_str());
+	yyjson_mut_val *exists = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_val(doc, exists, "exists", exists_inner);
+	yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_val(doc, bool_obj, "must_not", exists);
+	yyjson_mut_val *result = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_val(doc, result, "bool", bool_obj);
+	return result;
+}
+
+// Translate IS NOT NULL: matches documents where the field exists.
+// {"exists": {"field": "name"}}
+static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name) {
+	yyjson_mut_val *exists_inner = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_strcpy(doc, exists_inner, "field", field_name.c_str());
+	yyjson_mut_val *result = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_val(doc, result, "exists", exists_inner);
+	return result;
+}
+
+// Translate an IN expression "<column> IN (<values...>)" into an Elasticsearch terms query.
+static yyjson_mut_val *TranslateInExpression(yyjson_mut_doc *doc, const string &field_name,
+                                             const BoundOperatorExpression &op_expr,
+                                             const ElasticsearchSchema &schema) {
+	bool is_text_field = schema.text_fields.count(field_name) > 0;
+	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
+
+	// Defense-in-depth: text fields without .keyword and geo fields should never reach here.
+	if (is_text_field && !has_keyword_subfield) {
+		return nullptr;
+	}
+	if (schema.geo_fields.count(field_name) > 0) {
+		return nullptr;
+	}
+
+	// {"terms": {"field": [value1, value2, ...]}} (or "field.keyword" for text fields with .keyword).
+	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
+
+	yyjson_mut_val *values_arr = yyjson_mut_arr(doc);
+	for (idx_t i = 1; i < op_expr.children.size(); i++) {
+		if (op_expr.children[i]->type != ExpressionType::VALUE_CONSTANT) {
+			return nullptr;
+		}
+		auto &const_expr = op_expr.children[i]->Cast<BoundConstantExpression>();
+		yyjson_mut_arr_append(values_arr, ConvertDuckDBToJSON(doc, const_expr.value));
+	}
+
+	yyjson_mut_val *terms_inner = yyjson_mut_obj(doc);
+	yyjson_mut_val *key_in = yyjson_mut_strcpy(doc, es_field.c_str());
+	yyjson_mut_obj_add(terms_inner, key_in, values_arr);
+
+	yyjson_mut_val *result = yyjson_mut_obj(doc);
+	yyjson_mut_obj_add_val(doc, result, "terms", terms_inner);
+	return result;
+}
+
 FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterSet &filters,
                                          const vector<string> &column_names, const ElasticsearchSchema &schema) {
 	FilterTranslationResult result;
@@ -84,23 +247,13 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 
 		const string &column_name = column_names[col_idx];
 
-		// Defense-in-depth: skip _id IS NOT NULL and _id IS NULL filters. The optimizer extension
-		// (OptimizeIdFilters) normally handles these before we get here: IS NOT NULL is stripped
-		// as always-true and IS NULL replaces the scan with EMPTY_RESULT. If either somehow
-		// survives to translation, skip it rather than generating a pointless or incorrect
-		// Elasticsearch query. See the _id semantic optimization in elasticsearch_optimizer.cpp.
-		if (column_name == "_id" &&
-		    (filter.filter_type == TableFilterType::IS_NOT_NULL || filter.filter_type == TableFilterType::IS_NULL)) {
-			continue;
-		}
-
 		yyjson_mut_val *translated = TranslateFilter(doc, filter, column_name, schema);
 		if (translated) {
 			yyjson_mut_arr_append(must_arr, translated);
 		}
-		// Note: TranslateFilter may return nullptr for unsupported filter types (e.g. text fields
-		// without .keyword or geo fields that somehow reach here). Such filters are evaluated by
-		// DuckDB's FILTER stage above the scan instead.
+		// Note: TranslateFilter returns nullptr for unsupported TableFilterTypes or unrecognized
+		// expression shapes inside an ExpressionFilter. Such filters are evaluated by DuckDB's
+		// FILTER stage above the scan instead.
 	}
 
 	if (yyjson_mut_arr_size(must_arr) == 0) {
@@ -122,201 +275,22 @@ FilterTranslationResult TranslateFilters(yyjson_mut_doc *doc, const TableFilterS
 }
 
 // Translate a single filter for a specific column.
-// The schema is passed through to child functions for field type lookups.
+// We translate ExpressionFilter and conjunction filters; any other TableFilterType (e.g.
+// ConstantFilter / InFilter / IsNullFilter that DuckDB's FilterCombiner produces when our
+// table_filters is empty after the pushdown stage) returns nullptr so DuckDB evaluates them
+// in its FILTER stage above the scan.
 static yyjson_mut_val *TranslateFilter(yyjson_mut_doc *doc, const TableFilter &filter, const string &column_name,
                                        const ElasticsearchSchema &schema) {
 	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &const_filter = filter.Cast<ConstantFilter>();
-		return TranslateConstantComparison(doc, const_filter, column_name, schema);
-	}
-
-	case TableFilterType::IS_NULL:
-		return TranslateIsNull(doc, column_name);
-
-	case TableFilterType::IS_NOT_NULL:
-		return TranslateIsNotNull(doc, column_name);
-
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conj_filter = filter.Cast<ConjunctionAndFilter>();
-		return TranslateConjunctionAnd(doc, conj_filter, column_name, schema);
-	}
-
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conj_filter = filter.Cast<ConjunctionOrFilter>();
-		return TranslateConjunctionOr(doc, conj_filter, column_name, schema);
-	}
-
-	case TableFilterType::IN_FILTER: {
-		auto &in_filter = filter.Cast<InFilter>();
-		return TranslateInFilter(doc, in_filter, column_name, schema);
-	}
-
-	case TableFilterType::EXPRESSION_FILTER: {
-		auto &expr_filter = filter.Cast<ExpressionFilter>();
-		return TranslateExpressionFilter(doc, expr_filter, column_name, schema);
-	}
-
-	case TableFilterType::STRUCT_EXTRACT: {
-		// Handle filters on nested struct fields.
-		// The StructFilter wraps the child filter with the nested field name.
-		auto &struct_filter = filter.Cast<StructFilter>();
-
-		// Build the nested field path.
-		string nested_field = column_name + "." + struct_filter.child_name;
-
-		// Recursively translate the child filter with the nested field path.
-		// The schema maps contain entries for nested paths (e.g. "employee.name").
-		return TranslateFilter(doc, *struct_filter.child_filter, nested_field, schema);
-	}
-
+	case TableFilterType::EXPRESSION_FILTER:
+		return TranslateExpressionFilter(doc, filter.Cast<ExpressionFilter>(), column_name, schema);
+	case TableFilterType::CONJUNCTION_AND:
+		return TranslateConjunctionAnd(doc, filter.Cast<ConjunctionAndFilter>(), column_name, schema);
+	case TableFilterType::CONJUNCTION_OR:
+		return TranslateConjunctionOr(doc, filter.Cast<ConjunctionOrFilter>(), column_name, schema);
 	default:
-		// Unsupported filter type, return nullptr (filter will be applied by DuckDB).
 		return nullptr;
 	}
-}
-
-static yyjson_mut_val *TranslateConstantComparison(yyjson_mut_doc *doc, const ConstantFilter &filter,
-                                                   const string &field_name, const ElasticsearchSchema &schema) {
-	bool is_text_field = schema.text_fields.count(field_name) > 0;
-	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
-
-	// Defense-in-depth: text fields without .keyword should never reach here (the guard filter
-	// in pushdown_complex_filter prevents the FilterCombiner from pushing comparisons on them).
-	// If they somehow do, return nullptr so DuckDB handles the filter instead of generating
-	// an incorrect term/range query on an analyzed text field.
-	if (is_text_field && !has_keyword_subfield) {
-		return nullptr;
-	}
-
-	// Defense-in-depth: geo fields should never reach here (the guard filter in
-	// pushdown_complex_filter prevents the FilterCombiner from pushing comparisons on them).
-	// If they somehow do, return nullptr so DuckDB handles the filter instead of generating
-	// an invalid term/range query on a geo_point/geo_shape field.
-	if (schema.geo_fields.count(field_name) > 0) {
-		return nullptr;
-	}
-
-	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
-	yyjson_mut_val *value = ConvertDuckDBToJSON(doc, filter.constant);
-
-	switch (filter.comparison_type) {
-	case ExpressionType::COMPARE_EQUAL: {
-		// {"term": {"field": value}}
-		yyjson_mut_val *term_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key = yyjson_mut_strcpy(doc, es_field.c_str());
-		yyjson_mut_obj_add(term_inner, key, value);
-
-		yyjson_mut_val *result = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, result, "term", term_inner);
-		return result;
-	}
-
-	case ExpressionType::COMPARE_NOTEQUAL: {
-		// {"bool": {"must_not": {"term": {"field": value}}}}
-		yyjson_mut_val *term_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_ne = yyjson_mut_strcpy(doc, es_field.c_str());
-		yyjson_mut_obj_add(term_inner, key_ne, value);
-
-		yyjson_mut_val *term = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, term, "term", term_inner);
-
-		yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, bool_obj, "must_not", term);
-
-		yyjson_mut_val *result = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, result, "bool", bool_obj);
-		return result;
-	}
-
-	// For text fields with .keyword subfield range queries work correctly.
-	// The .keyword subfield stores the raw value and supports proper range queries.
-	case ExpressionType::COMPARE_GREATERTHAN: {
-		// {"range": {"field": {"gt": value}}}
-		yyjson_mut_val *range_cond = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, range_cond, "gt", value);
-
-		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_gt = yyjson_mut_strcpy(doc, es_field.c_str());
-		yyjson_mut_obj_add(range_inner, key_gt, range_cond);
-
-		yyjson_mut_val *result = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, result, "range", range_inner);
-		return result;
-	}
-
-	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
-		// {"range": {"field": {"gte": value}}}
-		yyjson_mut_val *range_cond = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, range_cond, "gte", value);
-
-		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_gte = yyjson_mut_strcpy(doc, es_field.c_str());
-		yyjson_mut_obj_add(range_inner, key_gte, range_cond);
-
-		yyjson_mut_val *result = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, result, "range", range_inner);
-		return result;
-	}
-
-	case ExpressionType::COMPARE_LESSTHAN: {
-		// {"range": {"field": {"lt": value}}}
-		yyjson_mut_val *range_cond = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, range_cond, "lt", value);
-
-		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_lt = yyjson_mut_strcpy(doc, es_field.c_str());
-		yyjson_mut_obj_add(range_inner, key_lt, range_cond);
-
-		yyjson_mut_val *result = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, result, "range", range_inner);
-		return result;
-	}
-
-	case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
-		// {"range": {"field": {"lte": value}}}
-		yyjson_mut_val *range_cond = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, range_cond, "lte", value);
-
-		yyjson_mut_val *range_inner = yyjson_mut_obj(doc);
-		yyjson_mut_val *key_lte = yyjson_mut_strcpy(doc, es_field.c_str());
-		yyjson_mut_obj_add(range_inner, key_lte, range_cond);
-
-		yyjson_mut_val *result = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_val(doc, result, "range", range_inner);
-		return result;
-	}
-
-	default:
-		// Unsupported comparison type.
-		return nullptr;
-	}
-}
-
-static yyjson_mut_val *TranslateIsNull(yyjson_mut_doc *doc, const string &field_name) {
-	// {"bool": {"must_not": {"exists": {"field": "name"}}}}
-	yyjson_mut_val *exists_inner = yyjson_mut_obj(doc);
-	yyjson_mut_obj_add_strcpy(doc, exists_inner, "field", field_name.c_str());
-
-	yyjson_mut_val *exists = yyjson_mut_obj(doc);
-	yyjson_mut_obj_add_val(doc, exists, "exists", exists_inner);
-
-	yyjson_mut_val *bool_obj = yyjson_mut_obj(doc);
-	yyjson_mut_obj_add_val(doc, bool_obj, "must_not", exists);
-
-	yyjson_mut_val *result = yyjson_mut_obj(doc);
-	yyjson_mut_obj_add_val(doc, result, "bool", bool_obj);
-	return result;
-}
-
-static yyjson_mut_val *TranslateIsNotNull(yyjson_mut_doc *doc, const string &field_name) {
-	// {"exists": {"field": "name"}}
-	yyjson_mut_val *exists_inner = yyjson_mut_obj(doc);
-	yyjson_mut_obj_add_strcpy(doc, exists_inner, "field", field_name.c_str());
-
-	yyjson_mut_val *result = yyjson_mut_obj(doc);
-	yyjson_mut_obj_add_val(doc, result, "exists", exists_inner);
-	return result;
 }
 
 static yyjson_mut_val *TranslateConjunctionAnd(yyjson_mut_doc *doc, const ConjunctionAndFilter &filter,
@@ -376,120 +350,99 @@ static yyjson_mut_val *TranslateConjunctionOr(yyjson_mut_doc *doc, const Conjunc
 	return result;
 }
 
-static yyjson_mut_val *TranslateInFilter(yyjson_mut_doc *doc, const InFilter &filter, const string &field_name,
-                                         const ElasticsearchSchema &schema) {
-	bool is_text_field = schema.text_fields.count(field_name) > 0;
-	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
-
-	// Defense-in-depth: text fields without .keyword should never reach here (the guard filter
-	// in pushdown_complex_filter prevents the FilterCombiner from pushing IN filters on them).
-	// If they somehow do, return nullptr so DuckDB handles the filter.
-	if (is_text_field && !has_keyword_subfield) {
-		return nullptr;
-	}
-
-	// Defense-in-depth: geo fields should never reach here (the guard filter in
-	// pushdown_complex_filter prevents the FilterCombiner from pushing IN filters on them).
-	// If they somehow do, return nullptr so DuckDB handles the filter.
-	if (schema.geo_fields.count(field_name) > 0) {
-		return nullptr;
-	}
-
-	// {"terms": {"field": [value1, value2, ...]}}
-	// or for text fields with .keyword: {"terms": {"field.keyword": [value1, value2, ...]}}
-	string es_field = GetElasticsearchFieldName(field_name, is_text_field, has_keyword_subfield);
-
-	yyjson_mut_val *values_arr = yyjson_mut_arr(doc);
-	for (auto &value : filter.values) {
-		yyjson_mut_val *json_val = ConvertDuckDBToJSON(doc, value);
-		yyjson_mut_arr_append(values_arr, json_val);
-	}
-
-	yyjson_mut_val *terms_inner = yyjson_mut_obj(doc);
-	yyjson_mut_val *key_in = yyjson_mut_strcpy(doc, es_field.c_str());
-	yyjson_mut_obj_add(terms_inner, key_in, values_arr);
-
-	yyjson_mut_val *result = yyjson_mut_obj(doc);
-	yyjson_mut_obj_add_val(doc, result, "terms", terms_inner);
-	return result;
-}
-
+// Translate the canonical ExpressionFilter shapes produced by the pushdown stage (and by DuckDB's
+// FilterCombiner). The expression's column ref leaves are BoundReferenceExpression(0); for nested
+// columns the leaf sits at the bottom of a struct_extract chain. We resolve the dotted field path
+// from base column_name using ExtractDottedFieldPath.
+//
+// Recognized shapes:
+// - BOUND_COMPARISON: <column> <op> <constant>, including ST_Distance(...) <op> <distance>
+// - BOUND_OPERATOR:   IS NULL / IS NOT NULL / COMPARE_IN
+// - BOUND_FUNCTION:   LIKE/ILIKE/prefix/suffix/contains and ST_* spatial predicates
+//
+// The _id always-non-null guard arrives as IS NOT NULL on column_name == "_id"; the optimizer
+// extension normally strips it before we get here, but if it survives, it produces a benign
+// {"exists":{"field":"_id"}} term.
 static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const ExpressionFilter &filter,
                                                  const string &column_name, const ElasticsearchSchema &schema) {
-	// ExpressionFilter contains arbitrary expressions. We handle:
-	// - LIKE/ILIKE patterns (~~, ~~*, like_escape, ilike_escape)
-	// - Optimized string functions from LikeOptimizationRule (prefix, suffix, contains)
-	// - ST_Distance comparisons
-	// - Spatial extension functions ST_DWithin, ST_Within, ST_Intersects, ST_Contains, ST_Disjoint
-	//
-	// Note: Standard comparison and IN filters on text fields without .keyword and on geo fields
-	// are excluded by the guard filter mechanism in pushdown_complex_filter and never reach this
-	// function as comparisons. Geo fields reach here only via spatial predicates (ST_Within,
-	// ST_DWithin etc.) which are pushed as ExpressionFilter.
 	auto &expr = *filter.expr;
 
-	// Check if this is a function expression.
+	// Comparison: <column> <op> <constant>.
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
+
+		// ST_Distance comparisons: ST_Distance(geo_col, point) </<=/>/>= distance.
+		if (expr.type == ExpressionType::COMPARE_LESSTHAN || expr.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
+		    expr.type == ExpressionType::COMPARE_GREATERTHAN ||
+		    expr.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+			if ((comp_expr.left->type == ExpressionType::BOUND_FUNCTION &&
+			     StringUtil::Lower(comp_expr.left->Cast<BoundFunctionExpression>().function.name) == "st_distance") ||
+			    (comp_expr.right->type == ExpressionType::BOUND_FUNCTION &&
+			     StringUtil::Lower(comp_expr.right->Cast<BoundFunctionExpression>().function.name) == "st_distance")) {
+				return TranslateGeoDistanceComparison(doc, comp_expr, column_name);
+			}
+		}
+
+		// Standard scalar comparison. One side is a column expression (BOUND_REF or struct_extract chain),
+		// the other is a constant.
+		const Expression *col_side = nullptr;
+		const Expression *const_side = nullptr;
+		ExpressionType comparison_type = comp_expr.type;
+		if (comp_expr.right->type == ExpressionType::VALUE_CONSTANT) {
+			col_side = comp_expr.left.get();
+			const_side = comp_expr.right.get();
+		} else if (comp_expr.left->type == ExpressionType::VALUE_CONSTANT) {
+			col_side = comp_expr.right.get();
+			const_side = comp_expr.left.get();
+			comparison_type = FlipComparisonExpression(comparison_type);
+		} else {
+			return nullptr;
+		}
+
+		string field_path;
+		if (!ExtractDottedFieldPath(*col_side, column_name, field_path)) {
+			return nullptr;
+		}
+		auto &constant = const_side->Cast<BoundConstantExpression>().value;
+		if (constant.IsNull()) {
+			return nullptr;
+		}
+		return TranslateScalarComparison(doc, field_path, comparison_type, constant, schema);
+	}
+
+	// Operator expressions: IS NULL / IS NOT NULL / COMPARE_IN.
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_OPERATOR) {
+		auto &op_expr = expr.Cast<BoundOperatorExpression>();
+		auto op_type = op_expr.type;
+
+		if ((op_type == ExpressionType::OPERATOR_IS_NULL || op_type == ExpressionType::OPERATOR_IS_NOT_NULL) &&
+		    op_expr.children.size() == 1) {
+			string field_path;
+			if (!ExtractDottedFieldPath(*op_expr.children[0], column_name, field_path)) {
+				return nullptr;
+			}
+			return op_type == ExpressionType::OPERATOR_IS_NULL ? TranslateIsNull(doc, field_path)
+			                                                   : TranslateIsNotNull(doc, field_path);
+		}
+
+		if (op_type == ExpressionType::COMPARE_IN && op_expr.children.size() >= 2) {
+			string field_path;
+			if (!ExtractDottedFieldPath(*op_expr.children[0], column_name, field_path)) {
+				return nullptr;
+			}
+			return TranslateInExpression(doc, field_path, op_expr, schema);
+		}
+
+		return nullptr;
+	}
+
+	// Function expressions: LIKE/ILIKE/prefix/suffix/contains and ST_* spatial predicates.
 	if (expr.type == ExpressionType::BOUND_FUNCTION) {
 		auto &func_expr = expr.Cast<BoundFunctionExpression>();
 		auto func_name = func_expr.function.name;
-
-		// Handle LIKE (~~, like_escape) and ILIKE (~~*, ilike_escape).
-		if (func_name == "~~" || func_name == "like_escape" || func_name == "~~*" || func_name == "ilike_escape") {
-			// LIKE pattern is typically the second argument (index 1).
-			// First argument (index 0) is the column reference.
-			if (func_expr.children.size() >= 2) {
-				auto &pattern_expr = func_expr.children[1];
-				if (pattern_expr->type == ExpressionType::VALUE_CONSTANT) {
-					auto &const_expr = pattern_expr->Cast<BoundConstantExpression>();
-					if (const_expr.value.type().id() == LogicalTypeId::VARCHAR) {
-						string pattern = StringValue::Get(const_expr.value);
-						// ~~* and ilike_escape are case-insensitive (ILIKE)
-						// ~~ and like_escape are case-sensitive (LIKE)
-						bool case_insensitive = (func_name == "~~*" || func_name == "ilike_escape");
-						return TranslateLikePattern(doc, column_name, pattern, schema, case_insensitive);
-					}
-				}
-			}
-		}
-
-		// Handle optimized string functions from DuckDB's LikeOptimizationRule:
-		// - prefix(col, 'str') from LIKE 'str%'
-		// - suffix(col, 'str') from LIKE '%str'
-		// - contains(col, 'str') from LIKE '%str%'
-		// These always come from case-sensitive LIKE (not ILIKE), so case_insensitive = false.
-		// For text fields without .keyword these are not pushed down by ElasticsearchPushdownComplexFilter.
-		// For text fields with .keyword these are pushed down and will use the .keyword subfield.
-		if (func_name == "prefix" || func_name == "suffix" || func_name == "contains") {
-			if (func_expr.children.size() >= 2) {
-				auto &value_expr = func_expr.children[1];
-				if (value_expr->type == ExpressionType::VALUE_CONSTANT) {
-					auto &const_expr = value_expr->Cast<BoundConstantExpression>();
-					if (const_expr.value.type().id() == LogicalTypeId::VARCHAR) {
-						string value = StringValue::Get(const_expr.value);
-
-						// Convert to equivalent LIKE pattern and use existing translation.
-						// prefix(col, 'str') -> 'str%'
-						// suffix(col, 'str') -> '%str'
-						// contains(col, 'str') -> '%str%'
-						string pattern;
-						if (func_name == "prefix") {
-							pattern = value + "%";
-						} else if (func_name == "suffix") {
-							pattern = "%" + value;
-						} else { // contains
-							pattern = "%" + value + "%";
-						}
-						// These come from LIKE optimization, so they are case-sensitive.
-						return TranslateLikePattern(doc, column_name, pattern, schema, false);
-					}
-				}
-			}
-		}
-
-		// Handle geospatial functions from the spatial extension.
-		// These are pushed down by ElasticsearchPushdownComplexFilter and arrive as ExpressionFilter.
-		// Note: Spatial extension registers functions with mixed case (e.g. ST_Within).
 		string func_name_lower = StringUtil::Lower(func_name);
+
+		// Spatial predicates and ST_DWithin: dotted path comes from the geo column among the first two args.
 		if (func_name_lower == "st_within" || func_name_lower == "st_intersects" || func_name_lower == "st_contains" ||
 		    func_name_lower == "st_disjoint") {
 			return TranslateGeospatialFilter(doc, func_expr, column_name);
@@ -497,16 +450,40 @@ static yyjson_mut_val *TranslateExpressionFilter(yyjson_mut_doc *doc, const Expr
 		if (func_name_lower == "st_dwithin") {
 			return TranslateGeoDistanceDWithin(doc, func_expr, column_name);
 		}
-	}
 
-	// Handle comparison expressions containing ST_Distance.
-	// Pattern: ST_Distance(geo_col, point) </<=/>/>= distance
-	if (expr.type == ExpressionType::COMPARE_LESSTHAN || expr.type == ExpressionType::COMPARE_LESSTHANOREQUALTO ||
-	    expr.type == ExpressionType::COMPARE_GREATERTHAN || expr.type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
-		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
-		auto result = TranslateGeoDistanceComparison(doc, comp_expr, column_name);
-		if (result) {
-			return result;
+		// LIKE/ILIKE/prefix/suffix/contains. children[0] is the column expression.
+		if (func_expr.children.size() < 2) {
+			return nullptr;
+		}
+		auto &pattern_expr = func_expr.children[1];
+		if (pattern_expr->type != ExpressionType::VALUE_CONSTANT) {
+			return nullptr;
+		}
+		auto &const_expr = pattern_expr->Cast<BoundConstantExpression>();
+		if (const_expr.value.type().id() != LogicalTypeId::VARCHAR) {
+			return nullptr;
+		}
+
+		string field_path;
+		if (!ExtractDottedFieldPath(*func_expr.children[0], column_name, field_path)) {
+			return nullptr;
+		}
+
+		string value = StringValue::Get(const_expr.value);
+		if (func_name == "~~" || func_name == "like_escape" || func_name == "~~*" || func_name == "ilike_escape") {
+			// ~~* and ilike_escape are case-insensitive (ILIKE); ~~ and like_escape are case-sensitive (LIKE).
+			bool case_insensitive = (func_name == "~~*" || func_name == "ilike_escape");
+			return TranslateLikePattern(doc, field_path, value, schema, case_insensitive);
+		}
+		// prefix/suffix/contains come from DuckDB's LikeOptimizationRule and are always case-sensitive.
+		if (func_name == "prefix") {
+			return TranslateLikePattern(doc, field_path, value + "%", schema, false);
+		}
+		if (func_name == "suffix") {
+			return TranslateLikePattern(doc, field_path, "%" + value, schema, false);
+		}
+		if (func_name == "contains") {
+			return TranslateLikePattern(doc, field_path, "%" + value + "%", schema, false);
 		}
 	}
 
@@ -531,9 +508,7 @@ static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &f
 	bool is_text_field = schema.text_fields.count(field_name) > 0;
 	bool has_keyword_subfield = schema.text_fields_with_keyword.count(field_name) > 0;
 
-	// Defense-in-depth: text fields without .keyword should never reach here (the guard filter
-	// in pushdown_complex_filter prevents the FilterCombiner from pushing LIKE/ILIKE on them).
-	// If they somehow do, return nullptr so DuckDB handles the filter.
+	// Defense-in-depth: text fields without .keyword should never reach here.
 	if (is_text_field && !has_keyword_subfield) {
 		return nullptr;
 	}
@@ -570,7 +545,6 @@ static yyjson_mut_val *TranslateLikePattern(yyjson_mut_doc *doc, const string &f
 		// Check if there is only one % and it's at the end.
 		if (percent_pos == pattern.length() - 1 && pattern.find('%') == pattern.rfind('%')) {
 			// Simple prefix query.
-			// For keyword fields and text fields with .keyword, use prefix query.
 			// {"prefix": {"field": {"value": "prefix"}}} or with case_insensitive option
 			string prefix = pattern.substr(0, percent_pos);
 
@@ -821,15 +795,23 @@ static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const
 		return nullptr;
 	}
 
-	// From ST_Distance's children, find the constant GeoJSON point (the one that's not the geo column reference).
-	// One child is the GEOMETRY column, the other is the constant point as GeoJSON VARCHAR.
+	// From ST_Distance's children, find the constant GeoJSON point and resolve the dotted field path
+	// for the geo column.
 	idx_t const_child_idx = DConstants::INVALID_INDEX;
+	idx_t geo_child_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < 2; i++) {
-		if (!IsGeoColumnRef(*func_expr->children[i])) {
+		if (IsGeoColumnRef(*func_expr->children[i])) {
+			geo_child_idx = i;
+		} else {
 			const_child_idx = i;
 		}
 	}
-	if (const_child_idx == DConstants::INVALID_INDEX) {
+	if (const_child_idx == DConstants::INVALID_INDEX || geo_child_idx == DConstants::INVALID_INDEX) {
+		return nullptr;
+	}
+
+	string field_path;
+	if (!ExtractDottedFieldPath(*func_expr->children[geo_child_idx], column_name, field_path)) {
 		return nullptr;
 	}
 
@@ -849,7 +831,7 @@ static yyjson_mut_val *TranslateGeoDistanceComparison(yyjson_mut_doc *doc, const
 	auto comparison_type = func_on_left ? expr_type : FlipComparisonExpression(expr_type);
 
 	// Build the geo_distance query.
-	yyjson_mut_val *geo_dist_query = BuildGeoDistanceQuery(doc, column_name, lat, lon, distance_meters);
+	yyjson_mut_val *geo_dist_query = BuildGeoDistanceQuery(doc, field_path, lat, lon, distance_meters);
 	if (!geo_dist_query) {
 		return nullptr;
 	}
@@ -880,14 +862,22 @@ static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const Bo
 		return nullptr;
 	}
 
-	// Find the constant geometry child (the one that's not the column reference) among the first two args.
+	// Find the geo column ref (one of the first two args) and the constant point (the other one).
 	idx_t const_child_idx = DConstants::INVALID_INDEX;
+	idx_t geo_child_idx = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < 2; i++) {
-		if (!IsGeoColumnRef(*func_expr.children[i])) {
+		if (IsGeoColumnRef(*func_expr.children[i])) {
+			geo_child_idx = i;
+		} else {
 			const_child_idx = i;
 		}
 	}
-	if (const_child_idx == DConstants::INVALID_INDEX) {
+	if (const_child_idx == DConstants::INVALID_INDEX || geo_child_idx == DConstants::INVALID_INDEX) {
+		return nullptr;
+	}
+
+	string field_path;
+	if (!ExtractDottedFieldPath(*func_expr.children[geo_child_idx], column_name, field_path)) {
 		return nullptr;
 	}
 
@@ -911,7 +901,7 @@ static yyjson_mut_val *TranslateGeoDistanceDWithin(yyjson_mut_doc *doc, const Bo
 		return nullptr;
 	}
 
-	return BuildGeoDistanceQuery(doc, column_name, lat, lon, distance_meters);
+	return BuildGeoDistanceQuery(doc, field_path, lat, lon, distance_meters);
 }
 
 // Translate a geospatial function expression to an Elasticsearch geo query.
@@ -929,11 +919,15 @@ static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const Boun
                                                  const string &column_name) {
 	string func_name = StringUtil::Lower(func_expr.function.name);
 
+	if (func_expr.children.size() < 2) {
+		return nullptr;
+	}
+
 	// Determine which child is the geo column reference and which is the constant geometry.
 	idx_t geo_col_idx = DConstants::INVALID_INDEX;
-	idx_t const_geo_idx = DConstants::INVALID_INDEX;
+	idx_t const_geo_idx;
 
-	for (idx_t i = 0; i < 2 && i < func_expr.children.size(); i++) {
+	for (idx_t i = 0; i < 2; i++) {
 		if (IsGeoColumnRef(*func_expr.children[i])) {
 			geo_col_idx = i;
 		}
@@ -945,7 +939,11 @@ static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const Boun
 
 	const_geo_idx = (geo_col_idx == 0) ? 1 : 0;
 
-	// Handle ST_Within, ST_Intersects, ST_Contains, ST_Disjoint -> geo_shape or geo_bounding_box.
+	// Resolve the dotted field path for the geo column.
+	string field_path;
+	if (!ExtractDottedFieldPath(*func_expr.children[geo_col_idx], column_name, field_path)) {
+		return nullptr;
+	}
 
 	// Extract the constant geometry GeoJSON.
 	string const_geojson = ExtractConstantGeoJSON(*func_expr.children[const_geo_idx]);
@@ -984,7 +982,7 @@ static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const Boun
 						double xmax = yyjson_get_num(yyjson_arr_get(br, 0));
 						double ymin = yyjson_get_num(yyjson_arr_get(br, 1));
 						yyjson_doc_free(env_doc);
-						return BuildGeoBoundingBoxQuery(doc, column_name, xmin, ymin, xmax, ymax);
+						return BuildGeoBoundingBoxQuery(doc, field_path, xmin, ymin, xmax, ymax);
 					}
 				}
 			}
@@ -1021,7 +1019,7 @@ static yyjson_mut_val *TranslateGeospatialFilter(yyjson_mut_doc *doc, const Boun
 		return nullptr;
 	}
 
-	return BuildGeoShapeQuery(doc, column_name, const_geojson, relation);
+	return BuildGeoShapeQuery(doc, field_path, const_geojson, relation);
 }
 
 } // namespace duckdb
