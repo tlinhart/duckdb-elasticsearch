@@ -6,6 +6,9 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -333,23 +336,31 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 	}
 
 	// Parse named parameters (override settings when explicitly specified).
+	// Track which connection-related params were set explicitly so secret values don't overwrite them.
+	case_insensitive_set_t explicit_params;
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "host") {
 			bind_data->config.host = StringValue::Get(kv.second);
+			explicit_params.insert("host");
 		} else if (kv.first == "port") {
 			bind_data->config.port = IntegerValue::Get(kv.second);
+			explicit_params.insert("port");
 		} else if (kv.first == "index") {
 			bind_data->index = StringValue::Get(kv.second);
 		} else if (kv.first == "query") {
 			bind_data->base_query = StringValue::Get(kv.second);
 		} else if (kv.first == "username") {
 			bind_data->config.username = StringValue::Get(kv.second);
+			explicit_params.insert("username");
 		} else if (kv.first == "password") {
 			bind_data->config.password = StringValue::Get(kv.second);
+			explicit_params.insert("password");
 		} else if (kv.first == "use_ssl") {
 			bind_data->config.use_ssl = BooleanValue::Get(kv.second);
+			explicit_params.insert("use_ssl");
 		} else if (kv.first == "verify_ssl") {
 			bind_data->config.verify_ssl = BooleanValue::Get(kv.second);
+			explicit_params.insert("verify_ssl");
 		} else if (kv.first == "timeout") {
 			bind_data->config.timeout = IntegerValue::Get(kv.second);
 		} else if (kv.first == "max_retries") {
@@ -360,6 +371,39 @@ static unique_ptr<FunctionData> ElasticsearchQueryBind(ClientContext &context, T
 			bind_data->config.retry_backoff_factor = DoubleValue::Get(kv.second);
 		} else if (kv.first == "sample_size") {
 			bind_data->sample_size = IntegerValue::Get(kv.second);
+		}
+	}
+
+	// Look up an "elasticsearch" secret and apply its values as fallback for any
+	// connection params not set explicitly in the named parameters.
+	// Scope matching uses the current host+port (with scheme) so per-cluster secrets work.
+	{
+		string scheme = bind_data->config.use_ssl ? "https://" : "http://";
+		string lookup_path = scheme + bind_data->config.host + ":" + to_string(bind_data->config.port);
+		auto &secret_manager = SecretManager::Get(context);
+		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+		auto secret_match = secret_manager.LookupSecret(transaction, lookup_path, "elasticsearch");
+		if (secret_match.HasMatch()) {
+			const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(secret_match.GetSecret());
+			Value val;
+			if (!explicit_params.count("host") && kv_secret.TryGetValue("host", val)) {
+				bind_data->config.host = StringValue::Get(val);
+			}
+			if (!explicit_params.count("port") && kv_secret.TryGetValue("port", val)) {
+				bind_data->config.port = IntegerValue::Get(val);
+			}
+			if (!explicit_params.count("username") && kv_secret.TryGetValue("username", val)) {
+				bind_data->config.username = StringValue::Get(val);
+			}
+			if (!explicit_params.count("password") && kv_secret.TryGetValue("password", val)) {
+				bind_data->config.password = StringValue::Get(val);
+			}
+			if (!explicit_params.count("use_ssl") && kv_secret.TryGetValue("use_ssl", val)) {
+				bind_data->config.use_ssl = BooleanValue::Get(val);
+			}
+			if (!explicit_params.count("verify_ssl") && kv_secret.TryGetValue("verify_ssl", val)) {
+				bind_data->config.verify_ssl = BooleanValue::Get(val);
+			}
 		}
 	}
 
