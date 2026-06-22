@@ -195,6 +195,95 @@ The following table lists all available settings:
 Changing `elasticsearch_sample_size` automatically clears the
 [bind cache](#bind-cache).
 
+## Secrets
+
+The extension integrates with DuckDB's
+[Secret Manager](https://duckdb.org/docs/stable/configuration/secrets_manager.html)
+so connection credentials can be stored once and reused across queries without
+repeating them in every function call.
+
+### Creating a secret
+
+Use `CREATE SECRET` with `TYPE elasticsearch` to define a named secret:
+
+```sql
+CREATE SECRET my_es (
+    TYPE elasticsearch,
+    host 'my-cluster.example.com',
+    port 9200,
+    username 'elastic',
+    password 's3cr3t'
+);
+```
+
+The following parameters are supported:
+
+| Parameter    | Type      | Description                            |
+| ------------ | --------- | -------------------------------------- |
+| `host`       | `VARCHAR` | Elasticsearch hostname or IP address   |
+| `port`       | `INTEGER` | Elasticsearch HTTP port                |
+| `username`   | `VARCHAR` | Username for HTTP basic authentication |
+| `password`   | `VARCHAR` | Password for HTTP basic authentication |
+| `use_ssl`    | `BOOLEAN` | Use HTTPS instead of HTTP              |
+| `verify_ssl` | `BOOLEAN` | Verify SSL certificates                |
+
+The `password` field is automatically redacted in `duckdb_secrets()` output.
+
+### Secret scope
+
+If `host` is provided at secret creation time, the secret's scope defaults to
+`http(s)://host:port`. This allows defining different secrets for different
+clusters – the one with the longest prefix match for the query's host is
+selected automatically.
+
+To create a catch-all secret that matches any host, use an explicit empty scope:
+
+```sql
+CREATE SECRET default_es (
+    TYPE elasticsearch,
+    SCOPE '',
+    username 'elastic',
+    password 's3cr3t'
+);
+```
+
+### Secret persistence
+
+By default, secrets are temporary and lost when the session ends. Use
+`PERSISTENT` to store them to disk across sessions:
+
+```sql
+CREATE PERSISTENT SECRET my_es (
+    TYPE elasticsearch,
+    host 'my-cluster.example.com',
+    username 'elastic',
+    password 's3cr3t'
+);
+```
+
+### Using secrets
+
+Once a matching secret exists, credentials no longer need to be specified in
+the function call:
+
+```sql
+CREATE SECRET es_local (
+    TYPE elasticsearch,
+    host 'localhost',
+    port 9200,
+    username 'elastic',
+    password 's3cr3t'
+);
+
+SELECT * FROM elasticsearch_query(
+    host := 'localhost',
+    index := 'orders'
+);
+```
+
+Parameters specified directly in the function call always take precedence over
+values from the secret.
+
 ## Table functions
 
 ### `elasticsearch_query`
@@ -207,14 +296,14 @@ The following table lists the parameters that the function supports:
 
 | Parameter name           | Type      | Default value          | Description                                 |
 | ------------------------ | --------- | ---------------------- | ------------------------------------------- |
-| `host`                   | `VARCHAR` | `localhost` (required) | Elasticsearch hostname or IP address        |
-| `port`                   | `INTEGER` | `9200`                 | Elasticsearch HTTP port                     |
+| `host`†                  | `VARCHAR` | `localhost` (required) | Elasticsearch hostname or IP address        |
+| `port`†                  | `INTEGER` | `9200`                 | Elasticsearch HTTP port                     |
 | `index`                  | `VARCHAR` | – (required)           | Index name or pattern (e.g. `logs-*`)       |
 | `query`                  | `VARCHAR` | –                      | Optional Elasticsearch query clause         |
-| `username`               | `VARCHAR` | –                      | Username for HTTP basic authentication      |
-| `password`               | `VARCHAR` | –                      | Password for HTTP basic authentication      |
-| `use_ssl`                | `BOOLEAN` | `false`                | Use HTTPS instead of HTTP                   |
-| `verify_ssl`\*           | `BOOLEAN` | `true`                 | Verify SSL certificates                     |
+| `username`†              | `VARCHAR` | –                      | Username for HTTP basic authentication      |
+| `password`†              | `VARCHAR` | –                      | Password for HTTP basic authentication      |
+| `use_ssl`†               | `BOOLEAN` | `false`                | Use HTTPS instead of HTTP                   |
+| `verify_ssl`\*†          | `BOOLEAN` | `true`                 | Verify SSL certificates                     |
 | `timeout`\*              | `INTEGER` | `30000`                | Request timeout in milliseconds             |
 | `max_retries`\*          | `INTEGER` | `3`                    | Maximum retry attempts for transient errors |
 | `retry_interval`\*       | `INTEGER` | `100`                  | Initial retry wait time in milliseconds     |
@@ -224,6 +313,9 @@ The following table lists the parameters that the function supports:
 \* Default value inherited from the corresponding
 [extension setting](#configuration). When specified, the named parameter
 overrides the setting value for that query.
+
+† Can be provided via a [secret](#secrets) instead of as a named parameter.
+When both are present, the named parameter takes precedence.
 
 The `query` parameter accepts an Elasticsearch query clause (e.g.
 `{"match": {"name": "alice"}}`), not a full request body. If provided, the

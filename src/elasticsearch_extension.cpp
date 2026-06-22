@@ -7,15 +7,63 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 
 #include <curl/curl.h>
 
 namespace duckdb {
 
+static unique_ptr<BaseSecret> CreateElasticsearchSecretFromConfig(ClientContext &context, CreateSecretInput &input) {
+	auto scope = input.scope;
+	if (scope.empty()) {
+		if (input.options.count("host")) {
+			string scheme = "http://";
+			if (input.options.count("use_ssl") && BooleanValue::Get(input.options.at("use_ssl"))) {
+				scheme = "https://";
+			}
+			string port_suffix =
+			    input.options.count("port") ? ":" + to_string(IntegerValue::Get(input.options.at("port"))) : "";
+			scope = {scheme + StringValue::Get(input.options.at("host")) + port_suffix};
+		} else {
+			scope = {""};
+		}
+	}
+
+	auto secret = make_uniq<KeyValueSecret>(scope, input.type, input.provider, input.name);
+	secret->TrySetValue("host", input);
+	secret->TrySetValue("port", input);
+	secret->TrySetValue("username", input);
+	secret->TrySetValue("password", input);
+	secret->TrySetValue("use_ssl", input);
+	secret->TrySetValue("verify_ssl", input);
+	secret->redact_keys = {"password"};
+	return secret;
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// Initialize libcurl globally. This must be called before any libcurl handles are created.
 	// It is safe to call multiple times (curl tracks init count internally).
 	curl_global_init(CURL_GLOBAL_DEFAULT);
+
+	// Register secret type and provider for storing Elasticsearch credentials.
+	SecretType es_secret_type;
+	es_secret_type.name = "elasticsearch";
+	es_secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+	es_secret_type.default_provider = "config";
+	loader.RegisterSecretType(es_secret_type);
+
+	CreateSecretFunction es_secret_func;
+	es_secret_func.secret_type = "elasticsearch";
+	es_secret_func.provider = "config";
+	es_secret_func.function = CreateElasticsearchSecretFromConfig;
+	es_secret_func.named_parameters["host"] = LogicalType::VARCHAR;
+	es_secret_func.named_parameters["port"] = LogicalType::INTEGER;
+	es_secret_func.named_parameters["username"] = LogicalType::VARCHAR;
+	es_secret_func.named_parameters["password"] = LogicalType::VARCHAR;
+	es_secret_func.named_parameters["use_ssl"] = LogicalType::BOOLEAN;
+	es_secret_func.named_parameters["verify_ssl"] = LogicalType::BOOLEAN;
+	loader.RegisterFunction(es_secret_func);
 
 	// Register table functions.
 	RegisterElasticsearchQueryFunction(loader);
